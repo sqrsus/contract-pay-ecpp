@@ -270,6 +270,52 @@ fn 草稿合同不可拨款() {
 }
 
 #[test]
+fn 新建合同先草稿再生效后才能拨款() {
+    let mut conn = db::open_in_memory().unwrap();
+    db::migrate(&mut conn).unwrap();
+    ctp_store::seed::seed_reference(&conn, "t").unwrap();
+    project_and_org(&conn);
+    let c = service::create_contract(
+        &mut conn,
+        NewContract {
+            project_id: "PJ-1".into(),
+            contract_name: "新增合同".into(),
+            contract_category_code: "GC".into(),
+            category_id: Some("C02".into()),
+            party_a: "某建设单位".into(),
+            contractor_id: "ORG-1".into(),
+            sign_date: "2026-02-10".into(),
+            original_amount: Money::from_cent(500_000),
+            payment_terms: "按月计量支付".into(),
+            ..Default::default()
+        },
+        "t",
+    )
+    .unwrap();
+
+    // 1) 新建即草稿，草稿拒付
+    assert_eq!(c.status, ContractStatus::Draft);
+    let err = pay(&mut conn, &c.id, 100).unwrap_err();
+    assert!(matches!(
+        err.domain(),
+        Some(DomainError::ContractNotPayable(_))
+    ));
+
+    // 2) 生效后可付
+    let a = service::activate_contract(&mut conn, &c.id, "t").unwrap();
+    assert_eq!(a.status, ContractStatus::Active);
+    assert!(a.is_payable());
+
+    // 3) 首笔拨款把「生效」推进到「履行中」
+    pay(&mut conn, &c.id, 100).unwrap();
+    let after = repo::get_contract(&conn, &c.id).unwrap();
+    assert_eq!(after.status, ContractStatus::Performing);
+
+    // 4) 已是履行中，重复生效被状态机拒绝
+    assert!(service::activate_contract(&mut conn, &c.id, "t").is_err());
+}
+
+#[test]
 fn 会计分类与合同类别分离() {
     let mut conn = db::open_in_memory().unwrap();
     db::migrate(&mut conn).unwrap();

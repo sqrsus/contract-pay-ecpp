@@ -108,6 +108,52 @@ def capture(hwnd, out):
     user32.ReleaseDC(hwnd, hdc_win)
 
 
+def capture_screen(hwnd, out):
+    """从屏幕直接抓窗口矩形。
+
+    PrintWindow 对 GPU 呈现的窗口（DirectX / wgpu）经常返回空白，
+    这时把窗口置顶后用 BitBlt 拷屏幕像素，拿到的是用户真实看到的画面。
+    """
+    from PIL import Image
+
+    rect = RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    w, h = rect.right - rect.left, rect.bottom - rect.top
+    if w <= 0 or h <= 0:
+        raise RuntimeError(f"窗口尺寸异常：{w}x{h}")
+
+    HWND_TOPMOST = -1
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(1.2)
+
+    hdc_screen = user32.GetDC(0)
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+    gdi32.SelectObject(hdc_mem, hbmp)
+    SRCCOPY = 0x00CC0020
+    ok = gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, rect.left, rect.top, SRCCOPY)
+
+    bi = BITMAPINFO()
+    bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bi.bmiHeader.biWidth = w
+    bi.bmiHeader.biHeight = -h
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    bi.bmiHeader.biCompression = 0
+
+    buf = ctypes.create_string_buffer(w * h * 4)
+    gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
+    img = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+    img.save(out)
+    print("screengrab", ok, "size", (w, h), "->", out)
+
+    gdi32.DeleteObject(hbmp)
+    gdi32.DeleteDC(hdc_mem)
+    user32.ReleaseDC(0, hdc_screen)
+
+
 def click(hwnd, lx, ly, scale):
     rect = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(rect))
@@ -125,7 +171,11 @@ def main():
     clicks = []
     env = dict(os.environ)
     size = None
+    grab = "printwindow"
     for a in sys.argv[2:]:
+        if a.startswith("grab="):
+            grab = a.split("=", 1)[1]
+            continue
         if "=" in a and a.split("=", 1)[0] in ("screen", "theme", "dialog"):
             k, v = a.split("=", 1)
             env["CTP_" + k.upper()] = v
@@ -192,7 +242,10 @@ def main():
     time.sleep(0.6)
 
     time.sleep(2.4)
-    capture(hwnd, out)
+    if grab == "screen":
+        capture_screen(hwnd, out)
+    else:
+        capture(hwnd, out)
 
     p.terminate()
     try:

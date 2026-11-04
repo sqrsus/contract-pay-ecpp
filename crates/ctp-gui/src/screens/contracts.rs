@@ -3,6 +3,7 @@
 use crate::screens::page_header;
 use crate::widgets::{self, Tone};
 use crate::{App, Confirm};
+use ctp_app::service;
 use ctp_core::contract::ContractStatus;
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -10,6 +11,7 @@ use egui_extras::{Column, TableBuilder};
 enum Act {
     Select(String),
     New,
+    Activate,
     Audit,
     Amount,
     Void,
@@ -269,10 +271,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(12.0);
             let max_h = (page_h - 8.0).max(260.0);
             ui.allocate_ui_with_layout(
-                egui::vec2(detail_w, 0.0),
+                egui::vec2(detail_w, max_h),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    detail_card(app, ui, &mut action, max_h);
+                    // 窗口高度不足时整卡可滚动，避免底部操作按钮被状态栏压住
+                    egui::ScrollArea::vertical()
+                        .id_salt("contract_detail_scroll")
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_width(detail_w - 2.0);
+                            detail_card(app, ui, &mut action, max_h);
+                        });
                 },
             );
         }
@@ -283,6 +293,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         Some(Act::New) => {
             app.new_contract = crate::dialogs::ContractForm::default();
             app.dialog = crate::dialogs::Dialog::NewContract;
+        }
+        Some(Act::Activate) => {
+            if let Some(id) = app.selected.clone() {
+                match app.exec(|conn| service::activate_contract(conn, &id, "界面用户")) {
+                    Ok(c) => {
+                        app.refresh();
+                        app.select(&c.id);
+                        app.success(format!("合同 {} 已生效，可以登记拨款", c.contract_no));
+                    }
+                    Err(e) => app.error(format!("生效失败：{e}")),
+                }
+            }
         }
         Some(Act::Audit) => {
             if let Some(s) = app.selected_summary() {
@@ -314,12 +336,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, _max_h: f32) {
+fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f32) {
     let p = app.pal;
     let Some(s) = app.selected_summary() else {
         return;
     };
     let d = app.detail.as_ref();
+    let is_draft = s.status == ContractStatus::Draft.code();
+    let can_pay = ContractStatus::from_code(&s.status)
+        .map(|x| x.is_payable())
+        .unwrap_or(false);
+    // 窗口较矮时收起次要字段与最近拨款，保证底部操作按钮不会被窗口下沿裁掉
+    let tight = max_h < 620.0;
     // 字段行较多，行距收紧到 7px，把内容压在卡片高度内
     ui.spacing_mut().item_spacing.y = 7.0;
 
@@ -336,6 +364,14 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, _max_h: f
                     .unwrap_or_else(|| s.status.clone()),
                 tone,
             );
+            // 草稿的唯一主行动放标题行，避免底部按钮挤成两行把卡片撑高
+            if is_draft {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::primary_button_sm(ui, &p, "设为生效").clicked() {
+                        *action = Some(Act::Activate);
+                    }
+                });
+            }
         });
         ui.label(RichText::new(&s.contract_name).size(12.5).color(p.text_muted));
         ui.add_space(8.0);
@@ -356,10 +392,12 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, _max_h: f
         widgets::kv(ui, &p, "可付额度", &format!("{} 元", s.available_amount.format_yuan()));
         widgets::kv(ui, &p, "支付率", &s.pay_rate.percent_string());
         if let Some(d) = d {
-            widgets::kv(ui, &p, "签订日期", &d.sign_date);
-            widgets::kv(ui, &p, "合同类型", d.contract_type.label());
-            if let Some(cat) = &s.category_name {
-                widgets::kv(ui, &p, "会计分类", cat);
+            if !tight {
+                widgets::kv(ui, &p, "签订日期", &d.sign_date);
+                widgets::kv(ui, &p, "合同类型", d.contract_type.label());
+                if let Some(cat) = &s.category_name {
+                    widgets::kv(ui, &p, "会计分类", cat);
+                }
             }
         }
 
@@ -413,7 +451,13 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, _max_h: f
             if widgets::ghost_button_sm(ui, &p, "修改金额").clicked() {
                 *action = Some(Act::Amount);
             }
-            if widgets::ghost_button_sm(ui, &p, "去拨款").clicked() {
+            let pay = widgets::ghost_button_sm_on(ui, &p, "去拨款", can_pay);
+            let pay = if can_pay {
+                pay
+            } else {
+                pay.on_hover_text("草稿 / 作废合同不可拨款，先点标题行的「设为生效」")
+            };
+            if pay.clicked() && can_pay {
                 *action = Some(Act::ToPayments(s.contract_id.clone()));
             }
             if s.status != "VOID" && widgets::danger_button_sm(ui, &p, "作废").clicked() {

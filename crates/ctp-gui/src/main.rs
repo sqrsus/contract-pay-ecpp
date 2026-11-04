@@ -1,3 +1,7 @@
+// release 构建声明为 Windows GUI 子系统：双击不再附带黑色控制台窗口，
+// 也就不会出现「关掉控制台把程序一起关掉」的情况。debug 构建保留控制台便于看日志。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! 工程合同台账与拨款管理平台 —— 桌面界面入口。
 //!
 //! 设计目标：把命令行里的「台账 / 拨款 / 汇总 / 自检」搬到可点选、可缩放的窗口里，
@@ -93,6 +97,14 @@ pub enum Confirm {
     VoidContract(Contract),
 }
 
+/// 冒烟/截图任务：`CTP_SELFTEST=1` 跑满帧退出；`CTP_SHOT=路径` 保存一帧界面。
+pub struct ShotJob {
+    pub path: String,
+    /// 还要等多少帧再请求截图（等字体与数据就绪）
+    pub wait: u32,
+    pub requested: bool,
+}
+
 /// 应用状态。
 pub struct App {
     pub mode: ThemeMode,
@@ -123,6 +135,8 @@ pub struct App {
 
     pub pay_contract: Option<String>,
     pub pay_form: PayForm,
+    /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
+    pub pay_detail: Option<Payment>,
     pub new_contract: ContractForm,
     pub audit_form: AuditForm,
     pub amount_form: AmountForm,
@@ -134,6 +148,8 @@ pub struct App {
     pub toast: Option<Toast>,
     /// 冒烟模式剩余帧数（`CTP_SELFTEST=1` 时启用）
     pub smoke: Option<u32>,
+    /// 自动截图任务（`CTP_SHOT=<文件>` 时启用）
+    pub shot: Option<ShotJob>,
 }
 
 fn exe_dir() -> PathBuf {
@@ -141,6 +157,16 @@ fn exe_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// GUI 子系统没有控制台，崩溃信息默认无处可看：把 panic 落到 exe 同级 `data/panic.log`。
+fn install_panic_log() {
+    let dir = exe_dir().join("data");
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = std::fs::create_dir_all(&dir);
+        let body = format!("[{}] {info}\n", ctp_core::date::now_iso());
+        let _ = std::fs::write(dir.join("panic.log"), body);
+    }));
 }
 
 /// 启动主题，可用环境变量 `CTP_THEME=dark` 指定（默认浅色）。
@@ -196,6 +222,7 @@ impl App {
             detail: None,
             pay_contract: None,
             pay_form: PayForm::default(),
+            pay_detail: None,
             new_contract: ContractForm::default(),
             audit_form: AuditForm::default(),
             amount_form: AmountForm::default(),
@@ -209,6 +236,14 @@ impl App {
             } else {
                 None
             },
+            shot: std::env::var("CTP_SHOT").ok().map(|path| ShotJob {
+                path,
+                wait: std::env::var("CTP_SHOT_FRAME")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(40),
+                requested: false,
+            }),
         };
 
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -234,7 +269,7 @@ impl App {
         app
     }
 
-    /// 启动时直接打开某个弹窗（`CTP_DIALOG=new_contract|audit_price|edit_amount`）。
+    /// 启动时直接打开某个弹窗（`CTP_DIALOG=new_contract|audit_price|edit_amount|payment_detail`）。
     ///
     /// 供自动化截图与问题复现使用；正常启动不受影响。
     fn open_initial_dialog(&mut self) {
@@ -266,6 +301,12 @@ impl App {
                     self.screen = Screen::Payments;
                     self.pay_contract = Some(pm.contract_id.clone());
                     self.confirm = Some(Confirm::VoidPayment(pm));
+                }
+            }
+            "payment_detail" => {
+                if let Some(pm) = self.payments.first().cloned() {
+                    self.pay_detail = Some(pm);
+                    self.dialog = Dialog::PaymentDetail;
                 }
             }
             _ => {}
@@ -325,6 +366,20 @@ impl App {
             .db
             .as_ref()
             .and_then(|c| repo::get_contract(c, id).ok());
+    }
+
+    /// 跳到合同台账并选中该合同（总览里点合同编号时用）。
+    pub fn goto_contract(&mut self, id: &str) {
+        self.select(id);
+        self.screen = Screen::Contracts;
+    }
+
+    /// 打开拨款单详情弹窗（总览、拨款明细里点单号时用）。
+    pub fn open_payment(&mut self, id: &str) {
+        if let Some(pm) = self.payments.iter().find(|x| x.id == id) {
+            self.pay_detail = Some(pm.clone());
+            self.dialog = Dialog::PaymentDetail;
+        }
     }
 
     pub fn toast(&mut self, tone: Tone, text: impl Into<String>) {
@@ -562,8 +617,20 @@ fn nav_item(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool, narrow: 
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn shorten_path(path: &str) -> String {
-    let s = path.replace('\\', "/");
+/// 把渲染器截图写成 PPM（P6），避免为一个调试用途引入图片编码依赖。
+fn write_ppm(path: &str, image: &egui::ColorImage) {
+    let (w, h) = (image.size[0], image.size[1]);
+    let mut buf = Vec::with_capacity(w * h * 3 + 32);
+    buf.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
+    for px in &image.pixels {
+        buf.push(px.r());
+        buf.push(px.g());
+        buf.push(px.b());
+    }
+    let _ = std::fs::write(path, buf);
+}
+
+fn shorten_path(path: &str) -> String {    let s = path.replace('\\', "/");
     if s.chars().count() <= 46 {
         return s;
     }
@@ -577,6 +644,34 @@ fn shorten_path(path: &str) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 自动截图：`CTP_SHOT=<文件.ppm>`。走渲染器自己的截图通道，
+        // 不依赖窗口是否在前台，也不受遮挡影响（PrintWindow 对 GPU 窗口常返回空白）。
+        if self.shot.is_some() {
+            let got = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(img) = got {
+                if let Some(job) = self.shot.take() {
+                    write_ppm(&job.path, &img);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            let job = self.shot.as_mut().expect("shot exists");
+            if job.requested {
+                ctx.request_repaint();
+            } else if job.wait == 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                job.requested = true;
+                ctx.request_repaint();
+            } else {
+                job.wait -= 1;
+                ctx.request_repaint();
+            }
+        }
         // 冒烟模式：跑满若干帧后自行退出，并落一个结果文件。
         // 用于在无法截图的环境（窗口被遮挡 / 远程会话）里确认界面确实在正常渲染。
         if let Some(left) = self.smoke {
@@ -644,6 +739,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    install_panic_log();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1380.0, 880.0])
@@ -651,9 +747,19 @@ fn main() -> eframe::Result<()> {
             .with_title("工程合同台账与拨款管理平台"),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "工程合同台账与拨款管理平台",
         opts,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    );
+    // GUI 模式看不到 stderr：启动失败（缺图形驱动等）时落一份日志，避免「双击没反应」。
+    if let Err(e) = &result {
+        let dir = exe_dir().join("data");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("startup-error.log"),
+            format!("[{}] {e}\n", ctp_core::date::now_iso()),
+        );
+    }
+    result
 }

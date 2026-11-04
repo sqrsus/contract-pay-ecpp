@@ -4,10 +4,18 @@ use crate::screens::page_header;
 use crate::widgets::{self, Tone};
 use crate::{App, Confirm};
 use ctp_app::service;
+use ctp_core::contract::ContractStatus;
 use ctp_core::date::is_iso_date;
 use ctp_core::money::Money;
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
+
+/// 合同状态的显示名（未知代码原样返回）。
+fn status_label(status: &str) -> &str {
+    ContractStatus::from_code(status)
+        .map(|x| x.label())
+        .unwrap_or(status)
+}
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
@@ -33,7 +41,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let current_label = current
         .as_ref()
         .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
-        .map(|s| format!("{} {}", s.contract_no, s.contract_name))
+        .map(|s| {
+            format!(
+                "{} {}（{}）",
+                s.contract_no,
+                s.contract_name,
+                status_label(&s.status)
+            )
+        })
         .unwrap_or_else(|| "请选择合同".into());
 
     let mut pick: Option<String> = None;
@@ -46,7 +61,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 for s in &app.summaries {
                     let sel = current.as_deref() == Some(&s.contract_id);
                     if ui
-                        .selectable_label(sel, format!("{} {}", s.contract_no, s.contract_name))
+                        .selectable_label(
+                            sel,
+                            format!(
+                                "{} {}（{}）",
+                                s.contract_no,
+                                s.contract_name,
+                                status_label(&s.status)
+                            ),
+                        )
                         .clicked()
                     {
                         pick = Some(s.contract_id.clone());
@@ -86,8 +109,45 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     };
     let avail_cent = quota.as_ref().map(|q| q.available_amount.cent()).unwrap_or(0);
     let overdue = quota.as_ref().map(|q| q.available_amount.cent() < 0).unwrap_or(false);
+    let is_draft = s.status == ContractStatus::Draft.code();
+    let payable = ContractStatus::from_code(&s.status)
+        .map(|x| x.is_payable())
+        .unwrap_or(false);
+    // 待办动作先收集，等借用释放后再落到 App 上
+    let mut goto_contract: Option<String> = None;
+    let mut open_pay: Option<String> = None;
 
     ui.add_space(10.0);
+
+    // ---------------- 不可付提示
+    if !payable {
+        widgets::soft_box(&p, p.warn_soft).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "该合同当前为「{}」，不可登记拨款。",
+                        status_label(&s.status)
+                    ))
+                    .size(12.5)
+                    .strong()
+                    .color(p.warn),
+                );
+                if is_draft {
+                    if widgets::link(ui, &p, "去合同台账设为生效 →", 12.5).clicked() {
+                        goto_contract = Some(cid.clone());
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("作废合同不再接受新的拨款单。")
+                            .size(12.0)
+                            .color(p.text_muted),
+                    );
+                }
+            });
+        });
+        ui.add_space(10.0);
+    }
 
     // ---------------- 额度卡片
     let avail_w = ui.available_width();
@@ -95,19 +155,32 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let cols = (((avail_w + gap) / 252.0).floor() as usize).clamp(1, 4);
     let w = (avail_w - gap * (cols as f32 - 1.0)) / cols as f32;
     let cards: Vec<(&str, String, String, Tone)> = vec![
-        ("有效计价基准", format!("{base} 元"), format!("容差 {tol_bp} bp"), Tone::Neutral),
-        ("累计已付", format!("{paid} 元"), rate.clone(), Tone::Primary),
+        (
+            "有效计价基准",
+            base.clone(),
+            format!("元 · 容差 {tol_bp} bp"),
+            Tone::Neutral,
+        ),
+        (
+            "累计已付",
+            paid.clone(),
+            format!("元 · 已付率 {rate}"),
+            Tone::Primary,
+        ),
         (
             "可付额度",
-            format!("{avail} 元"),
-            if overdue { "已超额，需先处理" } else { "上限 − 已付" }.to_string(),
+            avail.clone(),
+            format!(
+                "元 · {}",
+                if overdue { "已超额，需先处理" } else { "上限 − 已付" }
+            ),
             if overdue { Tone::Danger } else { Tone::Success },
         ),
         (
             "已登记单据",
             format!("{} 笔", app.payments.iter().filter(|x| x.contract_id == cid).count()),
             format!(
-                "其中作废 {} 笔",
+                "作废 {} 笔",
                 app.payments
                     .iter()
                     .filter(|x| {
@@ -204,7 +277,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let amount_ok = amount.map(|m| m.cent() > 0).unwrap_or(false);
                     let date_ok = is_iso_date(&app.pay_form.date);
                     let over = amount.map(|m| m.cent() > avail_cent).unwrap_or(false);
-                    let ok = amount_ok && date_ok && !over;
+                    let ok = amount_ok && date_ok && !over && payable;
 
                     ui.add_space(9.0);
                     if over {
@@ -231,6 +304,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     if widgets::primary_button(ui, &p, "登记拨款单", ok).clicked() && ok {
                         submit = true;
+                    }
+                    if !payable {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("当前合同不可拨款，按钮已禁用")
+                                .size(11.0)
+                                .color(p.text_muted),
+                        );
                     }
                 });
             },
@@ -277,11 +358,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 for pm in rows.iter().copied() {
                                     body.row(30.0, |mut row| {
                                         row.col(|ui| {
-                                            ui.label(
-                                                RichText::new(&pm.payment_no)
-                                                    .size(12.0)
-                                                    .color(p.primary),
-                                            );
+                                            if widgets::link(ui, &p, &pm.payment_no, 12.0).clicked()
+                                            {
+                                                open_pay = Some(pm.id.clone());
+                                            }
                                         });
                                         row.col(|ui| {
                                             ui.label(
@@ -376,5 +456,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some(pm) = void_target {
         app.confirm_reason.clear();
         app.confirm = Some(Confirm::VoidPayment(pm));
+    }
+    if let Some(id) = goto_contract {
+        app.goto_contract(&id);
+        return;
+    }
+    if let Some(id) = open_pay {
+        app.open_payment(&id);
     }
 }

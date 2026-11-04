@@ -12,6 +12,7 @@
 
 # 构建与测试日志
 build-log.txt
+build-*.log
 test-report.txt
 test-summary.txt
 verify.txt

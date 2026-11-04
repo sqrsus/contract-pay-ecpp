@@ -188,6 +188,20 @@ pub fn danger_solid_button(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) 
 
 /// 紧凑次要按钮：用在详情卡这类宽度受限的行内。
 pub fn ghost_button_sm(ui: &mut Ui, p: &Palette, text: &str) -> Response {
+    ghost_button_sm_on(ui, p, text, true)
+}
+
+/// 紧凑次要按钮（可禁用）：禁用时置灰描边，明显不像可点。
+pub fn ghost_button_sm_on(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> Response {
+    if !enabled {
+        return ui.add(
+            egui::Button::new(RichText::new(text).size(12.5).color(p.text_muted))
+                .fill(p.surface_alt)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .rounding(Rounding::same(7.0))
+                .min_size(Vec2::new(0.0, 28.0)),
+        );
+    }
     ui.add(
         egui::Button::new(RichText::new(text).size(12.5).color(p.text))
             .fill(p.surface)
@@ -195,6 +209,29 @@ pub fn ghost_button_sm(ui: &mut Ui, p: &Palette, text: &str) -> Response {
             .rounding(Rounding::same(7.0))
             .min_size(Vec2::new(0.0, 28.0)),
     )
+}
+
+/// 紧凑主按钮：详情卡里的「设为生效」这类唯一主行动。
+pub fn primary_button_sm(ui: &mut Ui, p: &Palette, text: &str) -> Response {
+    ui.scope(|ui| {
+        let w = &mut ui.style_mut().visuals.widgets;
+        for (state, fill) in [
+            (&mut w.inactive, p.primary),
+            (&mut w.hovered, p.primary_hover),
+            (&mut w.active, p.primary_active),
+        ] {
+            state.bg_fill = fill;
+            state.weak_bg_fill = fill;
+            state.bg_stroke = Stroke::NONE;
+            state.fg_stroke = Stroke::new(1.0_f32, p.on_primary);
+        }
+        ui.add(
+            egui::Button::new(RichText::new(text).size(12.5).color(p.on_primary))
+                .rounding(Rounding::same(7.0))
+                .min_size(Vec2::new(0.0, 28.0)),
+        )
+    })
+    .inner
 }
 
 /// 紧凑危险按钮。
@@ -253,6 +290,42 @@ pub fn th(ui: &mut Ui, p: &Palette, text: &str, right: bool) {
     } else {
         ui.label(label);
     }
+}
+
+/// 可点击文字：列表里的编号。悬停出下划线 + 手型光标。
+pub fn link(ui: &mut Ui, p: &Palette, text: &str, size: f32) -> Response {
+    link_colored(ui, text, size, p.primary, p.primary)
+}
+
+/// 弱化的可点击文字：常态灰、悬停主色下划线，避免和主编号抢注意力。
+pub fn link_muted(ui: &mut Ui, p: &Palette, text: &str, size: f32) -> Response {
+    link_colored(ui, text, size, p.text_muted, p.primary)
+}
+
+fn link_colored(
+    ui: &mut Ui,
+    text: &str,
+    size: f32,
+    color: Color32,
+    hover: Color32,
+) -> Response {
+    let resp = ui
+        .add(
+            egui::Label::new(RichText::new(text).size(size).color(color))
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.hovered() {
+        let r = resp.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(r.left(), r.bottom() - 1.5),
+                egui::pos2(r.right(), r.bottom() - 1.5),
+            ],
+            Stroke::new(1.0_f32, hover),
+        );
+    }
+    resp
 }
 
 /// 表格「合计行」上方的分隔线。须在表格绘制完成后调用，`(left, right)` 取表格横向范围。

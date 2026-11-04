@@ -100,9 +100,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             |ui| {
                 widgets::card(&p).show(ui, |ui| {
                     ui.set_width(left_w - 34.0);
-                    widgets::section_title(ui, &p, "最近拨款", "按开单日期倒序，最多 6 条");
+                    widgets::section_title(ui, &p, "最近拨款", "点单号看详情，点合同编号跳到台账");
                     ui.add_space(6.0);
-                    let mut recent: Vec<(String, String, String, i64, String)> = app
+                    // (单 ID, 开单日期, 单号, 合同 ID, 合同编号, 金额, 是否作废)
+                    let mut recent: Vec<(String, String, String, String, String, i64, bool)> = app
                         .payments
                         .iter()
                         .map(|pm| {
@@ -113,19 +114,23 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 .map(|s| s.contract_no.clone())
                                 .unwrap_or_else(|| "—".into());
                             (
+                                pm.id.clone(),
                                 pm.pay_date.clone(),
                                 pm.payment_no.clone(),
+                                pm.contract_id.clone(),
                                 cno,
                                 pm.amount_cent.cent(),
-                                pm.status.label().to_string(),
+                                pm.status == ctp_core::payment::PaymentStatus::Void,
                             )
                         })
                         .collect();
-                    recent.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+                    recent.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
                     if recent.is_empty() {
                         widgets::empty_state(ui, &p, "尚无拨款记录，去「拨款管理」登记第一笔。");
                     } else {
-                        for (i, (date, no, cno, amount, status)) in
+                        let mut open_pay: Option<String> = None;
+                        let mut goto_contract: Option<String> = None;
+                        for (i, (pay_id, date, no, contract_id, cno, amount, voided)) in
                             recent.into_iter().take(6).enumerate()
                         {
                             if i > 0 {
@@ -133,17 +138,26 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             }
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(date).size(12.0).color(p.text_muted));
-                                ui.label(RichText::new(no).size(12.5).color(p.primary));
-                                ui.label(RichText::new(cno).size(12.0).color(p.text_muted));
+                                if widgets::link(ui, &p, &no, 12.5).clicked() {
+                                    open_pay = Some(pay_id);
+                                }
+                                if cno != "—" && widgets::link_muted(ui, &p, &cno, 12.0).clicked() {
+                                    goto_contract = Some(contract_id);
+                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        let tone = if status == "作废" {
+                                        let tone = if voided {
                                             Tone::Neutral
                                         } else {
                                             Tone::Success
                                         };
-                                        widgets::badge(ui, &p, &status, tone);
+                                        widgets::badge(
+                                            ui,
+                                            &p,
+                                            if voided { "作废" } else { "已付" },
+                                            tone,
+                                        );
                                         ui.label(
                                             RichText::new(
                                                 Money::from_cent(amount).format_yuan(),
@@ -155,6 +169,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     },
                                 );
                             });
+                        }
+                        if let Some(id) = open_pay {
+                            app.open_payment(&id);
+                        }
+                        if let Some(id) = goto_contract {
+                            app.goto_contract(&id);
                         }
                     }
                 });

@@ -33,7 +33,7 @@ D:\pay2
 │  │  ├─ service.rs           合同登记/生效/作废、金额编辑、审计价、拨款登记/作废、对账
 │  │  ├─ checks.rs            六项口径自检（界面「运行自检」的唯一实现）
 │  │  ├─ history.rs           金额与审计价变更历史（JSON，保留 50 条）
-│  │  └─ tests/consistency.rs 11 项集成断言（评审条目逐条对应）
+│  │  └─ tests/consistency.rs 12 项集成断言（评审条目逐条对应）
 │  └─ ctp-gui/                egui 桌面界面：六个页面 + 四类弹窗，浅色 / 深色双主题
 ├─ scripts/                   WSL 构建 / 端到端演练 / 界面截图核验
 └─ docs/口径主表.md           金额与比率的单一事实来源
@@ -56,7 +56,7 @@ export CARGO_TARGET_DIR="$HOME/target-ctp"
 cd /mnt/d/pay2
 
 cargo build --workspace          # 编译（首次会编译 bundled SQLite，约 1 分钟）
-cargo test  --workspace          # 45 项测试
+cargo test  --workspace          # 46 项测试
 ```
 
 或直接跑现成脚本：
@@ -82,6 +82,24 @@ P0 全在本期、外键无悬空、已付口径与「仅 PAID 合计」一致�
 
 窗口可自由缩放，最小 1000×640；宽度小于 1100px 时左侧导航折叠为缩写并带悬停提示。
 右上角可切换浅色 / 深色。
+
+**发布版不带控制台窗口**：`main.rs` 在非 debug 构建里声明了
+`windows_subsystem = "windows"`，双击即直接进界面；崩溃信息写到同级的
+`data/panic.log`，启动失败写 `data/startup-error.log`（GUI 模式看不到 stderr）。
+
+### 界面自动核验
+
+界面没有控制台输出，因此内置几个环境变量开关（正常启动不生效）：
+
+```powershell
+$env:CTP_SELFTEST=1; .\ctp-gui.exe        # 跑 40 帧后退出，写 data/smoke.txt（页名 / 合同数 / 拨款数）
+$env:CTP_SHOT="out.ppm"; .\ctp-gui.exe    # 等界面稳定后由渲染器保存一帧，退出码 0
+$env:CTP_SCREEN="payments"; $env:CTP_THEME="dark"   # 指定启动页与主题
+$env:CTP_DIALOG="new_contract"             # 启动即打开弹窗，另有 payment_detail / audit_price / edit_amount / void_payment
+```
+
+`scripts/gui_probe.py` 在此之上提供截图与点击回放。打印窗口（PrintWindow）对
+GPU 呈现的窗口常返回空白，可加 `grab=screen` 改走屏幕直抓。
 
 ### 界面预览
 

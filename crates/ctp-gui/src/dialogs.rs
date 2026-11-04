@@ -4,7 +4,7 @@
 //! 必填未填或数值非法时按钮置灰，避免用户点了才看到报错。
 
 use crate::theme::Palette;
-use crate::widgets;
+use crate::widgets::{self, Tone};
 use crate::App;
 use ctp_app::service::{self, NewContract, NewPayment};
 use ctp_core::contract::ContractType;
@@ -21,6 +21,7 @@ pub enum Dialog {
     NewContract,
     AuditPrice,
     EditAmount,
+    PaymentDetail,
 }
 
 /// 新建合同表单。
@@ -43,6 +44,8 @@ pub struct ContractForm {
     pub advance: String,
     pub terms: String,
     pub remark: String,
+    /// 保存后立即置为「生效」，否则存为草稿。
+    pub activate: bool,
 }
 
 impl Default for ContractForm {
@@ -65,6 +68,7 @@ impl Default for ContractForm {
             advance: "0".into(),
             terms: "按月计量支付，进度款支付至已完工程量的 80%，竣工验收后支付至 97%，质保金 3% 满一年退还。".into(),
             remark: String::new(),
+            activate: true,
         }
     }
 }
@@ -200,6 +204,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::NewContract => new_contract(app, ctx),
         Dialog::AuditPrice => audit_price(app, ctx),
         Dialog::EditAmount => edit_amount(app, ctx),
+        Dialog::PaymentDetail => payment_detail(app, ctx),
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
@@ -424,14 +429,24 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                 if widgets::ghost_button(ui, &p, "取消").clicked() {
                     cancel = true;
                 }
-                if !ok {
-                    ui.label(
-                        RichText::new("请补全必填项并检查金额与日期格式")
-                            .size(11.5)
-                            .color(p.text_muted),
-                    );
-                }
+                ui.add_space(10.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.selection.bg_fill = p.primary;
+                    ui.checkbox(
+                        &mut app.new_contract.activate,
+                        RichText::new("保存后立即生效（可直接拨款）").size(12.5).color(p.text),
+                    )
+                    .on_hover_text("不勾选则保存为草稿，需在合同详情卡点「设为生效」后才能登记拨款");
+                });
             });
+            if !ok {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("请补全必填项并检查金额与日期格式")
+                        .size(11.5)
+                        .color(p.text_muted),
+                );
+            }
         });
 
     if cancel {
@@ -479,6 +494,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         let terms = app.new_contract.terms.trim().to_string();
         let remark = opt(&app.new_contract.remark);
 
+        let activate = app.new_contract.activate;
         let created = app.exec(move |conn| {
             service::create_contract(
                 conn,
@@ -507,11 +523,30 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         });
         match created {
             Ok(c) => {
+                let cid = c.id.clone();
+                let cno = c.contract_no.clone();
+                // 勾选了「保存后立即生效」：紧接着做一次草稿 → 生效（本期无审批环节）
+                let act_err = if activate {
+                    app.exec(|conn| service::activate_contract(conn, &cid, "界面用户"))
+                        .err()
+                } else {
+                    None
+                };
                 app.refresh();
-                app.select(&c.id);
+                app.select(&cid);
                 app.new_contract = ContractForm::default();
                 app.dialog = Dialog::None;
-                app.success(format!("合同 {} 已建立", c.contract_no));
+                match act_err {
+                    None if activate => {
+                        app.success(format!("合同 {cno} 已建立并生效，可直接登记拨款"))
+                    }
+                    None => app.success(format!(
+                        "合同 {cno} 已保存为草稿，在详情卡点「设为生效」后即可拨款"
+                    )),
+                    Some(e) => app.error(format!(
+                        "合同 {cno} 已建立，但生效失败：{e}（当前为草稿，可在详情卡重试）"
+                    )),
+                }
             }
             Err(e) => app.error(format!("新建合同失败：{e}")),
         }
@@ -694,6 +729,125 @@ fn edit_amount(app: &mut App, ctx: &egui::Context) {
                 Err(e) => app.error(format!("修改失败：{e}")),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- 拨款单详情
+
+/// 只读的拨款单详情：从总览「最近拨款」或拨款明细点单号进来。
+fn payment_detail(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+    let Some(pm) = app.pay_detail.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let contract = app
+        .summaries
+        .iter()
+        .find(|s| s.contract_id == pm.contract_id)
+        .cloned();
+    let voided = pm.status == ctp_core::payment::PaymentStatus::Void;
+    let created = pm
+        .created_at
+        .get(0..16)
+        .map(|s| s.replace('T', " "))
+        .unwrap_or_else(|| pm.created_at.clone());
+    let mut close = false;
+    let mut goto = false;
+
+    modal(format!("拨款单 {}", pm.payment_no), &p)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} 元", pm.amount_cent.format_yuan()))
+                        .size(24.0)
+                        .strong()
+                        .color(if voided { p.text_muted } else { p.text }),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if voided {
+                        widgets::badge(ui, &p, "作废", Tone::Neutral);
+                    } else {
+                        widgets::badge(ui, &p, "已付", Tone::Success);
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(if voided {
+                    "作废单保留记录，不计入已付净额。"
+                } else {
+                    "计入该合同的累计已付。"
+                })
+                .size(11.5)
+                .color(p.text_muted),
+            );
+
+            ui.add_space(8.0);
+            widgets::divider(ui, &p);
+            widgets::kv(
+                ui,
+                &p,
+                "合同编号",
+                contract
+                    .as_ref()
+                    .map(|c| c.contract_no.as_str())
+                    .unwrap_or("—"),
+            );
+            widgets::kv(
+                ui,
+                &p,
+                "合同名称",
+                contract
+                    .as_ref()
+                    .map(|c| c.contract_name.as_str())
+                    .unwrap_or("—"),
+            );
+            widgets::kv(ui, &p, "开单日期", &pm.pay_date);
+            widgets::kv(ui, &p, "支付方式", pm.pay_method.label());
+            widgets::kv(ui, &p, "事由", pm.reason.as_deref().unwrap_or("—"));
+            if let Some(t) = &pm.title {
+                widgets::kv(ui, &p, "摘要", t);
+            }
+            widgets::kv(
+                ui,
+                &p,
+                "银行流水号",
+                pm.bank_serial_no.as_deref().unwrap_or("—"),
+            );
+            widgets::kv(ui, &p, "付款账户", pm.pay_account.as_deref().unwrap_or("—"));
+            widgets::kv(
+                ui,
+                &p,
+                "收款账户",
+                pm.receive_account.as_deref().unwrap_or("—"),
+            );
+            widgets::kv(ui, &p, "经办人", &pm.operator_id);
+            widgets::kv(ui, &p, "登记时间", &created);
+            if let Some(r) = &pm.remark {
+                widgets::kv(ui, &p, "备注", r);
+            }
+
+            ui.add_space(6.0);
+            widgets::divider(ui, &p);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                    close = true;
+                }
+                if contract.is_some() && widgets::ghost_button(ui, &p, "查看所属合同").clicked() {
+                    goto = true;
+                }
+            });
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+        app.pay_detail = None;
+    } else if goto {
+        app.dialog = Dialog::None;
+        app.pay_detail = None;
+        app.goto_contract(&pm.contract_id);
     }
 }
 
