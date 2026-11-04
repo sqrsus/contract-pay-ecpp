@@ -1,0 +1,10 @@
+[package]
+name = "ctp-store"
+version.workspace = true
+edition.workspace = true
+description = "工程合同台账与拨款管理平台 —— SQLite 持久化与视图定义"
+
+[dependencies]
+ctp-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true

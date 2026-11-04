@@ -1,0 +1,17 @@
+[package]
+name = "ctp-gui"
+version.workspace = true
+edition.workspace = true
+description = "工程合同台账与拨款管理平台 —— 桌面界面（egui）"
+
+[[bin]]
+name = "ctp-gui"
+path = "src/main.rs"
+
+[dependencies]
+ctp-core.workspace = true
+ctp-store.workspace = true
+ctp-app.workspace = true
+rusqlite.workspace = true
+eframe = "0.29"
+egui_extras = "0.29"

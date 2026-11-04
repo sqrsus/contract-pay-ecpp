@@ -1,0 +1,24 @@
+# 编译产物（WSL 侧实际 target 在 $HOME/target-ctp）
+/target/
+**/target/
+
+# 运行期数据库
+*.db
+*.db-wal
+*.db-shm
+
+# 交付区：可执行文件与演示库另行分发，仓库只放源码
+/dist/
+
+# 构建与测试日志
+build-log.txt
+test-report.txt
+test-summary.txt
+verify.txt
+
+# 本地工具与 IDE
+.workbuddy/
+__pycache__/
+*.pyc
+.vscode/
+.idea/

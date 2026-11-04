@@ -1,0 +1,12 @@
+[package]
+name = "ctp-app"
+version.workspace = true
+edition.workspace = true
+description = "工程合同台账与拨款管理平台 —— 应用服务（合同、审计价、拨款、对账）"
+
+[dependencies]
+ctp-core.workspace = true
+ctp-store.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true

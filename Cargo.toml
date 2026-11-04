@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ctp-core",
+    "crates/ctp-store",
+    "crates/ctp-app",
+    "crates/ctp-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+ctp-core = { path = "crates/ctp-core" }
+ctp-store = { path = "crates/ctp-store" }
+ctp-app = { path = "crates/ctp-app" }
+thiserror = "1"
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }

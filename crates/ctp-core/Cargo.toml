@@ -1,0 +1,8 @@
+[package]
+name = "ctp-core"
+version.workspace = true
+edition.workspace = true
+description = "工程合同台账与拨款管理平台 —— 领域层（金额、比率、合同、拨款单、可付额度）"
+
+[dependencies]
+thiserror.workspace = true
