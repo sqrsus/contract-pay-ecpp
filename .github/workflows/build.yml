@@ -1,0 +1,147 @@
+name: build
+
+# 触发条件：
+#   - push 到 main            → 跑测试 + 编 release，产物作为 artifact 保留 30 天
+#   - 向 main 提 PR           → 只跑测试，避免重复构建
+#   - 推送 v* 标签            → 额外创建 GitHub Release，附上两平台二进制与校验和
+#   - 手动 workflow_dispatch → 按需重跑
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 创建 Release 需要写权限；其余步骤实际只读
+permissions:
+  contents: write
+
+# 同一分支的旧构建自动取消，避免连续提交堆叠排队（标签发布不取消）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 增量编译在 CI 里只增体积不加速，关掉让缓存更小
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 第 1 关：全量测试。不过测试就不进入构建，省下的 runner 时间比排队更值。
+  # ctp-gui 依赖 eframe/egui，Linux 下编译需要 X11 / Wayland / OpenGL 头文件，
+  # 用 cargo test --workspace 编译它之前必须先装好这些系统库。
+  # ---------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 图形依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  # ---------------------------------------------------------------------------
+  # 第 2 关：两平台编译 release profile 的可执行文件。
+  # Windows 用 msvc 目标（runner 自带 VS Build Tools，rusqlite bundled 能直接编 sqlite3.c）；
+  # Linux 产物仅用于验证代码可移植性，桌面使用以 Windows 版为准。
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.artifact }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: ctp-windows-x64
+            bin: ctp-gui.exe
+          - os: ubuntu-latest
+            artifact: ctp-linux-x86_64
+            bin: ctp-gui
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 图形依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.artifact }}
+
+      - name: 编译 release
+        run: cargo build --release --locked -p ctp-gui
+
+      - name: 记录产物大小与校验和
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh "target/release/${{ matrix.bin }}"
+          sha256sum "target/release/${{ matrix.bin }}"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 第 3 关：只有打 v* 标签才发布。把两个平台的产物下载下来，
+  # 生成 SHA256SUMS.txt 一并挂到 Release，便于分发时校验完整性。
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          set -euo pipefail
+          cd artifacts
+          ls -lh
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "自动构建产物，由 ${GITHUB_SHA::7} 编译。Windows 版解压后双击 ctp-gui.exe 即可运行。" \
+            --verify-tag
