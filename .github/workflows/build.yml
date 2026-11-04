@@ -139,9 +139,11 @@ jobs:
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 本 job 没有 checkout，gh 无法从 git remote 推断仓库，必须显式指定
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" artifacts/* \
             --title "${GITHUB_REF_NAME}" \
-            --notes "自动构建产物，由 ${GITHUB_SHA::7} 编译。Windows 版解压后双击 ctp-gui.exe 即可运行。" \
+            --generate-notes \
             --verify-tag
