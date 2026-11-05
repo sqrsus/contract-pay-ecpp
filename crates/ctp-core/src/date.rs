@@ -42,6 +42,32 @@ fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// 自然年上加年：`2024-05-10` + 2 → `2026-05-10`。
+///
+/// 2 月 29 日落到非闰年时归到 2 月 28 日，避免算出不存在的日期。
+pub fn plus_years(date: &str, years: i32) -> Option<String> {
+    if !is_iso_date(date) {
+        return None;
+    }
+    let y: i32 = date[0..4].parse().ok()?;
+    let m: u32 = date[5..7].parse().ok()?;
+    let d: u32 = date[8..10].parse().ok()?;
+    let ny = y + years;
+    let nd = d.min(days_in_month(ny, m));
+    Some(format!("{ny:04}-{m:02}-{nd:02}"))
+}
+
+/// `from` 到 `as_of` 是否已**严格超过** `years` 个自然年。
+///
+/// 例：`from = 2024-05-10`、`years = 2` 时，`as_of = 2026-05-10` 返回 false，
+/// `as_of = 2026-05-11` 返回 true。ISO 日期可直接按字符串比较。
+pub fn years_elapsed_over(from: &str, as_of: &str, years: i32) -> bool {
+    match plus_years(from, years) {
+        Some(limit) => is_iso_date(as_of) && as_of > limit.as_str(),
+        None => false,
+    }
+}
+
 pub fn validate_iso_date(s: &str) -> Result<()> {
     if is_iso_date(s) {
         Ok(())
@@ -134,5 +160,19 @@ mod tests {
     fn 公历还原基准点() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
+    }
+
+    #[test]
+    fn 自然年加年与满年判定() {
+        assert_eq!(plus_years("2024-05-10", 2).as_deref(), Some("2026-05-10"));
+        // 闰日归到平年 2 月 28 日
+        assert_eq!(plus_years("2024-02-29", 1).as_deref(), Some("2025-02-28"));
+        assert_eq!(plus_years("2026-13-01", 2), None);
+
+        assert!(years_elapsed_over("2024-05-10", "2026-05-11", 2));
+        assert!(!years_elapsed_over("2024-05-10", "2026-05-10", 2), "同日不算超过");
+        assert!(!years_elapsed_over("2024-05-10", "2026-05-09", 2));
+        // 开单日期早于交工日期（录错）按未满处理
+        assert!(!years_elapsed_over("2026-05-10", "2026-01-01", 2));
     }
 }

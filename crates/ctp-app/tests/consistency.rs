@@ -63,6 +63,19 @@ fn project_and_org(conn: &Connection) {
 }
 
 fn fixture(amount_yuan: i64) -> (Connection, String) {
+    // 默认「非施工 + 已交工」：不受付清条件封顶，用于验证原始额度口径。
+    fixture_with(
+        amount_yuan,
+        ctp_core::contract::ContractType::Service,
+        Some("2020-01-01"),
+    )
+}
+
+fn fixture_with(
+    amount_yuan: i64,
+    ctype: ctp_core::contract::ContractType,
+    delivery: Option<&str>,
+) -> (Connection, String) {
     let mut conn = db::open_in_memory().unwrap();
     db::migrate(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
@@ -72,12 +85,14 @@ fn fixture(amount_yuan: i64) -> (Connection, String) {
         NewContract {
             project_id: "PJ-1".into(),
             contract_name: "测试合同".into(),
+            contract_type: ctype,
             contract_category_code: "GC".into(),
             category_id: Some("C02".into()),
             party_a: "某建设单位".into(),
             contractor_id: "ORG-1".into(),
             sign_date: "2026-01-10".into(),
             original_amount: Money::from_cent(amount_yuan * 100),
+            delivery_date: delivery.map(str::to_string),
             payment_terms: "按月计量支付".into(),
             ..Default::default()
         },
@@ -192,6 +207,89 @@ fn 容差内放行_超容差拦截() {
     // 容差内剩余 5 元可拨
     pay(&mut conn, &cid, 5).unwrap();
     assert_eq!(repo::paid_net(&conn, &cid).unwrap().cent(), 101_000);
+}
+
+#[test]
+fn 未交工合同封顶八成() {
+    let (mut conn, cid) = fixture_with(1000, ctp_core::contract::ContractType::Construct, None);
+
+    pay(&mut conn, &cid, 700).unwrap();
+    let err = pay(&mut conn, &cid, 101).unwrap_err();
+    assert!(err.is_payment_blocked(), "应为付清条件拦截，实得 {err}");
+
+    // 恰好推到有效计价基准的 80% 可以通过
+    pay(&mut conn, &cid, 100).unwrap();
+    assert_eq!(repo::paid_net(&conn, &cid).unwrap().cent(), 80_000);
+    // 再付 1 分即被拦
+    assert!(pay(&mut conn, &cid, 1).unwrap_err().is_payment_blocked());
+
+    let q = service::quota_on(&conn, &cid, "2026-03-31").unwrap();
+    assert_eq!(q.cap_bp, 8_000);
+    assert_eq!(q.payable_amount.cent(), 0);
+    assert!(q.limit_note.unwrap().contains("未登记交工日期"));
+}
+
+#[test]
+fn 施工合同付清需审定且交工满两年() {
+    // 交工 2024-06-01：距开单日 2026-03-31 不满 2 年
+    let (mut conn, cid) = fixture_with(
+        1000,
+        ctp_core::contract::ContractType::Construct,
+        Some("2024-06-01"),
+    );
+
+    // 未审定 → 80% 封顶
+    assert!(pay(&mut conn, &cid, 900).unwrap_err().is_payment_blocked());
+    pay(&mut conn, &cid, 800).unwrap();
+
+    // 补登记审计价，仍不满 2 年 → 不得付清
+    service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(100_000)),
+        None,
+        None,
+        None,
+        "结算审定",
+        "t",
+    )
+    .unwrap();
+    let err = pay(&mut conn, &cid, 200).unwrap_err();
+    assert!(err.is_payment_blocked(), "交工未满 2 年不得付清，实得 {err}");
+
+    // 交工日期提前到 2023-01-01（+2 年 = 2025-01-01 < 开单日）→ 可付清
+    service::set_delivery_date(&mut conn, &cid, "2023-01-01", "t").unwrap();
+    pay(&mut conn, &cid, 200).unwrap();
+    let q = service::quota_on(&conn, &cid, "2026-03-31").unwrap();
+    assert!(q.is_settled());
+    assert_eq!(q.cap_bp, 10_000);
+    assert!(q.limit_note.is_none());
+}
+
+#[test]
+fn 满两年当日仍不可付清() {
+    // 交工 2024-03-31，开单 2026-03-31：同日不算「大于 2 年」
+    let (mut conn, cid) = fixture_with(
+        1000,
+        ctp_core::contract::ContractType::Construct,
+        Some("2024-03-31"),
+    );
+    service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(100_000)),
+        None,
+        None,
+        None,
+        "结算审定",
+        "t",
+    )
+    .unwrap();
+    pay(&mut conn, &cid, 800).unwrap();
+    assert!(pay(&mut conn, &cid, 200).unwrap_err().is_payment_blocked());
+
+    let q = service::quota_on(&conn, &cid, "2026-04-01").unwrap();
+    assert_eq!(q.cap_bp, 10_000, "开单日推到满 2 年之后即可付清");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use crate::history;
 use ctp_core::attachment::{Attachment, AttachmentKind};
-use ctp_core::contract::{Contract, ContractStatus, ContractType, PricingMethod};
+use ctp_core::contract::{BidMethod, Contract, ContractStatus, ContractType, PricingMethod};
 use ctp_core::date::{now_iso, validate_iso_date};
 use ctp_core::digest;
 use ctp_core::error::DomainError;
@@ -41,11 +41,24 @@ pub struct NewContract {
     pub duration_days: i64,
     pub planned_start: Option<String>,
     pub planned_end: Option<String>,
+    /// 交工日期（YYYY-MM-DD）
+    pub delivery_date: Option<String>,
     pub pricing_method: Option<PricingMethod>,
     pub retention_rate_bp: i32,
     pub advance_rate_bp: i32,
     pub payment_terms: String,
     pub remark: Option<String>,
+    // —— 新建合同页扩展字段（评审后增补，全部选填）——
+    /// 招标方式
+    pub bid_method: Option<BidMethod>,
+    /// 开标时间（YYYY-MM-DD）
+    pub open_bid_date: Option<String>,
+    /// 项目负责人
+    pub project_leader: Option<String>,
+    /// 联系方式
+    pub contact_info: Option<String>,
+    /// 招标代理名称；为空时用来解析/建档进 `org_contractor`（角色 AGENT）
+    pub bid_agent_text: Option<String>,
 }
 
 impl Default for NewContract {
@@ -66,11 +79,17 @@ impl Default for NewContract {
             duration_days: 0,
             planned_start: None,
             planned_end: None,
+            delivery_date: None,
             pricing_method: None,
             retention_rate_bp: 300,
             advance_rate_bp: 0,
             payment_terms: String::new(),
             remark: None,
+            bid_method: None,
+            open_bid_date: None,
+            project_leader: None,
+            contact_info: None,
+            bid_agent_text: None,
         }
     }
 }
@@ -284,6 +303,26 @@ pub fn create_contract(
     )?;
     let party_a = resolve_owner(&tx, &input.party_a, operator)?;
 
+    // 招标代理：与承包单位同路径，但以 AGENT 角色建档，避免混入承包单位联想列表
+    let bid_agent_id = match input.bid_agent_text.as_deref().map(|s| s.trim()) {
+        Some(name) if !name.is_empty() => {
+            Some(ensure_contractor(&tx, name, ContractorRole::Agent, operator)?)
+        }
+        _ => None,
+    };
+
+    // 开标时间仅作格式校验（选填）；空串归一为 None
+    let open_bid_date = input
+        .open_bid_date
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            validate_iso_date(s)?;
+            Ok::<_, StoreError>(s.to_string())
+        })
+        .transpose()?;
+
     let year = year_of(&input.sign_date);
     let seq = db::next_sequence(&tx, &format!("contract_no:{year}"))?;
     let contract_no = ids::contract_no(&year, seq);
@@ -299,6 +338,7 @@ pub fn create_contract(
         }
     }
 
+    let delivery_date = input.delivery_date.filter(|d| !d.trim().is_empty());
     let c = Contract {
         id: ids::new_id("CT"),
         project_id,
@@ -322,6 +362,7 @@ pub fn create_contract(
         planned_end: input.planned_end,
         actual_start: None,
         actual_end: None,
+        delivery_date,
         pricing_method: input.pricing_method,
         retention_rate_bp: input.retention_rate_bp,
         advance_rate_bp: input.advance_rate_bp,
@@ -334,6 +375,11 @@ pub fn create_contract(
         created_by: Some(operator.to_string()),
         updated_at: now,
         updated_by: Some(operator.to_string()),
+        bid_method: input.bid_method,
+        open_bid_date,
+        project_leader: input.project_leader,
+        contact_info: input.contact_info,
+        bid_agent_id,
     };
     c.validate()?;
     repo::insert_contract(&tx, &c)?;
@@ -580,8 +626,42 @@ pub fn register_audit_price(
     Ok(c)
 }
 
-// ---------------------------------------------------------------- 拨款
+/// 项目交工：登记 / 修改交工日期（覆盖写，写审计日志）。
+pub fn set_delivery_date(
+    conn: &mut Connection,
+    contract_id: &str,
+    date: &str,
+    operator: &str,
+) -> Result<Contract> {
+    validate_iso_date(date)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut c = repo::get_contract(&tx, contract_id)?;
+    if c.is_deleted {
+        return Err(DomainError::Invariant("合同已删除，不能登记交工".into()).into());
+    }
+    let old = c.delivery_date.clone();
+    c.delivery_date = Some(date.trim().to_string());
+    c.updated_at = now_iso();
+    c.updated_by = Some(operator.to_string());
+    repo::update_contract(&tx, &c)?;
+    let detail = format!(
+        "交工日期 {}（原 {}）",
+        date.trim(),
+        old.unwrap_or_else(|| "未登记".into())
+    );
+    db::insert_audit_log(
+        &tx,
+        "ct_contract",
+        &c.id,
+        "SET_DELIVERY_DATE",
+        Some(&detail),
+        operator,
+    )?;
+    tx.commit()?;
+    Ok(c)
+}
 
+// ---------------------------------------------------------------- 拨款
 /// 登记拨款单：额度校验（BR-01）与流水号自增在同一事务内。
 pub fn register_payment(
     conn: &mut Connection,
@@ -597,8 +677,8 @@ pub fn register_payment(
     let mut c = repo::get_contract(&tx, &input.contract_id)?;
     let paid = repo::paid_net(&tx, &c.id)?;
     let tolerance = db::tolerance(&tx)?;
-    // 1) 合同须可拨款；2) 本次金额不得超过可付额度
-    let quota = PaymentQuota::for_new_payment(&c, paid, tolerance)?;
+    // 1) 合同须可拨款；2) 本次金额不得超过「付清条件」下的可付额度
+    let quota = PaymentQuota::for_new_payment(&c, paid, tolerance, &input.pay_date)?;
     quota.check_new_payment(input.amount)?;
 
     let now = now_iso();
@@ -692,12 +772,24 @@ pub fn void_payment(
 
 // ---------------------------------------------------------------- 查询与对账
 
-/// 当前可付额度（展示用，不在事务内加锁）。
+/// 当前可付额度（展示用，不在事务内加锁）。按「今天」判定付清条件。
 pub fn quota_of(conn: &Connection, contract_id: &str) -> Result<PaymentQuota> {
+    quota_on(conn, contract_id, &ctp_core::date::today_iso())
+}
+
+/// 指定开单日期的可付额度：界面按表单里填的开单日期实时展示，
+/// 与 `register_payment` 的校验口径完全一致（交工满 2 年按开单日判定）。
+pub fn quota_on(conn: &Connection, contract_id: &str, pay_date: &str) -> Result<PaymentQuota> {
     let c = repo::get_contract(conn, contract_id)?;
     let paid = repo::paid_net(conn, contract_id)?;
     let tolerance = db::tolerance(conn)?;
-    Ok(PaymentQuota::compute(&c, paid, Money::ZERO, tolerance)?)
+    let today = ctp_core::date::today_iso();
+    let date = if ctp_core::date::is_iso_date(pay_date) {
+        pay_date
+    } else {
+        today.as_str()
+    };
+    Ok(PaymentQuota::compute(&c, paid, Money::ZERO, tolerance, date)?)
 }
 
 /// 口径对账（H1 / 5.5 约束第 5 条）：视图 `pay_rate_bp` 必须等于 `Rate::ratio`。

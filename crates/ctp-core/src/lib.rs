@@ -22,10 +22,12 @@ pub mod scope;
 
 pub use amount_cn::rmb_uppercase;
 pub use attachment::{Attachment, AttachmentKind, MAX_ATTACHMENT_BYTES};
-pub use contract::{Contract, ContractStatus, ContractType, PricingMethod, BUSINESS_FIELDS};
+pub use contract::{
+    BidMethod, Contract, ContractStatus, ContractType, PricingMethod, BUSINESS_FIELDS,
+};
 pub use error::{DomainError, Result};
 pub use ledger::{CategoryRow, ContractSummary, LedgerRow, PeriodRow};
 pub use money::Money;
 pub use payment::{PayMethod, Payment, PaymentStatus};
-pub use quota::{BreachLevel, PaymentQuota};
+pub use quota::{pay_limit, pay_limit_for, BreachLevel, PaymentQuota, PayLimit};
 pub use rate::Rate;

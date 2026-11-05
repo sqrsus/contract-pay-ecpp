@@ -40,6 +40,9 @@ pub enum DomainError {
         over: i64,
     },
 
+    #[error("付款受付清条件限制：{0}")]
+    PaymentBlocked(String),
+
     #[error("单据状态 {0} 不允许该操作")]
     IllegalState(String),
 

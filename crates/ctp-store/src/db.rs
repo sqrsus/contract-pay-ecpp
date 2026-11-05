@@ -33,7 +33,7 @@ fn configure(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 建表 + 建索引 + 建视图，全部在一个事务内完成；重复执行幂等。
+/// 建表 + 补列 + 建索引 + 建视图；重复执行幂等。
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     // 角色枚举扩展要在建表之前做：老库的 CHECK 不含 OWNER，只能重建表。
     migrate_contractor_role(conn)?;
@@ -45,8 +45,20 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         for sql in schema::index_statements() {
             tx.execute_batch(sql)?;
         }
-        for (_, sql) in schema::view_statements() {
-            tx.execute_batch(&sql)?;
+        tx.commit()?;
+    }
+    // 先补列、再建视图：视图会引用新增列，顺序反了存量库会报 no such column。
+    migrate_contract_columns(conn)?;
+    {
+        let tx = conn.transaction()?;
+        // `CREATE VIEW IF NOT EXISTS` 不会覆盖已有视图定义；视图列变化时
+        // 必须先按依赖倒序删除再重建，否则存量库仍读到旧列。
+        let views = schema::view_statements();
+        for (name, _) in views.iter().rev() {
+            tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
+        }
+        for (_, sql) in &views {
+            tx.execute_batch(sql)?;
         }
         tx.commit()?;
     }
@@ -61,7 +73,56 @@ pub fn schema_version(conn: &Connection) -> Result<Option<String>> {
     get_meta(conn, "schema_version")
 }
 
-/// 把 `org_contractor.role_type` 的 CHECK 扩到含 `OWNER`。
+/// 给存量 `ct_contract` 追加新建合同页扩展字段（全部选填，缺列才加，幂等）。
+///
+/// SQLite `ALTER TABLE … ADD COLUMN` 不支持 `IF NOT EXISTS`，故先用
+/// `PRAGMA table_info` 探明已有列，只对缺失的列追加；新库在建表阶段已含这些列，此处跳过。
+/// 这些列不参与任何视图计算，追加不会触发视图失效，无需重建视图。
+fn migrate_contract_columns(conn: &mut Connection) -> Result<()> {
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(ct_contract)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has = |name: &str| existing.iter().any(|c| c == name);
+    let tx = conn.transaction()?;
+    // 顺序需与 schema.rs 的 ct_contract DDL 保持一致
+    let columns: &[(&str, &str)] = &[
+        (
+            "bid_method",
+            "ALTER TABLE ct_contract ADD COLUMN bid_method TEXT \
+             CHECK (bid_method IS NULL OR bid_method IN ('OPEN','GOV_PROC','DIRECT'))",
+        ),
+        (
+            "open_bid_date",
+            "ALTER TABLE ct_contract ADD COLUMN open_bid_date TEXT",
+        ),
+        (
+            "project_leader",
+            "ALTER TABLE ct_contract ADD COLUMN project_leader TEXT",
+        ),
+        (
+            "contact_info",
+            "ALTER TABLE ct_contract ADD COLUMN contact_info TEXT",
+        ),
+        (
+            "bid_agent_id",
+            "ALTER TABLE ct_contract ADD COLUMN bid_agent_id TEXT REFERENCES org_contractor(id)",
+        ),
+        (
+            "delivery_date",
+            "ALTER TABLE ct_contract ADD COLUMN delivery_date TEXT",
+        ),
+    ];
+    for (name, sql) in columns {
+        if !has(name) {
+            tx.execute_batch(sql)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 把 `org_contractor.role_type` 的 CHECK 扩到含 `OWNER` 与 `AGENT`。
 ///
 /// SQLite 无法修改已有 CHECK 约束，只能「建新表 → 搬数据 → 换名」。
 /// 因为 `ct_contract.contractor_id` 引用本表，重建时必须临时关闭外键
@@ -79,7 +140,8 @@ fn migrate_contractor_role(conn: &mut Connection) -> Result<()> {
         // 新库：表还不存在，后面建表语句直接就是新结构
         return Ok(());
     };
-    if ddl.contains("'OWNER'") {
+    // 已是含 OWNER 与 AGENT 的新结构，直接返回
+    if ddl.contains("'OWNER'") && ddl.contains("'AGENT'") {
         return Ok(());
     }
 

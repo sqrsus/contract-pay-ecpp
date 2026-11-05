@@ -1,6 +1,6 @@
 //! 两套分类字典的**分离定义**（评审 H4）。
 //!
-//! 文档原稿把 `ct_category` 同时当作「合同类别」（工程款/设备款/材料款/服务款）
+//! 文档原稿把 `ct_category` 同时当作「合同类别」（工程款/设备款/材料款/监理费/检测费）
 //! 与「合同会计分类」（C01–C99）使用，导致迁移时「工程款」会落到「前期费用」这类科目上。
 //! 本实现拆成两张：
 //!
@@ -16,7 +16,8 @@ pub const CONTRACT_CATEGORIES: &[(&str, &str)] = &[
     ("GC", "工程款"),
     ("SB", "设备款"),
     ("CL", "材料款"),
-    ("FW", "服务款"),
+    ("FW", "监理费"),
+    ("JC", "检测费"),
 ];
 
 /// 会计分类（财务口径）：(code, 名称)。
@@ -68,6 +69,13 @@ mod tests {
                 "编码 {bc} 在两套字典中重复"
             );
         }
+    }
+
+    #[test]
+    fn 合同类别包含监理费与检测费() {
+        assert_eq!(contract_category_name("FW"), Some("监理费"));
+        assert_eq!(contract_category_name("JC"), Some("检测费"));
+        assert!(is_valid_contract_category("JC"));
     }
 
     #[test]

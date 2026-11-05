@@ -8,13 +8,14 @@ use crate::widgets::{self, Tone};
 use crate::App;
 use ctp_app::service::{self, NewContract, NewPayment};
 use ctp_core::attachment::{Attachment, AttachmentKind};
-use ctp_core::contract::ContractType;
+use ctp_core::contract::{BidMethod, ContractType};
 use ctp_core::date::{is_iso_date, today_iso};
 use ctp_core::dict;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
 use ctp_core::project::ContractorRole;
 use ctp_core::rate::Rate;
+use ctp_store::repo;
 use eframe::egui::{self, RichText};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,12 +23,18 @@ pub enum Dialog {
     None,
     NewContract,
     AuditPrice,
+    /// 项目交工：登记交工日期
+    DeliveryDate,
     EditAmount,
     PaymentDetail,
     /// 付款打印数据预览（本轮只预览 9 个合并域，不产出 docx）
     PrintPreview,
     /// 合同附件管理（从合同详情卡的「附件 n/4」进来）
     Attachments,
+    /// 附件材料打印（预留：中标通知书、审计报告等）
+    MaterialPrint,
+    /// 合同详情只读弹窗（点击合同编号）
+    ContractDetail,
 }
 
 /// 新建时暂存于内存的附件。点「保存合同」才随合同一起落库，
@@ -70,11 +77,22 @@ pub struct ContractForm {
     pub duration: String,
     pub planned_start: String,
     pub planned_end: String,
+    /// 交工日期（YYYY-MM-DD），选填。
+    pub delivery_date: String,
     pub pricing_idx: usize,
     pub retention: String,
-    pub advance: String,
     pub terms: String,
     pub remark: String,
+    /// 招标方式下拉索引：0 = 未选，1/2/3 对应公开招标/政府采购/直接发包。
+    pub bid_method_idx: usize,
+    /// 开标时间（YYYY-MM-DD），选填。
+    pub open_bid_date: String,
+    /// 项目负责人，选填。
+    pub project_leader: String,
+    /// 联系方式，选填。
+    pub contact_info: String,
+    /// 招标代理名称（保存时若为新名称，自动建档为 Agent 角色）。
+    pub bid_agent_text: String,
     /// 保存后立即置为「生效」，否则存为草稿。
     pub activate: bool,
     /// 四类附件，每类至多一条
@@ -96,11 +114,16 @@ impl Default for ContractForm {
             duration: String::new(),
             planned_start: String::new(),
             planned_end: String::new(),
+            delivery_date: String::new(),
             pricing_idx: 1,
             retention: "3".into(),
-            advance: "0".into(),
             terms: "按月计量支付，进度款支付至已完工程量的 80%，竣工验收后支付至 97%，质保金 3% 满一年退还。".into(),
             remark: String::new(),
+            bid_method_idx: 1,
+            open_bid_date: String::new(),
+            project_leader: String::new(),
+            contact_info: String::new(),
+            bid_agent_text: String::new(),
             activate: true,
             attachments: Vec::new(),
         }
@@ -206,11 +229,21 @@ fn modal(title: impl Into<String>, p: &Palette) -> egui::Window<'static> {
 
 fn field(ui: &mut egui::Ui, p: &Palette, label: &str, w: f32, value: &mut String) {
     ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
         widgets::field_label(ui, p, label);
         ui.add_sized(
             [w, 26.0],
             egui::TextEdit::singleline(value).margin(egui::Margin::symmetric(8.0, 4.0)),
         );
+    });
+}
+
+/// 带标签的日期输入框：点击输入框弹出月历，选中回填。
+fn date_field(ui: &mut egui::Ui, p: &Palette, label: &str, id: &str, w: f32, value: &mut String) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        widgets::date_input(ui, id, p, value, w);
     });
 }
 
@@ -247,10 +280,13 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::None => {}
         Dialog::NewContract => new_contract(app, ctx),
         Dialog::AuditPrice => audit_price(app, ctx),
+        Dialog::DeliveryDate => delivery_date(app, ctx),
         Dialog::EditAmount => edit_amount(app, ctx),
         Dialog::PaymentDetail => payment_detail(app, ctx),
         Dialog::PrintPreview => print_preview(app, ctx),
         Dialog::Attachments => attachments(app, ctx),
+        Dialog::MaterialPrint => material_print(app, ctx),
+        Dialog::ContractDetail => contract_detail(app, ctx),
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
@@ -342,12 +378,23 @@ fn ac_field(
     hints: &[String],
     hint_text: &str,
     w: f32,
+    mode: widgets::SuggestMode,
 ) -> Option<String> {
     ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
         widgets::field_label(ui, p, label);
-        widgets::autocomplete(ui, id, p, text, hints, w, hint_text)
+        widgets::autocomplete(ui, id, p, text, hints, w, hint_text, mode)
     })
     .inner
+}
+
+/// 新建合同专用紧凑卡片：内边距 12（全局卡片为 16），为「一屏不滚动」省高度。
+fn form_card(p: &Palette) -> egui::Frame {
+    egui::Frame::none()
+        .fill(p.surface)
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::same(12.0))
 }
 
 fn new_contract(app: &mut App, ctx: &egui::Context) {
@@ -377,6 +424,23 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
     owner_hints.sort();
     owner_hints.dedup();
 
+    let mut agent_hints: Vec<String> = app
+        .contractors
+        .iter()
+        .filter(|c| c.role_type == ContractorRole::Agent)
+        .map(|c| c.contractor_name.clone())
+        .collect();
+    // 库里还没有「招标代理」档案时退化为全部单位，避免联想框看起来是空的
+    if agent_hints.is_empty() {
+        agent_hints = app
+            .contractors
+            .iter()
+            .map(|c| c.contractor_name.clone())
+            .collect();
+    }
+    agent_hints.sort();
+    agent_hints.dedup();
+
     // 第一步的完整性：与保存时的校验共用同一套条件
     let amount_ok = Money::parse_yuan(&app.new_contract.amount)
         .map(|m| m.cent() > 0)
@@ -404,12 +468,12 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
     let mut flash: Option<String> = None;
 
     modal("新建合同", &p)
-        .default_width(980.0)
-        .min_width(980.0)
+        .default_width(1060.0)
+        .min_width(1060.0)
         // 长表单用居中锚点在首帧尺寸未定时会顶出窗口，改为顶部固定留白
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
         .show(ctx, |ui| {
-            ui.set_width(940.0);
+            ui.set_width(1020.0);
             ui.horizontal(|ui| {
                 step_chip(ui, &p, 1, "基本信息", step == 0);
                 ui.label(RichText::new("→").size(12.0).color(p.text_muted));
@@ -425,184 +489,107 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
             ui.add_space(12.0);
 
             if step == 0 {
-                // ---------------- 第一步：基本信息（左栏字段 / 右栏长文本）
+                // 两列卡片：左列（主体 / 招标与工期 / 负责人），右列（价款与条款）。
+                // 整页不滚动，靠两列压缩高度，保证一屏内完整展示。
                 ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(612.0, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            egui::Grid::new("ct_form")
+                    ui.vertical(|ui| {
+                        ui.set_width(486.0);
+                        form_card(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            widgets::section_title(ui, &p, "合同主体", "含负责人与联系，可输新名称自动建档");
+                            egui::Grid::new("card_subject")
                                 .num_columns(2)
-                                .spacing([12.0, 8.0])
+                                .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
-                                    field(ui, &p, "* 合同名称", 300.0, &mut app.new_contract.name);
-                                    ac_field(
-                                        ui,
-                                        &p,
-                                        "* 发包人（甲方）",
-                                        "party_a",
-                                        &mut app.new_contract.party_a,
-                                        &owner_hints,
-                                        "输入名称，可从已有业主中联想",
-                                        300.0,
-                                    );
+                                    field(ui, &p, "* 合同名称", 218.0, &mut app.new_contract.name);
+                                    ac_field(ui, &p, "* 发包人（甲方）", "party_a", &mut app.new_contract.party_a, &owner_hints, "输入名称，可从已有业主中联想", 218.0, widgets::SuggestMode::ShowAllOnEmpty);
                                     ui.end_row();
-
-                                    ac_field(
-                                        ui,
-                                        &p,
-                                        "* 所属项目",
-                                        "project",
-                                        &mut app.new_contract.project_text,
-                                        &project_hints,
-                                        "输入项目编码或名称",
-                                        300.0,
-                                    );
-                                    ac_field(
-                                        ui,
-                                        &p,
-                                        "* 承包单位",
-                                        "contractor",
-                                        &mut app.new_contract.contractor_text,
-                                        &unit_hints,
-                                        "输入名称，可从已有单位中联想",
-                                        300.0,
-                                    );
+                                    ac_field(ui, &p, "* 所属项目", "project", &mut app.new_contract.project_text, &project_hints, "输入编码或名称后联想", 218.0, widgets::SuggestMode::TypedOnly);
+                                    ac_field(ui, &p, "* 承包单位", "contractor", &mut app.new_contract.contractor_text, &unit_hints, "输入名称后联想已有单位", 218.0, widgets::SuggestMode::TypedOnly);
                                     ui.end_row();
+                                    field(ui, &p, "项目负责人", 218.0, &mut app.new_contract.project_leader);
+                                    field(ui, &p, "联系方式", 218.0, &mut app.new_contract.contact_info);
+                                    ui.end_row();
+                                });
+                        });
+                        ui.add_space(10.0);
 
+                        form_card(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            widgets::section_title(ui, &p, "招标与工期", "");
+                            egui::Grid::new("card_bid")
+                                .num_columns(2)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        widgets::field_label(ui, &p, "招标方式");
+                                        let bid_labels: Vec<String> = vec![
+                                            "（未选）".into(),
+                                            "公开招标".into(),
+                                            "政府采购".into(),
+                                            "直接发包".into(),
+                                        ];
+                                        combo(ui, "bid_method", 218.0, app.new_contract.bid_method_idx, bid_labels, &mut app.new_contract.bid_method_idx);
+                                    });
+                                    date_field(ui, &p, "开标时间", "open_bid_date", 218.0, &mut app.new_contract.open_bid_date);
+                                    ui.end_row();
+                                    ac_field(ui, &p, "招标代理", "bid_agent", &mut app.new_contract.bid_agent_text, &agent_hints, "输入名称后联想；新名称自动建档", 218.0, widgets::SuggestMode::TypedOnly);
+                                    field(ui, &p, "工期（日历天）", 218.0, &mut app.new_contract.duration);
+                                    ui.end_row();
+                                    date_field(ui, &p, "计划开工", "planned_start", 218.0, &mut app.new_contract.planned_start);
+                                    date_field(ui, &p, "计划交工", "planned_end", 218.0, &mut app.new_contract.planned_end);
+                                    ui.end_row();
+                                });
+                        });
+                    });
+
+                    ui.add_space(12.0);
+
+                    ui.vertical(|ui| {
+                        ui.set_width(486.0);
+                        form_card(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            widgets::section_title(ui, &p, "价款与条款", "");
+                            egui::Grid::new("card_price")
+                                .num_columns(2)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
                                     ui.vertical(|ui| {
                                         widgets::field_label(ui, &p, "合同类型");
-                                        let labels: Vec<String> = CONTRACT_TYPES
-                                            .iter()
-                                            .map(|t| t.label().to_string())
-                                            .collect();
-                                        combo(
-                                            ui,
-                                            "ctype",
-                                            300.0,
-                                            app.new_contract.ctype_idx,
-                                            labels,
-                                            &mut app.new_contract.ctype_idx,
-                                        );
+                                        let labels: Vec<String> = CONTRACT_TYPES.iter().map(|t| t.label().to_string()).collect();
+                                        combo(ui, "ctype", 218.0, app.new_contract.ctype_idx, labels, &mut app.new_contract.ctype_idx);
                                     });
                                     ui.vertical(|ui| {
                                         widgets::field_label(ui, &p, "* 合同类别");
-                                        let labels: Vec<String> = dict::CONTRACT_CATEGORIES
-                                            .iter()
-                                            .map(|(_, n)| n.to_string())
-                                            .collect();
-                                        combo(
-                                            ui,
-                                            "category",
-                                            300.0,
-                                            app.new_contract.category_idx,
-                                            labels,
-                                            &mut app.new_contract.category_idx,
-                                        );
+                                        let labels: Vec<String> = dict::CONTRACT_CATEGORIES.iter().map(|(_, n)| n.to_string()).collect();
+                                        combo(ui, "category", 218.0, app.new_contract.category_idx, labels, &mut app.new_contract.category_idx);
                                     });
                                     ui.end_row();
-
-                                    field(
-                                        ui,
-                                        &p,
-                                        "* 签订日期（YYYY-MM-DD）",
-                                        300.0,
-                                        &mut app.new_contract.sign_date,
-                                    );
-                                    field(
-                                        ui,
-                                        &p,
-                                        "* 合同金额（元）",
-                                        300.0,
-                                        &mut app.new_contract.amount,
-                                    );
+                                    date_field(ui, &p, "* 签订日期", "sign_date", 218.0, &mut app.new_contract.sign_date);
+                                    field(ui, &p, "* 合同金额（元）", 218.0, &mut app.new_contract.amount);
                                     ui.end_row();
-
-                                    field(
-                                        ui,
-                                        &p,
-                                        "工期（日历天）",
-                                        300.0,
-                                        &mut app.new_contract.duration,
-                                    );
                                     ui.vertical(|ui| {
                                         widgets::field_label(ui, &p, "计价方式");
-                                        let labels: Vec<String> =
-                                            PRICING.iter().map(|x| x.to_string()).collect();
-                                        combo(
-                                            ui,
-                                            "pricing",
-                                            300.0,
-                                            app.new_contract.pricing_idx,
-                                            labels,
-                                            &mut app.new_contract.pricing_idx,
-                                        );
+                                        let labels: Vec<String> = PRICING.iter().map(|x| x.to_string()).collect();
+                                        combo(ui, "pricing", 218.0, app.new_contract.pricing_idx, labels, &mut app.new_contract.pricing_idx);
                                     });
+                                    field(ui, &p, "质保金率 %", 218.0, &mut app.new_contract.retention);
                                     ui.end_row();
-
-                                    field(
-                                        ui,
-                                        &p,
-                                        "计划开工（YYYY-MM-DD）",
-                                        300.0,
-                                        &mut app.new_contract.planned_start,
-                                    );
-                                    field(
-                                        ui,
-                                        &p,
-                                        "计划竣工（YYYY-MM-DD）",
-                                        300.0,
-                                        &mut app.new_contract.planned_end,
-                                    );
-                                    ui.end_row();
-
-                                    ui.horizontal(|ui| {
-                                        field(
-                                            ui,
-                                            &p,
-                                            "质保金率 %",
-                                            138.0,
-                                            &mut app.new_contract.retention,
-                                        );
-                                        field(
-                                            ui,
-                                            &p,
-                                            "预付款率 %",
-                                            138.0,
-                                            &mut app.new_contract.advance,
-                                        );
-                                    });
+                                    date_field(ui, &p, "交工日期", "delivery_date", 218.0, &mut app.new_contract.delivery_date);
                                     ui.label("");
                                     ui.end_row();
                                 });
-                        },
-                    );
-
-                    ui.add_space(16.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(300.0, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
+                            ui.add_space(6.0);
                             widgets::field_label(ui, &p, "* 付款条款");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut app.new_contract.terms)
-                                    .desired_rows(9)
-                                    .desired_width(300.0)
-                                    .margin(egui::Margin::symmetric(8.0, 6.0)),
-                            );
-                            ui.add_space(8.0);
+                            ui.add(egui::TextEdit::multiline(&mut app.new_contract.terms).desired_rows(3).desired_width(ui.available_width()).margin(egui::Margin::symmetric(8.0, 6.0)));
+                            ui.add_space(6.0);
                             widgets::field_label(ui, &p, "备注");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut app.new_contract.remark)
-                                    .desired_rows(7)
-                                    .desired_width(300.0)
-                                    .margin(egui::Margin::symmetric(8.0, 6.0)),
-                            );
-                        },
-                    );
+                            ui.add(egui::TextEdit::multiline(&mut app.new_contract.remark).desired_rows(2).desired_width(ui.available_width()).margin(egui::Margin::symmetric(8.0, 6.0)));
+                        });
+                    });
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(
                         "所属项目、承包单位、发包人可直接输入新名称：库里没有会自动建档，项目编码自动生成。",
@@ -610,7 +597,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                     .size(11.5)
                     .color(p.text_muted),
                 );
-                ui.add_space(10.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if widgets::primary_button(ui, &p, "下一步：附件", base_ok).clicked() && base_ok {
                         next = true;
@@ -659,7 +646,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                         .rounding(egui::Rounding::same(9.0))
                         .inner_margin(egui::Margin::symmetric(12.0, 9.0))
                         .show(ui, |ui| {
-                            ui.set_width(908.0);
+                            ui.set_width(988.0);
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(kind.label()).size(13.0).strong().color(p.text),
@@ -808,12 +795,22 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         };
         let duration = f.duration.trim().parse::<i64>().unwrap_or(0);
         let retention = pct_to_bp(&f.retention);
-        let advance = pct_to_bp(&f.advance);
         let sign_date = f.sign_date.trim().to_string();
         let planned_start = opt(&f.planned_start);
         let planned_end = opt(&f.planned_end);
+        let delivery_date = opt(&f.delivery_date);
         let terms = f.terms.trim().to_string();
         let remark = opt(&f.remark);
+        let bid_method = match f.bid_method_idx {
+            1 => Some(BidMethod::Open),
+            2 => Some(BidMethod::Government),
+            3 => Some(BidMethod::Direct),
+            _ => None,
+        };
+        let open_bid_date = opt(&f.open_bid_date);
+        let project_leader = opt(&f.project_leader);
+        let contact_info = opt(&f.contact_info);
+        let bid_agent_text = opt(&f.bid_agent_text);
         let activate = f.activate;
         let atts: Vec<(AttachmentKind, String, Option<String>, Vec<u8>)> = f
             .attachments
@@ -841,11 +838,18 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                     duration_days: duration,
                     planned_start,
                     planned_end,
+                    delivery_date,
                     pricing_method: pricing,
                     retention_rate_bp: retention,
-                    advance_rate_bp: advance,
+                    // 预付款率已从新建页移除，新合同统一按 0 处理
+                    advance_rate_bp: 0,
                     payment_terms: terms,
                     remark,
+                    bid_method,
+                    open_bid_date,
+                    project_leader,
+                    contact_info,
+                    bid_agent_text,
                 },
                 "界面用户",
             )?;
@@ -896,6 +900,76 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
 }
 // ---------------------------------------------------------------- 审计价
 
+/// 项目交工：选一个日期写入该合同的「交工日期」。
+fn delivery_date(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+    let Some(cid) = app.selected.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let cno = app
+        .detail
+        .as_ref()
+        .map(|d| d.contract_no.clone())
+        .unwrap_or_default();
+
+    let mut close = false;
+    let mut submit = false;
+    modal(format!("项目交工 · {cno}"), &p)
+        .default_width(460.0)
+        .show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(
+                RichText::new(
+                    "登记该合同的交工日期；确认后可在合同台账的「交工日期」列与详情卡查看。",
+                )
+                .size(12.0)
+                .color(p.text_muted),
+            );
+            ui.add_space(10.0);
+            widgets::field_label(ui, &p, "* 交工日期");
+            widgets::date_input(ui, "delivery_date_dialog", &p, &mut app.delivery_form, 260.0);
+
+            let ok = is_iso_date(&app.delivery_form);
+            if !ok {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("请选择合法日期（YYYY-MM-DD）")
+                        .size(11.5)
+                        .color(p.warn),
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "确认交工", ok).clicked() && ok {
+                    submit = true;
+                }
+                if widgets::ghost_button(ui, &p, "取消").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+    }
+    if submit {
+        let date = app.delivery_form.trim().to_string();
+        match app.exec(move |conn| service::set_delivery_date(conn, &cid, &date, "界面用户")) {
+            Ok(c) => {
+                app.refresh();
+                app.select(&c.id);
+                app.success(format!(
+                    "交工日期已登记：{}",
+                    c.delivery_date.unwrap_or_default()
+                ));
+                app.dialog = Dialog::None;
+            }
+            Err(e) => app.error(format!("登记交工日期失败：{e}")),
+        }
+    }
+}
+
 fn audit_price(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
     let mut cancel = false;
@@ -927,7 +1001,7 @@ fn audit_price(app: &mut App, ctx: &egui::Context) {
                 .spacing([14.0, 10.0])
                 .show(ui, |ui| {
                     field(ui, &p, "* 审计价（元）", 300.0, &mut app.audit_form.amount);
-                    field(ui, &p, "审定日期", 300.0, &mut app.audit_form.date);
+                    date_field(ui, &p, "审定日期", "audit_date", 300.0, &mut app.audit_form.date);
                     ui.end_row();
                     field(ui, &p, "审定单位", 300.0, &mut app.audit_form.org);
                     field(ui, &p, "审定报告号", 300.0, &mut app.audit_form.report_no);
@@ -1094,7 +1168,7 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
         .map(|s| s.replace('T', " "))
         .unwrap_or_else(|| pm.created_at.clone());
     let mut close = false;
-    let mut goto = false;
+    let mut open_contract = false;
     let mut print = false;
 
     modal(format!("拨款单 {}", pm.payment_no), &p)
@@ -1152,19 +1226,6 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
             if let Some(t) = &pm.title {
                 widgets::kv(ui, &p, "摘要", t);
             }
-            widgets::kv(
-                ui,
-                &p,
-                "银行流水号",
-                pm.bank_serial_no.as_deref().unwrap_or("—"),
-            );
-            widgets::kv(ui, &p, "付款账户", pm.pay_account.as_deref().unwrap_or("—"));
-            widgets::kv(
-                ui,
-                &p,
-                "收款账户",
-                pm.receive_account.as_deref().unwrap_or("—"),
-            );
             widgets::kv(ui, &p, "经办人", &pm.operator_id);
             widgets::kv(ui, &p, "登记时间", &created);
             if let Some(r) = &pm.remark {
@@ -1180,8 +1241,10 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
                 if widgets::ghost_button(ui, &p, "打印").clicked() {
                     print = true;
                 }
-                if contract.is_some() && widgets::ghost_button(ui, &p, "查看所属合同").clicked() {
-                    goto = true;
+                if contract.is_some()
+                    && widgets::ghost_button(ui, &p, "查看合同详情").clicked()
+                {
+                    open_contract = true;
                 }
             });
         });
@@ -1189,10 +1252,10 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
     if close {
         app.dialog = Dialog::None;
         app.pay_detail = None;
-    } else if goto {
-        app.dialog = Dialog::None;
+    } else if open_contract {
+        // 与合同台账「点击合同编号」走同一个只读详情弹窗
         app.pay_detail = None;
-        app.goto_contract(&pm.contract_id);
+        app.open_contract_detail(&pm.contract_id);
     } else if print {
         app.open_print_preview(&pm);
     }
@@ -1339,6 +1402,380 @@ fn open_external(path: &std::path::Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开失败：{e}"))
+}
+
+/// 打印附件材料（预留）：列示四类材料的在位情况。
+///
+/// 本期只做材料清点与入口预留；中标通知书 / 审计报告等模板渲染待接入，
+/// 点击「打印」只给出提示，不生成文件。
+/// 只读字段：标签 + 浅底值框，尺寸与新合同页的输入框一致。
+fn ro_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    value: &str,
+    w: f32,
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        egui::Frame::none()
+            .fill(p.surface_alt)
+            .stroke(egui::Stroke::new(1.0_f32, p.border))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.set_width((w - 16.0).max(40.0));
+                ui.label(RichText::new(value).size(12.0).color(p.text));
+            });
+    });
+}
+
+fn ro_text(ui: &mut egui::Ui, p: &Palette, text: &str) {
+    egui::Frame::none()
+        .fill(p.surface_alt)
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(text).size(12.0).color(p.text));
+        });
+}
+
+/// 合同详情（只读）：布局与新建合同一致；底部三个按钮读取并展示对应附件。
+fn contract_detail(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+    let Some(c) = app.modal_contract.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+
+    let project_text = app
+        .projects
+        .iter()
+        .find(|x| x.id == c.project_id)
+        .map(|x| format!("{} {}", x.project_code, x.project_name))
+        .unwrap_or_else(|| "—".into());
+    let contractor = app
+        .contractors
+        .iter()
+        .find(|x| x.id == c.contractor_id)
+        .map(|x| x.contractor_name.clone())
+        .unwrap_or_else(|| "—".into());
+    let agent = c
+        .bid_agent_id
+        .as_ref()
+        .and_then(|id| app.contractors.iter().find(|x| &x.id == id))
+        .map(|x| x.contractor_name.clone())
+        .unwrap_or_else(|| "—".into());
+    let category = dict::contract_category_name(&c.contract_category_code).unwrap_or("—");
+    let pricing = c.pricing_method.map(|x| x.label()).unwrap_or("—");
+
+    let mut close = false;
+    let mut material: Option<AttachmentKind> = None;
+
+    modal(format!("合同详情 · {}", c.contract_no), &p)
+        .default_width(1060.0)
+        .min_width(1060.0)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
+        .show(ctx, |ui| {
+            ui.set_width(1020.0);
+            ui.label(
+                RichText::new("只读视图；如需修改请关闭后从对应操作入口处理。")
+                    .size(12.0)
+                    .color(p.text_muted),
+            );
+            ui.add_space(8.0);
+
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(486.0);
+                    form_card(&p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        widgets::section_title(ui, &p, "合同主体", "");
+                        egui::Grid::new("ro_subject")
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ro_field(ui, &p, "合同名称", &c.contract_name, 218.0);
+                                ro_field(ui, &p, "发包人（甲方）", &c.party_a, 218.0);
+                                ui.end_row();
+                                ro_field(ui, &p, "所属项目", &project_text, 218.0);
+                                ro_field(ui, &p, "承包单位", &contractor, 218.0);
+                                ui.end_row();
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "项目负责人",
+                                    c.project_leader.as_deref().unwrap_or("—"),
+                                    218.0,
+                                );
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "联系方式",
+                                    c.contact_info.as_deref().unwrap_or("—"),
+                                    218.0,
+                                );
+                                ui.end_row();
+                            });
+                    });
+                    ui.add_space(10.0);
+                    form_card(&p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        widgets::section_title(ui, &p, "招标与工期", "");
+                        egui::Grid::new("ro_bid")
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "招标方式",
+                                    c.bid_method.map(|b| b.label()).unwrap_or("—"),
+                                    218.0,
+                                );
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "开标时间",
+                                    c.open_bid_date.as_deref().unwrap_or("—"),
+                                    218.0,
+                                );
+                                ui.end_row();
+                                ro_field(ui, &p, "招标代理", &agent, 218.0);
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "工期（日历天）",
+                                    &c.duration_days.to_string(),
+                                    218.0,
+                                );
+                                ui.end_row();
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "计划开工",
+                                    c.planned_start.as_deref().unwrap_or("—"),
+                                    218.0,
+                                );
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "计划交工",
+                                    c.planned_end.as_deref().unwrap_or("—"),
+                                    218.0,
+                                );
+                                ui.end_row();
+                            });
+                    });
+                });
+
+                ui.add_space(12.0);
+
+                ui.vertical(|ui| {
+                    ui.set_width(486.0);
+                    form_card(&p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        widgets::section_title(ui, &p, "价款与条款", "");
+                        egui::Grid::new("ro_price")
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ro_field(ui, &p, "合同类型", c.contract_type.label(), 218.0);
+                                ro_field(ui, &p, "合同类别", category, 218.0);
+                                ui.end_row();
+                                ro_field(ui, &p, "签订日期", &c.sign_date, 218.0);
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "合同金额（元）",
+                                    &c.original_amount_cent.format_yuan(),
+                                    218.0,
+                                );
+                                ui.end_row();
+                                ro_field(ui, &p, "计价方式", pricing, 218.0);
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "质保金率 %",
+                                    &format!(
+                                        "{:.2}",
+                                        c.retention_rate_bp as f32 / 100.0
+                                    ),
+                                    218.0,
+                                );
+                                ui.end_row();
+                                ro_field(
+                                    ui,
+                                    &p,
+                                    "交工日期",
+                                    c.delivery_date.as_deref().unwrap_or("—"),
+                                    218.0,
+                                );
+                                ui.label("");
+                                ui.end_row();
+                            });
+                        ui.add_space(6.0);
+                        widgets::field_label(ui, &p, "付款条款");
+                        ro_text(ui, &p, &c.payment_terms);
+                        ui.add_space(6.0);
+                        widgets::field_label(ui, &p, "备注");
+                        ro_text(ui, &p, c.remark.as_deref().unwrap_or("—"));
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("附件材料").size(12.0).color(p.text_muted));
+                for kind in [
+                    AttachmentKind::BidNotice,
+                    AttachmentKind::Contract,
+                    AttachmentKind::AuditReport,
+                ] {
+                    if widgets::ghost_button_sm(ui, &p, kind.label()).clicked() {
+                        material = Some(kind);
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+        app.modal_contract = None;
+        return;
+    }
+
+    if let Some(kind) = material {
+        let cid = c.id.clone();
+        let kind_code = kind.code().to_string();
+        let got = app.exec(move |conn| {
+            let list = repo::list_attachments(conn, &cid)?;
+            let Some(a) = list.into_iter().find(|a| a.kind_code == kind_code) else {
+                return Ok(None);
+            };
+            let bytes = service::attachment_bytes(conn, &a.id)?;
+            Ok(Some((a.file_name, bytes)))
+        });
+        match got {
+            Ok(Some((name, bytes))) => {
+                let dir = std::env::temp_dir().join("ctp-attachments");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(&name);
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        if let Err(e) = open_external(&path) {
+                            app.error(e);
+                        }
+                    }
+                    Err(e) => app.error(format!("写入临时文件失败：{e}")),
+                }
+            }
+            Ok(None) => app.error(format!("「{}」尚未上传", kind.label())),
+            Err(e) => app.error(format!("读取附件失败：{e}")),
+        }
+    }
+}
+
+fn material_print(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+    let cno = app
+        .att_contract
+        .as_ref()
+        .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
+        .map(|s| s.contract_no.clone())
+        .unwrap_or_else(|| "—".into());
+
+    let mut close = false;
+    let mut hint: Option<String> = None;
+
+    modal(format!("打印附件材料 · {cno}"), &p)
+        .default_width(620.0)
+        .show(ctx, |ui| {
+            ui.set_width(580.0);
+            ui.label(
+                RichText::new(
+                    "预留接口：用于打印中标通知书、审计报告、中期结算材料与合同正本。本期只做材料清点，模板渲染待接入。",
+                )
+                .size(12.0)
+                .color(p.text_muted),
+            );
+            ui.add_space(10.0);
+
+            for kind in AttachmentKind::ALL {
+                let att = app.attachments.iter().find(|a| a.kind_code == kind.code());
+                egui::Frame::none()
+                    .fill(p.surface_alt)
+                    .rounding(egui::Rounding::same(9.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.set_width(556.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(kind.label()).size(13.0).strong().color(p.text),
+                            );
+                            if kind.is_required() {
+                                widgets::badge(ui, &p, "必传", Tone::Danger);
+                            }
+                            ui.add_space(10.0);
+                            match att {
+                                Some(a) => {
+                                    ui.label(
+                                        RichText::new(&a.file_name).size(12.0).color(p.primary),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        RichText::new("未上传").size(12.0).color(p.text_muted),
+                                    );
+                                }
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let enabled = att.is_some();
+                                    let btn = widgets::ghost_button_sm_on(ui, &p, "打印", enabled);
+                                    let btn = if enabled {
+                                        btn.on_hover_text("接口已预留，待接入材料模板渲染")
+                                    } else {
+                                        btn.on_hover_text("该材料未上传，无法打印")
+                                    };
+                                    if btn.clicked() && enabled {
+                                        hint = Some(format!(
+                                            "「{}」打印接口已预留，待接入模板渲染",
+                                            kind.label()
+                                        ));
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(7.0);
+            }
+
+            if let Some(msg) = &hint {
+                ui.add_space(2.0);
+                ui.label(RichText::new(msg).size(11.5).color(p.warn));
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+    }
 }
 
 fn attachments(app: &mut App, ctx: &egui::Context) {

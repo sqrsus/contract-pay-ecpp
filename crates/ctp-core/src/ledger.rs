@@ -11,6 +11,8 @@ pub struct ContractSummary {
     pub contract_name: String,
     pub status: String,
     pub contractor_name: String,
+    /// 合同类型代码（CONSTRUCT / SUPERVISE / …），用于付清条件判定
+    pub contract_type: String,
     pub contract_category_code: String,
     pub category_code: Option<String>,
     pub category_name: Option<String>,
@@ -27,9 +29,29 @@ pub struct ContractSummary {
     pub is_inverted: bool,
     pub planned_end: Option<String>,
     pub duration_days: i64,
+    /// 交工日期（项目交工登记）
+    pub delivery_date: Option<String>,
 }
 
 impl ContractSummary {
+    /// 项目状态口径：支付率达 100% 即视为「归档关闭」，否则「履行中」。
+    pub fn is_archived(&self) -> bool {
+        self.pay_rate.bp() >= 10_000
+    }
+
+    /// 是否施工类合同（付清需审定 + 交工满 2 年）。
+    pub fn is_construct(&self) -> bool {
+        self.contract_type.eq_ignore_ascii_case("CONSTRUCT")
+    }
+
+    /// 是否已登记交工日期。
+    pub fn has_delivery(&self) -> bool {
+        self.delivery_date
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|d| !d.is_empty())
+    }
+
     /// 视图口径的越界级别：V1 不输出容差上限，只区分「倒挂 / 正常」。
     /// 需要区分容差内与超容差时用 `PaymentQuota::breach_level`（容差来自 `sys_meta.tol_bp`）。
     pub fn breach_level(&self) -> BreachLevel {
@@ -40,8 +62,31 @@ impl ContractSummary {
         }
     }
 
-    /// 从视图行还原成本可付额度快照（容差未知时按 0，仅用于展示）。
+    /// 从视图行还原成可付额度快照（容差未知时按 0，仅用于展示）。
+    ///
+    /// 付清条件按**今天**估算（视图行不带开单日期）；登记拨款时以实际开单日期为准。
     pub fn to_quota(&self, tolerance: Rate) -> PaymentQuota {
+        let pay_date = crate::date::today_iso();
+        let limit = crate::quota::pay_limit_for(
+            self.is_construct(),
+            self.is_audited,
+            self.delivery_date.as_deref(),
+            self.base_amount,
+            &pay_date,
+        );
+        let tolerance_amt = self
+            .base_amount
+            .mul_rate(tolerance.bp())
+            .map(|m| m.cent())
+            .unwrap_or(0);
+        let ceiling = Money::from_cent(self.base_amount.cent() + tolerance_amt);
+        let (limit_amount, cap_bp, limit_note) = match limit {
+            Ok(l) if l.cap_bp >= 10_000 => (ceiling, l.cap_bp, l.note),
+            Ok(l) if l.ceiling.cent() < ceiling.cent() => (l.ceiling, l.cap_bp, l.note),
+            Ok(l) => (ceiling, l.cap_bp, l.note),
+            Err(_) => (ceiling, 10_000, None),
+        };
+        let payable_amount = Money::from_cent(limit_amount.cent() - self.occupied_amount.cent());
         PaymentQuota {
             contract_amount: self.total_amount,
             audit_price: self.audit_price,
@@ -51,8 +96,12 @@ impl ContractSummary {
             paid_amount: self.paid_amount,
             inflight_amount: self.inflight_amount,
             occupied_amount: self.occupied_amount,
-            ceiling_amount: self.base_amount,
+            ceiling_amount: ceiling,
             available_amount: self.available_amount,
+            limit_amount,
+            payable_amount,
+            cap_bp,
+            limit_note,
             pay_rate: self.pay_rate,
             is_inverted: self.is_inverted,
             tolerance,
@@ -119,6 +168,7 @@ mod tests {
             contract_name: "N".into(),
             status: "ACTIVE".into(),
             contractor_name: "O".into(),
+            contract_type: "CONSTRUCT".into(),
             contract_category_code: "GC".into(),
             category_code: None,
             category_name: None,
@@ -135,10 +185,44 @@ mod tests {
             is_inverted: false,
             planned_end: None,
             duration_days: 0,
+            delivery_date: None,
         };
         assert_eq!(s.breach_level(), BreachLevel::None);
         s.paid_amount = Money::from_cent(1_001);
         s.is_inverted = true;
         assert_eq!(s.breach_level(), BreachLevel::OverTolerance);
+    }
+
+    #[test]
+    fn 项目状态按支付率自动归档() {
+        let mut s = ContractSummary {
+            contract_id: "C".into(),
+            project_id: "P".into(),
+            contract_no: "HT".into(),
+            contract_name: "N".into(),
+            status: "PERFORMING".into(),
+            contractor_name: "O".into(),
+            contract_type: "CONSTRUCT".into(),
+            contract_category_code: "GC".into(),
+            category_code: None,
+            category_name: None,
+            total_amount: Money::from_cent(1_000),
+            audit_price: None,
+            is_audited: false,
+            base_amount: Money::from_cent(1_000),
+            audit_reduction: Money::ZERO,
+            paid_amount: Money::from_cent(999),
+            inflight_amount: Money::ZERO,
+            occupied_amount: Money::from_cent(999),
+            available_amount: Money::from_cent(1),
+            pay_rate: Rate::from_bp(9_990),
+            is_inverted: false,
+            planned_end: None,
+            duration_days: 0,
+            delivery_date: None,
+        };
+        assert!(!s.is_archived(), "未满 100% 应为履行中");
+        s.pay_rate = Rate::from_bp(10_000);
+        assert!(s.is_archived(), "支付率达 100% 应自动归档关闭");
     }
 }

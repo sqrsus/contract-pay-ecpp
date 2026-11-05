@@ -143,8 +143,12 @@ pub struct App {
     pub status_filter: Option<ContractStatus>,
     pub selected: Option<String>,
     pub detail: Option<Contract>,
+    /// 合同台账里展开拨款明细的合同（点击合同名称切换）
+    pub expanded_contract: Option<String>,
 
     pub pay_contract: Option<String>,
+    /// 拨款管理页合同搜索框的文本（可输入编号或名称，实时匹配切换）
+    pub pay_contract_text: String,
     pub pay_form: PayForm,
     /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
     pub pay_detail: Option<Payment>,
@@ -154,7 +158,11 @@ pub struct App {
     /// 新建合同表单里的一次性提示（附件选择失败等）
     pub new_contract_flash: Option<String>,
     pub new_contract: ContractForm,
+    /// 合同详情只读弹窗（点击合同编号）
+    pub modal_contract: Option<Contract>,
     pub audit_form: AuditForm,
+    /// 项目交工弹窗的日期输入
+    pub delivery_form: String,
     pub amount_form: AmountForm,
     pub tol_input: String,
 
@@ -240,13 +248,17 @@ impl App {
             status_filter: None,
             selected: None,
             detail: None,
+            expanded_contract: None,
             pay_contract: None,
+            pay_contract_text: String::new(),
             pay_form: PayForm::default(),
             pay_detail: None,
             print_data: None,
             new_contract: ContractForm::default(),
             new_contract_flash: None,
+            modal_contract: None,
             audit_form: AuditForm::default(),
+            delivery_form: String::new(),
             amount_form: AmountForm::default(),
             tol_input: String::new(),
             dialog: Dialog::None,
@@ -302,6 +314,22 @@ impl App {
                 self.screen = Screen::Contracts;
             }
         }
+        // `CTP_EXPAND=1` 选中并展开第一份合同的拨款明细，用于核对表头与作废筛除
+        if std::env::var("CTP_EXPAND").unwrap_or_default() == "1" {
+            if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
+                self.select(&id);
+                self.expanded_contract = Some(id);
+                self.screen = Screen::Contracts;
+            }
+        }
+        // `CTP_PAY_NO=HT-...` 直达指定合同的拨款页，用于核对限额与状态展示
+        if let Ok(no) = std::env::var("CTP_PAY_NO") {
+            if let Some(s) = self.summaries.iter().find(|s| s.contract_no == no).cloned() {
+                self.pay_contract = Some(s.contract_id.clone());
+                self.sync_pay_text();
+                self.screen = Screen::Payments;
+            }
+        }
         match std::env::var("CTP_DIALOG").unwrap_or_default().as_str() {
             "new_contract" => {
                 self.dialog = Dialog::NewContract;
@@ -342,6 +370,11 @@ impl App {
                 if let Some(pm) = self.payments.first().cloned() {
                     self.pay_detail = Some(pm);
                     self.dialog = Dialog::PaymentDetail;
+                }
+            }
+            "contract_detail" => {
+                if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
+                    self.open_contract_detail(&id);
                 }
             }
             "print_preview" => {
@@ -401,6 +434,21 @@ impl App {
         if self.pay_contract.is_none() {
             self.pay_contract = self.summaries.first().map(|s| s.contract_id.clone());
         }
+        self.sync_pay_text();
+    }
+
+    /// 合同在搜索框里的展示文本：`编号 名称`。
+    pub fn pay_contract_label(&self) -> Option<String> {
+        let id = self.pay_contract.as_ref()?;
+        self.summaries
+            .iter()
+            .find(|s| &s.contract_id == id)
+            .map(|s| format!("{} {}", s.contract_no, s.contract_name))
+    }
+
+    /// 把当前选中合同回填到搜索框（切换合同 / 刷新数据后调用）。
+    pub fn sync_pay_text(&mut self) {
+        self.pay_contract_text = self.pay_contract_label().unwrap_or_default();
     }
 
     /// 选中合同。
@@ -421,6 +469,46 @@ impl App {
     pub fn goto_contract(&mut self, id: &str) {
         self.select(id);
         self.screen = Screen::Contracts;
+    }
+
+    /// 打开合同详情只读弹窗（点击合同编号）。
+    pub fn open_contract_detail(&mut self, id: &str) {
+        self.modal_contract = self
+            .db
+            .as_ref()
+            .and_then(|c| repo::get_contract(c, id).ok());
+        self.dialog = Dialog::ContractDetail;
+    }
+
+    /// 合同台账点击名称：展开 / 收起该合同的拨款明细。
+    pub fn toggle_expand(&mut self, id: &str) {
+        self.expanded_contract = if self.expanded_contract.as_deref() == Some(id) {
+            None
+        } else {
+            Some(id.to_string())
+        };
+    }
+
+    /// 总览「新建拨款」：跳到拨款管理，并尽量定位到已选合同。
+    pub fn start_payment(&mut self) {
+        if let Some(id) = self.selected.clone() {
+            self.pay_contract = Some(id);
+        } else if self.pay_contract.is_none() {
+            self.pay_contract = self.summaries.first().map(|s| s.contract_id.clone());
+        }
+        self.sync_pay_text();
+        self.screen = Screen::Payments;
+    }
+
+    /// 打印附件材料（预留）：加载该合同的附件元数据，打开材料清单。
+    pub fn open_material_print(&mut self, contract_id: &str) {
+        self.att_contract = Some(contract_id.to_string());
+        self.attachments = self
+            .db
+            .as_ref()
+            .and_then(|c| repo::list_attachments(c, contract_id).ok())
+            .unwrap_or_default();
+        self.dialog = Dialog::MaterialPrint;
     }
 
     /// 打开附件管理弹窗，并加载该合同的附件清单。
@@ -867,7 +955,9 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1380.0, 880.0])
-            .with_min_inner_size([1000.0, 640.0])
+            // 最小尺寸需容纳「新建合同」弹窗（1060 宽、约 690 高），
+            // 该页不做滚动，窗口再小就会裁切。
+            .with_min_inner_size([1100.0, 720.0])
             .with_title("工程合同台账与拨款管理平台"),
         ..Default::default()
     };

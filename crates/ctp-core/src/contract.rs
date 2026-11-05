@@ -7,7 +7,7 @@ use crate::money::Money;
 ///
 /// 文档正文在 4.2.2 / 2.9 / C-10 / 11.8.1 处给出 18 与 19 两个数字，实体清点为 20，
 /// DDL 实列更多。本清单定义：「业务字段 = 用户在合同表单上录入或可编辑、且非派生的字段」，
-/// 共 **25** 个（含 4 个审计价字段、含 `payment_terms`，不含 `id`、`status`、审计列与逻辑删除列）。
+/// 共 **31** 个（含 4 个审计价字段、含 `payment_terms`，不含 `id`、`status`、审计列与逻辑删除列）。
 /// 任何字段增减只改这里，验收与测试都引用 `BUSINESS_FIELDS.len()`。
 pub const BUSINESS_FIELDS: &[&str] = &[
     "contract_no",
@@ -30,11 +30,17 @@ pub const BUSINESS_FIELDS: &[&str] = &[
     "planned_end",
     "actual_start",
     "actual_end",
+    "delivery_date",
     "pricing_method",
     "retention_rate_bp",
     "advance_rate_bp",
     "payment_terms",
     "remark",
+    "bid_method",
+    "open_bid_date",
+    "project_leader",
+    "contact_info",
+    "bid_agent_id",
 ];
 
 /// 业务字段计数（文档中一切「合同字段数」均应引用本函数，不再手写数字）。
@@ -72,7 +78,7 @@ impl ContractType {
             ContractType::Supervise => "监理",
             ContractType::Design => "设计",
             ContractType::Survey => "勘察",
-            ContractType::Supply => "采购",
+            ContractType::Supply => "货物",
             ContractType::Service => "服务",
         }
     }
@@ -121,6 +127,45 @@ impl PricingMethod {
             "LUMP_SUM" => PricingMethod::LumpSum,
             "UNIT_PRICE" => PricingMethod::UnitPrice,
             "COST_PLUS" => PricingMethod::CostPlus,
+            _ => return None,
+        })
+    }
+}
+
+/// 招标方式（新建合同页下拉，3 个固定值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BidMethod {
+    /// 公开招标
+    #[default]
+    Open,
+    /// 政府采购
+    Government,
+    /// 直接发包
+    Direct,
+}
+
+impl BidMethod {
+    pub fn code(self) -> &'static str {
+        match self {
+            BidMethod::Open => "OPEN",
+            BidMethod::Government => "GOV_PROC",
+            BidMethod::Direct => "DIRECT",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BidMethod::Open => "公开招标",
+            BidMethod::Government => "政府采购",
+            BidMethod::Direct => "直接发包",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Option<Self> {
+        Some(match s {
+            "OPEN" => BidMethod::Open,
+            "GOV_PROC" => BidMethod::Government,
+            "DIRECT" => BidMethod::Direct,
             _ => return None,
         })
     }
@@ -252,6 +297,8 @@ pub struct Contract {
     pub planned_end: Option<String>,
     pub actual_start: Option<String>,
     pub actual_end: Option<String>,
+    /// 交工日期（项目交工登记，YYYY-MM-DD）
+    pub delivery_date: Option<String>,
     pub pricing_method: Option<PricingMethod>,
     pub retention_rate_bp: i32,
     pub advance_rate_bp: i32,
@@ -265,6 +312,17 @@ pub struct Contract {
     pub created_by: Option<String>,
     pub updated_at: String,
     pub updated_by: Option<String>,
+    // —— 新建合同页扩展字段（评审后增补，全部选填）——
+    /// 招标方式（公开招标 / 政府采购 / 直接发包）
+    pub bid_method: Option<BidMethod>,
+    /// 开标时间（YYYY-MM-DD）
+    pub open_bid_date: Option<String>,
+    /// 项目负责人
+    pub project_leader: Option<String>,
+    /// 联系方式
+    pub contact_info: Option<String>,
+    /// 招标代理单位 id（自动建档进 `org_contractor`，角色 AGENT）
+    pub bid_agent_id: Option<String>,
 }
 
 impl Contract {
@@ -344,7 +402,7 @@ impl Contract {
         }
         if !dict::is_valid_contract_category(&self.contract_category_code) {
             return Err(DomainError::InvalidDict(format!(
-                "合同类别 {}（应为 GC/SB/CL/FW）",
+                "合同类别 {}（应为 GC/SB/CL/FW/JC）",
                 self.contract_category_code
             )));
         }
@@ -384,10 +442,11 @@ impl Contract {
         validate_opt_date(self.planned_end.as_deref())?;
         validate_opt_date(self.actual_start.as_deref())?;
         validate_opt_date(self.actual_end.as_deref())?;
+        validate_opt_date(self.delivery_date.as_deref())?;
         if let (Some(s), Some(e)) = (&self.planned_start, &self.planned_end) {
             if e < s {
                 return Err(DomainError::Invariant(format!(
-                    "计划竣工 {e} 早于计划开工 {s}"
+                    "计划交工 {e} 早于计划开工 {s}"
                 )));
             }
         }
@@ -422,9 +481,17 @@ mod tests {
     }
 
     #[test]
-    fn 业务字段计数口径为_25() {
-        assert_eq!(business_field_count(), 25);
+    fn 业务字段计数口径为_31() {
+        assert_eq!(business_field_count(), 31);
         assert!(BUSINESS_FIELDS.contains(&"payment_terms"));
+        assert!(BUSINESS_FIELDS.contains(&"bid_method"));
+        assert!(BUSINESS_FIELDS.contains(&"delivery_date"));
+    }
+
+    #[test]
+    fn 合同类型采购标签改为货物() {
+        assert_eq!(ContractType::Supply.label(), "货物");
+        assert_eq!(ContractType::from_code("SUPPLY"), Some(ContractType::Supply));
     }
 
     #[test]

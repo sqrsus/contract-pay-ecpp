@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS org_contractor (
     id              TEXT PRIMARY KEY,
     contractor_name TEXT NOT NULL,
     role_type       TEXT NOT NULL DEFAULT 'CONSTRUCT'
-                    CHECK (role_type IN ('CONSTRUCT','SUPERVISE','DESIGN','SURVEY','SUPPLIER','OWNER','OTHER')),
+                    CHECK (role_type IN ('CONSTRUCT','SUPERVISE','DESIGN','SURVEY','SUPPLIER','OWNER','OTHER','AGENT')),
     credit_code     TEXT,
     bank_name       TEXT,
     bank_account    TEXT,
@@ -258,6 +258,7 @@ CREATE TABLE IF NOT EXISTS ct_contract (
     planned_end             TEXT,
     actual_start            TEXT,
     actual_end              TEXT,
+    delivery_date           TEXT,
     pricing_method          TEXT CHECK (pricing_method IN ('LUMP_SUM','UNIT_PRICE','COST_PLUS')),
     retention_rate_bp       INTEGER NOT NULL DEFAULT 300 CHECK (retention_rate_bp BETWEEN 0 AND 10000),
     advance_rate_bp         INTEGER NOT NULL DEFAULT 0 CHECK (advance_rate_bp BETWEEN 0 AND 10000),
@@ -271,6 +272,12 @@ CREATE TABLE IF NOT EXISTS ct_contract (
     updated_at              TEXT NOT NULL,
     updated_by              TEXT,
     version                 INTEGER NOT NULL DEFAULT 1,
+    -- 新建合同页扩展字段（评审后增补，全部选填）
+    bid_method              TEXT CHECK (bid_method IS NULL OR bid_method IN ('OPEN','GOV_PROC','DIRECT')),
+    open_bid_date           TEXT,
+    project_leader          TEXT,
+    contact_info            TEXT,
+    bid_agent_id            TEXT REFERENCES org_contractor(id),
     CHECK (planned_end IS NULL OR planned_start IS NULL OR planned_end >= planned_start),
     -- 审计价不加 CHECK：NULL / 0 / 负数一律按「未审定」处理（4.2.7），由应用层归一
     CHECK (audit_price_cent IS NULL OR audit_price_cent >= 0)
@@ -369,6 +376,7 @@ SELECT
     c.contract_name                                 AS contract_name,
     c.status                                        AS status,
     o.contractor_name                               AS contractor_name,
+    c.contract_type                                 AS contract_type,
     c.contract_category_code                        AS contract_category_code,
     cat.category_code                               AS category_code,
     cat.category_name                               AS category_name,
@@ -385,7 +393,8 @@ SELECT
     {rate}                                          AS pay_rate_bp,
     CASE WHEN {base} < {paid} THEN 1 ELSE 0 END     AS is_inverted,
     c.planned_end                                   AS planned_end,
-    c.duration_days                                 AS duration_days
+    c.duration_days                                 AS duration_days,
+    c.delivery_date                                 AS delivery_date
 FROM ct_contract c
 JOIN org_contractor o   ON o.id = c.contractor_id
 LEFT JOIN ct_category cat ON cat.id = c.category_id

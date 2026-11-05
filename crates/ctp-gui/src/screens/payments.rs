@@ -23,7 +23,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui,
         &p,
         "拨款管理",
-        "登记即校验额度：超过「有效基准 ×（1 + 容差）」会被拦截，提示可付余额",
+        "未交工合同累计付款不超过有效计价基准的 80%；施工合同须已审定、且交工满 2 年方可付清",
     );
 
     if app.summaries.is_empty() {
@@ -33,53 +33,82 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
 
-    // ---------------- 合同选择
-    let current = app
-        .pay_contract
-        .clone()
-        .or_else(|| app.summaries.first().map(|s| s.contract_id.clone()));
-    let current_label = current
-        .as_ref()
-        .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
-        .map(|s| {
-            format!(
-                "{} {}（{}）",
-                s.contract_no,
-                s.contract_name,
-                status_label(&s.status)
-            )
-        })
-        .unwrap_or_else(|| "请选择合同".into());
+    // ---------------- 合同选择：输入即筛查，聚焦不全量展开
+    if app.pay_contract.is_none() {
+        app.pay_contract = app.summaries.first().map(|s| s.contract_id.clone());
+        app.sync_pay_text();
+        app.pay_contract_text = app.pay_contract_label().unwrap_or_default();
+    }
+    let candidates: Vec<String> = app
+        .summaries
+        .iter()
+        .map(|s| format!("{} {}", s.contract_no, s.contract_name))
+        .collect();
+    let mut text = app.pay_contract_text.clone();
+    let mut picked: Option<String> = None;
+    let mut edited = false;
 
-    let mut pick: Option<String> = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new("合同").size(12.5).color(p.text_muted));
-        egui::ComboBox::from_id_salt("pay_contract")
-            .width(420.0)
-            .selected_text(current_label)
-            .show_ui(ui, |ui| {
-                for s in &app.summaries {
-                    let sel = current.as_deref() == Some(&s.contract_id);
-                    if ui
-                        .selectable_label(
-                            sel,
-                            format!(
-                                "{} {}（{}）",
-                                s.contract_no,
-                                s.contract_name,
-                                status_label(&s.status)
-                            ),
-                        )
-                        .clicked()
-                    {
-                        pick = Some(s.contract_id.clone());
-                    }
-                }
-            });
-        if let Some(id) = pick {
-            app.pay_contract = Some(id);
+        let out = widgets::autocomplete_full(
+            ui,
+            "pay_contract",
+            &p,
+            &mut text,
+            &candidates,
+            372.0,
+            "输入合同编号或名称后联想",
+            widgets::SuggestMode::TypedOnly,
+        );
+        picked = out.picked;
+        edited = out.changed;
+
+        // 当前合同的项目状态与支付率：输入框之后紧跟，样式与合同台账一致
+        if let Some(s) = app
+            .pay_contract
+            .as_ref()
+            .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
+        {
+            ui.add_space(8.0);
+            if s.is_archived() {
+                widgets::badge(ui, &p, "归档关闭", Tone::Danger);
+            } else {
+                widgets::badge(ui, &p, "履行中", Tone::Success);
+            }
+            ui.add_space(8.0);
+            let frac = s.pay_rate.bp() as f32 / 10_000.0;
+            let color = if s.is_inverted {
+                p.danger
+            } else if frac > 0.99 {
+                p.warn
+            } else {
+                p.primary
+            };
+            widgets::bar(ui, &p, frac, color, 82.0, 7.0);
+            ui.label(
+                RichText::new(s.pay_rate.percent_string())
+                    .size(11.5)
+                    .color(p.text_muted),
+            );
         }
     });
+
+    app.pay_contract_text = text;
+    if let Some(v) = picked {
+        // 点选候选：按展示串反查合同 id
+        if let Some(s) = app
+            .summaries
+            .iter()
+            .find(|s| format!("{} {}", s.contract_no, s.contract_name) == v)
+        {
+            app.pay_contract = Some(s.contract_id.clone());
+        }
+    } else if edited {
+        // 边输边匹配：唯一命中才切换，匹配不到沿用原合同
+        if let Some(id) = unique_contract_match(&app.summaries, &app.pay_contract_text) {
+            app.pay_contract = Some(id);
+        }
+    }
 
     let Some(cid) = app.pay_contract.clone() else {
         return;
@@ -87,27 +116,34 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(s) = app.summaries.iter().find(|s| s.contract_id == cid) else {
         return;
     };
+    // 额度按表单里的开单日期计算，与登记时的校验口径一致
     let quota = app
         .db
         .as_ref()
-        .and_then(|c| service::quota_of(c, &cid).ok());
-    let (base, paid, avail, rate, tol_bp) = match &quota {
+        .and_then(|c| service::quota_on(c, &cid, &app.pay_form.date).ok());
+    let (base, paid, rate, tol_bp) = match &quota {
         Some(q) => (
             q.base_amount.format_yuan(),
             q.paid_amount.format_yuan(),
-            q.available_amount.format_yuan(),
             q.pay_rate.percent_string(),
             q.tolerance.bp(),
         ),
         None => (
             s.base_amount.format_yuan(),
             s.paid_amount.format_yuan(),
-            s.available_amount.format_yuan(),
             s.pay_rate.percent_string(),
             app.tolerance_bp,
         ),
     };
-    let avail_cent = quota.as_ref().map(|q| q.available_amount.cent()).unwrap_or(0);
+    // 可付额度取「付清条件」封顶后的口径
+    let payable_cent = quota
+        .as_ref()
+        .map(|q| q.payable_amount.cent())
+        .unwrap_or_else(|| s.available_amount.cent());
+    let limit_cent = quota.as_ref().map(|q| q.limit_amount.cent()).unwrap_or(0);
+    let cap_bp = quota.as_ref().map(|q| q.cap_bp).unwrap_or(10_000);
+    let limit_note = quota.as_ref().and_then(|q| q.limit_note);
+    let avail = Money::from_cent(payable_cent.max(0)).format_yuan();
     let overdue = quota.as_ref().map(|q| q.available_amount.cent() < 0).unwrap_or(false);
     let is_draft = s.status == ContractStatus::Draft.code();
     let payable = ContractStatus::from_code(&s.status)
@@ -118,6 +154,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut open_pay: Option<String> = None;
 
     ui.add_space(10.0);
+
+    // ---------------- 付清条件提示
+    if let Some(note) = limit_note {
+        widgets::soft_box(&p, p.warn_soft).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(note).size(12.0).strong().color(p.warn));
+                ui.label(
+                    RichText::new(format!(
+                        "｜当前累计上限 {}%（{} 元），已付 {} 元。",
+                        cap_bp / 100,
+                        Money::from_cent(limit_cent).format_yuan(),
+                        paid
+                    ))
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+            });
+        });
+        ui.add_space(10.0);
+    }
 
     // ---------------- 不可付提示
     if !payable {
@@ -170,10 +227,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         (
             "可付额度",
             avail.clone(),
-            format!(
-                "元 · {}",
-                if overdue { "已超额，需先处理" } else { "上限 − 已付" }
-            ),
+            if limit_note.is_some() {
+                format!("元 · {}% 封顶", cap_bp / 100)
+            } else if overdue {
+                "元 · 已超额，需先处理".to_string()
+            } else {
+                "元 · 上限 − 已付".to_string()
+            },
             if overdue { Tone::Danger } else { Tone::Success },
         ),
         (
@@ -210,9 +270,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut submit = false;
     let mut void_target: Option<ctp_core::payment::Payment> = None;
     let mut print_target: Option<ctp_core::payment::Payment> = None;
+    let mut material_target: Option<String> = None;
 
     ui.horizontal_top(|ui| {
-        let form_w = if avail_w > 900.0 { 344.0 } else { avail_w };
+        let form_w = if avail_w > 900.0 { 300.0 } else { avail_w };
         ui.allocate_ui_with_layout(
             egui::vec2(form_w, 0.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -223,31 +284,28 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     ui.add_space(6.0);
 
                     widgets::field_label(ui, &p, "* 本次金额（元）");
-                    ui.add_sized(
-                        [form_w - 40.0, 30.0],
-                        egui::TextEdit::singleline(&mut app.pay_form.amount)
-                            .hint_text("例如 1250000.00")
-                            .margin(egui::Margin::symmetric(8.0, 4.0)),
-                    );
-
-                    // 快捷填充：可付额度的一半 / 全额
                     ui.horizontal(|ui| {
-                        let half = avail_cent / 2;
-                        if ui.small_button("可付一半").clicked() && half > 0 {
-                            app.pay_form.amount = Money::from_cent(half).format_yuan();
-                        }
-                        if ui.small_button("填满额度").clicked() && avail_cent > 0 {
-                            app.pay_form.amount = Money::from_cent(avail_cent).format_yuan();
+                        ui.add_sized(
+                            [form_w - 40.0 - 56.0, 30.0],
+                            egui::TextEdit::singleline(&mut app.pay_form.amount)
+                                .hint_text("例如 1250000.00")
+                                .margin(egui::Margin::symmetric(8.0, 4.0)),
+                        );
+                        // 付清 = 填入当前可付额度（已叠加付清条件封顶）
+                        let fill = widgets::ghost_button_sm_on(ui, &p, "付清", payable_cent > 0);
+                        let fill = if payable_cent > 0 {
+                            fill.on_hover_text("填入当前可付额度")
+                        } else {
+                            fill.on_hover_text("当前无可付额度")
+                        };
+                        if fill.clicked() && payable_cent > 0 {
+                            app.pay_form.amount = Money::from_cent(payable_cent).format_yuan();
                         }
                     });
 
                     ui.add_space(6.0);
                     widgets::field_label(ui, &p, "* 开单日期");
-                    ui.add_sized(
-                        [form_w - 40.0, 30.0],
-                        egui::TextEdit::singleline(&mut app.pay_form.date)
-                            .margin(egui::Margin::symmetric(8.0, 4.0)),
-                    );
+                    widgets::date_input(ui, "pay_date", &p, &mut app.pay_form.date, form_w - 40.0);
 
                     ui.add_space(6.0);
                     widgets::field_label(ui, &p, "事由");
@@ -277,12 +335,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let amount = Money::parse_yuan(&app.pay_form.amount).ok();
                     let amount_ok = amount.map(|m| m.cent() > 0).unwrap_or(false);
                     let date_ok = is_iso_date(&app.pay_form.date);
-                    let over = amount.map(|m| m.cent() > avail_cent).unwrap_or(false);
+                    let over = amount.map(|m| m.cent() > payable_cent).unwrap_or(false);
                     let ok = amount_ok && date_ok && !over && payable;
 
                     ui.add_space(9.0);
                     if over {
                         widgets::soft_box(&p, p.warn_soft).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             ui.label(
                                 RichText::new(format!(
                                     "超出可付额度：本次 {} 元 > 可付 {} 元",
@@ -292,6 +351,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 .size(11.5)
                                 .color(p.warn),
                             );
+                            if limit_note.is_some() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "原因：累计付款上限为 {}%（付清条件未满足）",
+                                        cap_bp / 100
+                                    ))
+                                    .size(11.0)
+                                    .color(p.text_muted),
+                                );
+                            }
                         });
                         ui.add_space(6.0);
                     } else if !date_ok {
@@ -342,12 +411,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         TableBuilder::new(ui)
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .column(Column::auto().at_least(112.0))
-                            .column(Column::auto().at_least(86.0))
-                            .column(Column::auto().at_least(100.0))
-                            .column(Column::remainder().at_least(96.0))
-                            .column(Column::auto().at_least(62.0))
-                            .column(Column::auto().at_least(86.0))
+                            .column(Column::auto().at_least(104.0))
+                            .column(Column::auto().at_least(80.0))
+                            .column(Column::auto().at_least(92.0))
+                            .column(Column::remainder().at_least(60.0))
+                            .column(Column::auto().at_least(54.0))
+                            .column(Column::auto().at_least(160.0))
                             .header(26.0, |mut h| {
                                 for t in ["拨款单号", "开单日期", "金额", "事由", "状态", "操作"] {
                                     h.col(|ui| {
@@ -404,11 +473,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         });
                                         row.col(|ui| {
                                             ui.horizontal(|ui| {
-                                                if widgets::link(ui, &p, "打印", 11.5)
+                                                // 表格列间距是 20px，操作列内要收紧，否则第三个操作会被挤出
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                if widgets::link(ui, &p, "打印拨款单", 11.0)
                                                     .on_hover_text("预览付款打印模板的 9 个合并域取值")
                                                     .clicked()
                                                 {
                                                     print_target = Some((*pm).clone());
+                                                }
+                                                if widgets::link(ui, &p, "打印附件", 11.0)
+                                                    .on_hover_text("中标通知书、审计报告等材料打印")
+                                                    .clicked()
+                                                {
+                                                    material_target = Some(pm.contract_id.clone());
                                                 }
                                                 if pm.status
                                                     == ctp_core::payment::PaymentStatus::Paid
@@ -416,7 +493,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                         .add(
                                                             egui::Button::new(
                                                                 RichText::new("作废")
-                                                                    .size(11.5)
+                                                                    .size(11.0)
                                                                     .color(p.danger),
                                                             )
                                                             .frame(false),
@@ -472,11 +549,49 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some(pm) = print_target {
         app.open_print_preview(&pm);
     }
+    if let Some(cid) = material_target {
+        app.open_material_print(&cid);
+    }
     if let Some(id) = goto_contract {
         app.goto_contract(&id);
         return;
     }
     if let Some(id) = open_pay {
         app.open_payment(&id);
+    }
+}
+
+/// 按输入文本找合同：整串「编号 名称」/ 编号 / 名称精确命中，或**唯一**包含命中。
+///
+/// 命中多于一份时返回 `None`——继续沿用用户原先选中的合同，避免边打字边跳合同。
+fn unique_contract_match(
+    summaries: &[ctp_core::ledger::ContractSummary],
+    text: &str,
+) -> Option<String> {
+    let q = text.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    let exact: Vec<&ctp_core::ledger::ContractSummary> = summaries
+        .iter()
+        .filter(|s| {
+            format!("{} {}", s.contract_no, s.contract_name).to_lowercase() == q
+                || s.contract_no.to_lowercase() == q
+                || s.contract_name.to_lowercase() == q
+        })
+        .collect();
+    if exact.len() == 1 {
+        return Some(exact[0].contract_id.clone());
+    }
+    let hits: Vec<&ctp_core::ledger::ContractSummary> = summaries
+        .iter()
+        .filter(|s| {
+            s.contract_no.to_lowercase().contains(&q) || s.contract_name.to_lowercase().contains(&q)
+        })
+        .collect();
+    if hits.len() == 1 {
+        Some(hits[0].contract_id.clone())
+    } else {
+        None
     }
 }

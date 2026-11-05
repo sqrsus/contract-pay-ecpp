@@ -15,7 +15,7 @@ pub mod xlsx;
 pub use print::{PaymentPrintData, PrintError, PAYMENT_TEMPLATE};
 pub use report::{Cell, ColumnKind, ReportColumn, ReportKind, ReportResult};
 pub use service::{
-    create_contract, edit_contract_amount, export_report, quota_of, reconcile,
+    create_contract, edit_contract_amount, export_report, quota_of, quota_on, reconcile,
     register_audit_price, register_payment, report_of, void_contract, void_payment, NewContract,
     NewPayment, RateMismatch,
 };

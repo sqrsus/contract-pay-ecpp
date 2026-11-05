@@ -48,6 +48,8 @@ pub enum ContractorRole {
     Supplier,
     Owner,
     Other,
+    /// 招标代理（新建合同页「招标代理」自动建档时使用的角色）
+    Agent,
 }
 
 impl ContractorRole {
@@ -60,6 +62,7 @@ impl ContractorRole {
             ContractorRole::Supplier => "SUPPLIER",
             ContractorRole::Owner => "OWNER",
             ContractorRole::Other => "OTHER",
+            ContractorRole::Agent => "AGENT",
         }
     }
 
@@ -72,6 +75,7 @@ impl ContractorRole {
             ContractorRole::Supplier => "供应商",
             ContractorRole::Owner => "业主",
             ContractorRole::Other => "其他",
+            ContractorRole::Agent => "招标代理",
         }
     }
 
@@ -84,6 +88,7 @@ impl ContractorRole {
             "SUPPLIER" => ContractorRole::Supplier,
             "OWNER" => ContractorRole::Owner,
             "OTHER" => ContractorRole::Other,
+            "AGENT" => ContractorRole::Agent,
             _ => return None,
         })
     }

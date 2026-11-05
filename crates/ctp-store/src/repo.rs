@@ -1,6 +1,6 @@
 use crate::error::{Result, StoreError};
 use crate::schema;
-use ctp_core::contract::{Contract, ContractStatus, ContractType, PricingMethod};
+use ctp_core::contract::{BidMethod, Contract, ContractStatus, ContractType, PricingMethod};
 use ctp_core::date::now_iso;
 use ctp_core::ledger::{CategoryRow, ContractSummary, LedgerRow, PeriodRow};
 use ctp_core::money::Money;
@@ -142,7 +142,8 @@ contract_category_code, category_id, party_a, contractor_id, building_id, sort_n
 original_amount_cent, audit_price_cent, audit_date, audit_org, audit_report_no, duration_days, \
 planned_start, planned_end, actual_start, actual_end, pricing_method, retention_rate_bp, \
 advance_rate_bp, status, payment_terms, remark, is_deleted, version, created_at, created_by, \
-updated_at, updated_by";
+updated_at, updated_by, bid_method, open_bid_date, project_leader, contact_info, bid_agent_id, \
+delivery_date";
 
 fn map_contract(row: &Row) -> rusqlite::Result<Contract> {
     Ok(Contract {
@@ -186,6 +187,15 @@ fn map_contract(row: &Row) -> rusqlite::Result<Contract> {
         created_by: row.get(31)?,
         updated_at: row.get(32)?,
         updated_by: row.get(33)?,
+        bid_method: row
+            .get::<_, Option<String>>(34)?
+            .as_deref()
+            .and_then(BidMethod::from_code),
+        open_bid_date: row.get(35)?,
+        project_leader: row.get(36)?,
+        contact_info: row.get(37)?,
+        bid_agent_id: row.get(38)?,
+        delivery_date: row.get(39)?,
     })
 }
 
@@ -197,8 +207,9 @@ pub fn insert_contract(conn: &Connection, c: &Contract) -> Result<()> {
             sign_date, original_amount_cent, audit_price_cent, audit_date, audit_org, \
             audit_report_no, duration_days, planned_start, planned_end, actual_start, actual_end, \
             pricing_method, retention_rate_bp, advance_rate_bp, status, payment_terms, remark, \
-            is_deleted, created_at, created_by, updated_at, updated_by, version) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
+            is_deleted, created_at, created_by, updated_at, updated_by, version, \
+            bid_method, open_bid_date, project_leader, contact_info, bid_agent_id, delivery_date) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40)",
         rusqlite::params![
             c.id,
             c.project_id,
@@ -233,7 +244,13 @@ pub fn insert_contract(conn: &Connection, c: &Contract) -> Result<()> {
             c.created_by,
             c.updated_at,
             c.updated_by,
-            c.version
+            c.version,
+            c.bid_method.map(|b| b.code()),
+            c.open_bid_date,
+            c.project_leader,
+            c.contact_info,
+            c.bid_agent_id,
+            c.delivery_date
         ],
     )?;
     Ok(())
@@ -251,6 +268,8 @@ pub fn update_contract(conn: &Connection, c: &Contract) -> Result<()> {
             duration_days=?19, planned_start=?20, planned_end=?21, actual_start=?22, actual_end=?23, \
             pricing_method=?24, retention_rate_bp=?25, advance_rate_bp=?26, status=?27, \
             payment_terms=?28, remark=?29, is_deleted=?30, updated_at=?31, updated_by=?32, \
+            bid_method=?33, open_bid_date=?34, project_leader=?35, contact_info=?36, bid_agent_id=?37, \
+            delivery_date=?38, \
             version = version + 1 \
          WHERE id=?1 AND version=?2",
         rusqlite::params![
@@ -285,7 +304,13 @@ pub fn update_contract(conn: &Connection, c: &Contract) -> Result<()> {
             c.remark,
             c.is_deleted as i32,
             c.updated_at,
-            c.updated_by
+            c.updated_by,
+            c.bid_method.map(|b| b.code()),
+            c.open_bid_date,
+            c.project_leader,
+            c.contact_info,
+            c.bid_agent_id,
+            c.delivery_date
         ],
     )?;
     if n == 0 {
@@ -581,29 +606,32 @@ fn map_summary(row: &Row) -> rusqlite::Result<ContractSummary> {
         contract_name: row.get(3)?,
         status: row.get(4)?,
         contractor_name: row.get(5)?,
-        contract_category_code: row.get(6)?,
-        category_code: row.get(7)?,
-        category_name: row.get(8)?,
-        total_amount: money(row.get(9)?),
-        audit_price: row.get::<_, Option<i64>>(10)?.map(money),
-        is_audited: row.get::<_, i64>(11)? != 0,
-        base_amount: money(row.get(12)?),
-        audit_reduction: money(row.get(13)?),
-        paid_amount: money(row.get(14)?),
-        inflight_amount: money(row.get(15)?),
-        occupied_amount: money(row.get(16)?),
-        available_amount: money(row.get(17)?),
-        pay_rate: Rate::from_bp(row.get(18)?),
-        is_inverted: row.get::<_, i64>(19)? != 0,
-        planned_end: row.get(20)?,
-        duration_days: row.get(21)?,
+        contract_type: row.get(6)?,
+        contract_category_code: row.get(7)?,
+        category_code: row.get(8)?,
+        category_name: row.get(9)?,
+        total_amount: money(row.get(10)?),
+        audit_price: row.get::<_, Option<i64>>(11)?.map(money),
+        is_audited: row.get::<_, i64>(12)? != 0,
+        base_amount: money(row.get(13)?),
+        audit_reduction: money(row.get(14)?),
+        paid_amount: money(row.get(15)?),
+        inflight_amount: money(row.get(16)?),
+        occupied_amount: money(row.get(17)?),
+        available_amount: money(row.get(18)?),
+        pay_rate: Rate::from_bp(row.get(19)?),
+        is_inverted: row.get::<_, i64>(20)? != 0,
+        planned_end: row.get(21)?,
+        duration_days: row.get(22)?,
+        delivery_date: row.get(23)?,
     })
 }
 
 const SUMMARY_COLS: &str = "contract_id, project_id, contract_no, contract_name, status, \
-contractor_name, contract_category_code, category_code, category_name, total_amount_cent, \
-audit_price_cent, is_audited, base_amount_cent, audit_reduction_cent, paid_cent, inflight_cent, \
-occupied_cent, available_cent, pay_rate_bp, is_inverted, planned_end, duration_days";
+contractor_name, contract_type, contract_category_code, category_code, category_name, \
+total_amount_cent, audit_price_cent, is_audited, base_amount_cent, audit_reduction_cent, paid_cent, \
+inflight_cent, occupied_cent, available_cent, pay_rate_bp, is_inverted, planned_end, duration_days, \
+delivery_date";
 
 pub fn summaries(conn: &Connection) -> Result<Vec<ContractSummary>> {
     let sql = format!("SELECT {SUMMARY_COLS} FROM v_contract_summary ORDER BY contract_no");

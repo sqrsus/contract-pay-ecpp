@@ -3,6 +3,7 @@
 //! 所有组件只依赖 `Palette`，因此浅色/深色两套主题下表现一致。
 
 use crate::theme::Palette;
+use ctp_core::date::today_iso;
 use eframe::egui::{
     self, Color32, Margin, Response, RichText, Rounding, Stroke, Ui, Vec2,
 };
@@ -211,6 +212,69 @@ pub fn ghost_button_sm_on(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -
     )
 }
 
+/// 定宽文本：超出宽度时默认只显示开头；鼠标悬停后自动横向滚动查看全文。
+pub fn marquee(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    size: f32,
+    color: Color32,
+) -> Response {
+    marquee_sense(ui, text, width, size, color, egui::Sense::hover())
+}
+
+/// 同 `marquee`，但可指定交互类型（例如 `Sense::click()` 用作链接）。
+pub fn marquee_sense(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    size: f32,
+    color: Color32,
+    sense: egui::Sense,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 18.0), sense);
+    let font = egui::FontId::proportional(size);
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, color));
+    let text_w = galley.size().x;
+    let gap = 28.0;
+    let cycle = text_w + gap;
+
+    let mut offset = 0.0_f32;
+    if text_w > width && resp.hovered() {
+        ui.ctx().request_repaint();
+        let t = ui.input(|i| i.time) as f32;
+        offset = (t * 32.0) % cycle;
+    }
+
+    let painter = ui.painter().with_clip_rect(rect);
+    let y = rect.center().y - galley.size().y / 2.0;
+    painter.galley(egui::pos2(rect.left() - offset, y), galley.clone(), color);
+    if offset > 0.0 {
+        painter.galley(egui::pos2(rect.left() - offset + cycle, y), galley, color);
+    }
+    resp
+}
+
+/// 定宽文本（不滚动）：超出宽度直接裁剪，避免表格列被长名称撑开。
+pub fn clipped_text(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    size: f32,
+    color: Color32,
+    sense: egui::Sense,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width.max(1.0), 18.0), sense);
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), color)
+    });
+    let y = rect.center().y - galley.size().y / 2.0;
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(egui::pos2(rect.left(), y), galley, color);
+    resp
+}
+
 /// 紧凑主按钮：详情卡里的「设为生效」这类唯一主行动。
 pub fn primary_button_sm(ui: &mut Ui, p: &Palette, text: &str) -> Response {
     ui.scope(|ui| {
@@ -232,17 +296,6 @@ pub fn primary_button_sm(ui: &mut Ui, p: &Palette, text: &str) -> Response {
         )
     })
     .inner
-}
-
-/// 紧凑危险按钮。
-pub fn danger_button_sm(ui: &mut Ui, p: &Palette, text: &str) -> Response {
-    ui.add(
-        egui::Button::new(RichText::new(text).size(12.5).color(p.danger))
-            .fill(p.surface)
-            .stroke(Stroke::new(1.0_f32, p.danger))
-            .rounding(Rounding::same(7.0))
-            .min_size(Vec2::new(0.0, 28.0)),
-    )
 }
 
 /// 表单字段标题。
@@ -298,10 +351,6 @@ pub fn link(ui: &mut Ui, p: &Palette, text: &str, size: f32) -> Response {
 }
 
 /// 弱化的可点击文字：常态灰、悬停主色下划线，避免和主编号抢注意力。
-pub fn link_muted(ui: &mut Ui, p: &Palette, text: &str, size: f32) -> Response {
-    link_colored(ui, text, size, p.text_muted, p.primary)
-}
-
 fn link_colored(
     ui: &mut Ui,
     text: &str,
@@ -328,10 +377,32 @@ fn link_colored(
     resp
 }
 
+/// 联想弹层的触发方式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SuggestMode {
+    /// 只有输入了内容才筛选展示；输入为空不弹层。
+    TypedOnly,
+    /// 输入为空时也展示全部已有条目（发包人沿用既有行为）。
+    ShowAllOnEmpty,
+}
+
+/// 联想框的一帧结果。
+pub struct AcOutcome {
+    /// 用户点选了某一项时的回填值
+    pub picked: Option<String>,
+    /// 本帧输入内容是否被用户编辑（用于「边输边匹配」的场景）
+    pub changed: bool,
+}
+
 /// 联想输入框：输入时在下方浮出候选，点选即回填，未点选则保留用户原文。
 ///
 /// 匹配用「包含」而不是前缀——中文输入法下用户常从中间几个字开始回忆，
 /// 前缀匹配会漏掉大量正确结果。候选最多 8 条，避免浮层盖住整个表单。
+///
+/// 展示规则：
+/// * `TypedOnly`：空输入不展示；输入后按内容筛选；无匹配时给一行「无匹配项」提示。
+/// * `ShowAllOnEmpty`：空输入展示全部已有条目；输入后筛选；无匹配不弹层。
+///
 /// 返回 `Some(值)` 表示这一帧用户点选了某一项（调用方据此刷新联动字段）。
 pub fn autocomplete(
     ui: &mut Ui,
@@ -341,7 +412,22 @@ pub fn autocomplete(
     candidates: &[String],
     width: f32,
     hint: &str,
+    mode: SuggestMode,
 ) -> Option<String> {
+    autocomplete_full(ui, id, p, text, candidates, width, hint, mode).picked
+}
+
+/// 同 `autocomplete`，额外回报「输入是否变化」与焦点状态。
+pub fn autocomplete_full(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    candidates: &[String],
+    width: f32,
+    hint: &str,
+    mode: SuggestMode,
+) -> AcOutcome {
     let resp = ui.add_sized(
         [width, 26.0],
         egui::TextEdit::singleline(text)
@@ -349,59 +435,414 @@ pub fn autocomplete(
             .margin(Margin::symmetric(8.0, 4.0)),
     );
 
-    // 只有「正在输入」才弹候选：失焦或空串时一律不打扰
-    if !resp.has_focus() {
-        return None;
+    // 弹层显隐不能只看 `has_focus`：鼠标按在候选上时输入框会先失去焦点，
+    // 若此时提前 return，候选列表当帧不再绘制，这次点击就永远丢失。
+    // 因此用 memory 记住「展开」状态，并用上一帧弹层矩形判断点击是否落在外面。
+    let open_id = egui::Id::new((id, "ac_open"));
+    let rect_id = egui::Id::new((id, "ac_rect"));
+    let last_rect: Option<egui::Rect> = ui
+        .memory(|m| m.data.get_temp::<Option<egui::Rect>>(rect_id))
+        .flatten();
+    let mut open = ui.memory(|m| m.data.get_temp::<bool>(open_id).unwrap_or(false));
+
+    if resp.has_focus() || resp.clicked() {
+        open = true;
     }
+    if ui.input(|i| i.pointer.any_pressed()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            let in_input = resp.rect.contains(pos);
+            let in_popup = last_rect.map_or(false, |r| r.contains(pos));
+            if !in_input && !in_popup {
+                open = false;
+            }
+        }
+    }
+
+    let empty = text.trim().is_empty();
+
+    // TypedOnly：输入为空时直接收起，不做任何展示。
+    if empty && mode == SuggestMode::TypedOnly {
+        open = false;
+    }
+
+    let matched = matched_candidates(candidates, text, mode);
+
+    // 已输入但一个都没匹配上：给一行灰色提示，说明可继续手工输入新名称。
+    // 发包人（ShowAllOnEmpty）保持原行为——无匹配时不弹层。
+    let no_match_hint = mode == SuggestMode::TypedOnly && !empty && matched.is_empty();
+
+    let mut picked: Option<String> = None;
+    let mut popup_rect: Option<egui::Rect> = None;
+
+    if open && (!matched.is_empty() || no_match_hint) {
+        let area = egui::Area::new(egui::Id::new((id, "ac_area")))
+            .order(egui::Order::Foreground)
+            .fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(6.0, 6.0))
+                    .show(ui, |ui| {
+                        let row_w = (width - 12.0).max(120.0);
+                        ui.set_width(row_w);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        if no_match_hint {
+                            ui.label(
+                                RichText::new("无匹配项，可直接输入新名称")
+                                    .size(11.5)
+                                    .color(p.text_muted),
+                            );
+                        } else {
+                            for c in &matched {
+                                if suggestion_row(ui, p, c, row_w).clicked() {
+                                    picked = Some(c.clone());
+                                }
+                            }
+                        }
+                    });
+            });
+        popup_rect = Some(area.response.rect);
+    }
+
+    let still_open = open && picked.is_none();
+    ui.memory_mut(|m| {
+        m.data.insert_temp(open_id, still_open);
+        m.data.insert_temp(rect_id, popup_rect);
+    });
+
+    if let Some(v) = picked {
+        *text = v.clone();
+        ui.memory_mut(|m| m.surrender_focus(resp.id));
+        return AcOutcome {
+            picked: Some(v),
+            changed: true,
+        };
+    }
+    AcOutcome {
+        picked: None,
+        changed: resp.changed(),
+    }
+}
+
+/// 候选上限：避免浮层盖住整个表单。
+const MAX_SUGGESTIONS: usize = 8;
+
+/// 纯函数：按输入过滤候选。
+///
+/// * 空输入：`TypedOnly` 返回空（不展示），`ShowAllOnEmpty` 返回前 8 条；
+/// * 非空输入：忽略大小写、按「包含」匹配，最多 8 条；
+/// * 无匹配：返回空，由调用方决定是否显示「无匹配项」提示。
+fn matched_candidates(candidates: &[String], text: &str, mode: SuggestMode) -> Vec<String> {
     let q = text.trim().to_lowercase();
     if q.is_empty() {
-        return None;
+        return match mode {
+            SuggestMode::TypedOnly => Vec::new(),
+            SuggestMode::ShowAllOnEmpty => candidates
+                .iter()
+                .take(MAX_SUGGESTIONS)
+                .cloned()
+                .collect(),
+        };
     }
-    let matched: Vec<String> = candidates
+    candidates
         .iter()
         .filter(|c| c.to_lowercase().contains(&q))
-        .take(8)
+        .take(MAX_SUGGESTIONS)
         .cloned()
-        .collect();
-    if matched.is_empty() {
-        return None;
+        .collect()
+}
+
+/// 联想候选行：整行可点、悬停高亮，避免只有文字本身能点中。
+fn suggestion_row(ui: &mut Ui, p: &Palette, text: &str, width: f32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(5.0), p.primary_soft);
     }
-    // 已经唯一命中且完全一致，就没有再选一次的必要
-    if matched.len() == 1 && matched[0].to_lowercase() == q {
-        return None;
+    ui.painter().with_clip_rect(rect).text(
+        egui::pos2(rect.left() + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(12.5),
+        p.text,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 日期输入框：点击弹出月历，选中即回填 `YYYY-MM-DD`；也可直接键盘输入。
+///
+/// 与联想框同理，弹层用 memory 维持——点日历格子时输入框会先失焦，
+/// 若依赖 `has_focus` 就会当帧收起、点击丢失。
+pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: f32) {
+    let resp = ui.add_sized(
+        [width, 26.0],
+        egui::TextEdit::singleline(text)
+            .hint_text(RichText::new("YYYY-MM-DD").size(12.0).color(p.text_muted))
+            .margin(Margin::symmetric(8.0, 4.0)),
+    );
+
+    let open_id = egui::Id::new((id, "dt_open"));
+    let rect_id = egui::Id::new((id, "dt_rect"));
+    let ym_id = egui::Id::new((id, "dt_ym"));
+
+    let last_rect: Option<egui::Rect> = ui
+        .memory(|m| m.data.get_temp::<Option<egui::Rect>>(rect_id))
+        .flatten();
+    let mut open = ui.memory(|m| m.data.get_temp::<bool>(open_id).unwrap_or(false));
+
+    if resp.clicked() {
+        open = true;
+        // 每次点开都按当前文本重新定位月份，避免沿用上次浏览到的月份
+        if let Some((y, m)) = parse_ym(text) {
+            ui.memory_mut(|mem| mem.data.insert_temp(ym_id, (y, m)));
+        }
+    }
+    // 键盘输入时不挡着日历
+    if resp.changed() {
+        open = false;
+    }
+    if ui.input(|i| i.pointer.any_pressed()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            let in_input = resp.rect.contains(pos);
+            let in_popup = last_rect.map_or(false, |r| r.contains(pos));
+            if !in_input && !in_popup {
+                open = false;
+            }
+        }
     }
 
     let mut picked: Option<String> = None;
-    egui::Area::new(egui::Id::new((id, "ac")))
-        .order(egui::Order::Foreground)
-        .fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
-        .show(ui.ctx(), |ui| {
-            egui::Frame::none()
-                .fill(p.surface)
-                .stroke(Stroke::new(1.0_f32, p.border))
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::symmetric(6.0, 6.0))
-                .show(ui, |ui| {
-                    ui.set_width((width - 12.0).max(120.0));
-                    for c in &matched {
-                        if ui
-                            .selectable_label(
-                                false,
-                                RichText::new(c).size(12.5).color(p.text),
-                            )
-                            .clicked()
-                        {
-                            picked = Some(c.clone());
-                        }
-                    }
-                });
-        });
+    let mut cleared = false;
+    let mut popup_rect: Option<egui::Rect> = None;
 
-    if let Some(v) = &picked {
-        *text = v.clone();
-        ui.memory_mut(|m| m.surrender_focus(resp.id));
+    if open {
+        let today = today_parts();
+        let (mut y, mut m) = ui
+            .memory(|mem| mem.data.get_temp::<(i32, u32)>(ym_id))
+            .or_else(|| parse_ym(text))
+            .unwrap_or((today.0, today.1));
+
+        let mut nav = 0i32;
+        let area = egui::Area::new(egui::Id::new((id, "dt_area")))
+            .order(egui::Order::Foreground)
+            .fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(232.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(
+                                    [26.0, 24.0],
+                                    egui::Button::new(
+                                        RichText::new("‹").size(16.0).color(p.text),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                nav = -1;
+                            }
+                            ui.label(
+                                RichText::new(format!("{y} 年 {m} 月"))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(p.text),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_sized(
+                                            [26.0, 24.0],
+                                            egui::Button::new(
+                                                RichText::new("›")
+                                                    .size(16.0)
+                                                    .color(p.text),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        nav = 1;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        egui::Grid::new(egui::Id::new((id, "dt_grid")))
+                            .num_columns(7)
+                            .spacing([2.0, 2.0])
+                            .show(ui, |ui| {
+                                for (i, w) in
+                                    ["一", "二", "三", "四", "五", "六", "日"].iter().enumerate()
+                                {
+                                    ui.label(
+                                        RichText::new(*w).size(11.0).color(p.text_muted),
+                                    );
+                                    if i == 6 {
+                                        ui.end_row();
+                                    }
+                                }
+                                let first = weekday_monday0(y, m, 1);
+                                let days = days_in_month(y, m);
+                                let mut col = 0u32;
+                                for _ in 0..first {
+                                    ui.label("");
+                                    col += 1;
+                                }
+                                for d in 1..=days {
+                                    let iso = format!("{y:04}-{m:02}-{d:02}");
+                                    let selected = text.as_str() == iso.as_str();
+                                    let is_today = today == (y, m, d);
+                                    if day_cell(ui, p, d, selected, is_today).clicked() {
+                                        picked = Some(iso);
+                                    }
+                                    col += 1;
+                                    if col == 7 {
+                                        ui.end_row();
+                                        col = 0;
+                                    }
+                                }
+                                if col != 0 {
+                                    ui.end_row();
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("今天").size(11.5).color(p.primary),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                picked = Some(format!(
+                                    "{:04}-{:02}-{:02}",
+                                    today.0, today.1, today.2
+                                ));
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("清空").size(11.5).color(p.text_muted),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                cleared = true;
+                                *text = String::new();
+                            }
+                        });
+                    });
+            });
+        popup_rect = Some(area.response.rect);
+
+        if nav != 0 {
+            let mut nm = m as i32 + nav;
+            while nm < 1 {
+                nm += 12;
+                y -= 1;
+            }
+            while nm > 12 {
+                nm -= 12;
+                y += 1;
+            }
+            m = nm as u32;
+            ui.memory_mut(|mem| mem.data.insert_temp(ym_id, (y, m)));
+        }
     }
-    picked
+
+    if let Some(v) = picked {
+        *text = v;
+        open = false;
+    }
+    if cleared {
+        open = false;
+    }
+    ui.memory_mut(|m| {
+        m.data.insert_temp(open_id, open);
+        m.data.insert_temp(rect_id, popup_rect);
+    });
+}
+
+/// 日历格子：整格可点，选中实心主色、今日浅主色、悬停浅主色。
+fn day_cell(ui: &mut Ui, p: &Palette, day: u32, selected: bool, is_today: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 24.0), egui::Sense::click());
+    let fill = if selected {
+        p.primary
+    } else if resp.hovered() || is_today {
+        p.primary_soft
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, Rounding::same(6.0), fill);
+    }
+    let fg = if selected { p.on_primary } else { p.text };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        day.to_string(),
+        egui::FontId::proportional(12.0),
+        fg,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn parse_ym(s: &str) -> Option<(i32, u32)> {
+    let b = s.as_bytes();
+    if b.len() < 7 || b[4] != b'-' {
+        return None;
+    }
+    let y: i32 = s.get(0..4)?.parse().ok()?;
+    let m: u32 = s.get(5..7)?.parse().ok()?;
+    if (1..=12).contains(&m) {
+        Some((y, m))
+    } else {
+        None
+    }
+}
+
+fn today_parts() -> (i32, u32, u32) {
+    let t = today_iso();
+    let y = t.get(0..4).and_then(|x| x.parse().ok()).unwrap_or(2026);
+    let m = t.get(5..7).and_then(|x| x.parse().ok()).unwrap_or(1);
+    let d = t.get(8..10).and_then(|x| x.parse().ok()).unwrap_or(1);
+    (y, m, d)
+}
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// 周一为 0 的星期序号（Sakamoto 公式）。
+fn weekday_monday0(y: i32, m: u32, d: u32) -> u32 {
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let yy = if m < 3 { y - 1 } else { y };
+    let sun0 = (yy + yy / 4 - yy / 100 + yy / 400 + T[(m - 1) as usize] + d as i32)
+        .rem_euclid(7) as u32;
+    (sun0 + 6) % 7
 }
 
 /// 表格「合计行」上方的分隔线。须在表格绘制完成后调用，`(left, right)` 取表格横向范围。
@@ -411,4 +852,46 @@ pub fn total_rule(ui: &Ui, p: &Palette, left: f32, right: f32, y: f32) {
         y,
         Stroke::new(1.0_f32, p.border_strong),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn 样例() -> Vec<String> {
+        vec![
+            "XATJ 某市政道路改扩建工程".to_string(),
+            "某建工集团有限公司".to_string(),
+            "某工程监理有限公司".to_string(),
+        ]
+    }
+
+    #[test]
+    fn 联想_空输入不展示() {
+        assert!(matched_candidates(&样例(), "", SuggestMode::TypedOnly).is_empty());
+        assert!(matched_candidates(&样例(), "   ", SuggestMode::TypedOnly).is_empty());
+    }
+
+    #[test]
+    fn 联想_按包含匹配且忽略大小写() {
+        let hit = matched_candidates(&样例(), "xatj", SuggestMode::TypedOnly);
+        assert_eq!(hit.len(), 1);
+        assert!(hit[0].contains("XATJ"));
+
+        let hit2 = matched_candidates(&样例(), "某建工", SuggestMode::TypedOnly);
+        assert_eq!(hit2, vec!["某建工集团有限公司".to_string()]);
+    }
+
+    #[test]
+    fn 联想_无匹配返回空() {
+        assert!(matched_candidates(&样例(), "不存在的名称", SuggestMode::TypedOnly).is_empty());
+    }
+
+    #[test]
+    fn 联想_发包人空输入仍展示全部() {
+        assert_eq!(
+            matched_candidates(&样例(), "", SuggestMode::ShowAllOnEmpty).len(),
+            3
+        );
+    }
 }

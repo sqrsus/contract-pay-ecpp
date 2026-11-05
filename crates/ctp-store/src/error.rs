@@ -37,4 +37,9 @@ impl StoreError {
     pub fn is_quota_exceeded(&self) -> bool {
         matches!(self.domain(), Some(DomainError::QuotaExceeded { .. }))
     }
+
+    /// 是否为付清条件拦截（未交工 80% / 施工未审定或交工未满 2 年）。
+    pub fn is_payment_blocked(&self) -> bool {
+        matches!(self.domain(), Some(DomainError::PaymentBlocked(_)))
+    }
 }
