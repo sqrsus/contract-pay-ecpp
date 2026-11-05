@@ -271,6 +271,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut void_target: Option<ctp_core::payment::Payment> = None;
     let mut print_target: Option<ctp_core::payment::Payment> = None;
     let mut material_target: Option<String> = None;
+    // 批量打印：勾选状态与批量动作分开收集，遍历列表时不能改 App
+    let mut sel_toggle: Vec<(String, bool)> = Vec::new();
+    let mut batch_print = false;
+    let mut select_all = false;
+    let mut clear_sel = false;
 
     ui.horizontal_top(|ui| {
         let form_w = if avail_w > 900.0 { 300.0 } else { avail_w };
@@ -407,10 +412,39 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             widgets::empty_state(ui, &p, "该合同还没有拨款记录");
                             return;
                         }
+                        // 批量打印：勾选若干条 → 合并成一份，一份一页
+                        let chosen = rows.iter().filter(|pm| app.print_sel.contains(&pm.id)).count();
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if widgets::link(
+                                ui,
+                                &p,
+                                &format!("批量打印所选（{chosen}）"),
+                                11.0,
+                            )
+                            .on_hover_text("勾选的拨款单合并成一份 Word，每张一页")
+                            .clicked()
+                            {
+                                batch_print = true;
+                            }
+                            if widgets::link(ui, &p, "全选", 11.0).clicked() {
+                                select_all = true;
+                            }
+                            if chosen > 0 && widgets::link(ui, &p, "清空", 11.0).clicked() {
+                                clear_sel = true;
+                            }
+                            ui.label(
+                                RichText::new("作废单不参与勾选，也不可打印")
+                                    .size(11.0)
+                                    .color(p.text_muted),
+                            );
+                        });
+                        ui.add_space(4.0);
                         ui.spacing_mut().item_spacing.x = 20.0;
                         TableBuilder::new(ui)
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().at_least(24.0))
                             .column(Column::auto().at_least(104.0))
                             .column(Column::auto().at_least(80.0))
                             .column(Column::auto().at_least(92.0))
@@ -418,7 +452,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             .column(Column::auto().at_least(54.0))
                             .column(Column::auto().at_least(160.0))
                             .header(26.0, |mut h| {
-                                for t in ["拨款单号", "开单日期", "金额", "事由", "状态", "操作"] {
+                                for t in ["", "拨款单号", "开单日期", "金额", "事由", "状态", "操作"] {
                                     h.col(|ui| {
                                         ui.label(RichText::new(t).size(12.0).color(p.text_muted));
                                     });
@@ -427,6 +461,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             .body(|mut body| {
                                 for pm in rows.iter().copied() {
                                     body.row(30.0, |mut row| {
+                                        row.col(|ui| {
+                                            let paid = pm.status
+                                                == ctp_core::payment::PaymentStatus::Paid;
+                                            let mut on = app.print_sel.contains(&pm.id);
+                                            let cb = ui.add_enabled(
+                                                paid,
+                                                egui::Checkbox::new(&mut on, ""),
+                                            );
+                                            if !paid {
+                                                cb.on_hover_text("作废单不可打印");
+                                            } else if cb.changed() {
+                                                sel_toggle.push((pm.id.clone(), on));
+                                            }
+                                        });
                                         row.col(|ui| {
                                             if widgets::link(ui, &p, &pm.payment_no, 12.0).clicked()
                                             {
@@ -475,11 +523,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             ui.horizontal(|ui| {
                                                 // 表格列间距是 20px，操作列内要收紧，否则第三个操作会被挤出
                                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                                if widgets::link(ui, &p, "打印拨款单", 11.0)
-                                                    .on_hover_text("预览付款打印模板的 9 个合并域取值")
-                                                    .clicked()
+                                                if pm.status
+                                                    == ctp_core::payment::PaymentStatus::Paid
                                                 {
-                                                    print_target = Some((*pm).clone());
+                                                    if widgets::link(ui, &p, "打印拨款单", 11.0)
+                                                        .on_hover_text(
+                                                            "核对 9 个合并域后交给 Word 打印，可导出 Word / PDF",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        print_target = Some((*pm).clone());
+                                                    }
+                                                } else {
+                                                    ui.label(
+                                                        RichText::new("打印拨款单")
+                                                            .size(11.0)
+                                                            .color(p.text_muted),
+                                                    )
+                                                    .on_hover_text("作废单不允许打印");
                                                 }
                                                 if widgets::link(ui, &p, "打印附件", 11.0)
                                                     .on_hover_text("中标通知书、审计报告等材料打印")
@@ -515,6 +576,33 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             );
         }
     });
+
+    // 勾选状态落回 App：表格遍历期间借用了 app.payments，不能就地改
+    for (id, on) in sel_toggle {
+        if on {
+            app.print_sel.insert(id);
+        } else {
+            app.print_sel.remove(&id);
+        }
+    }
+    if clear_sel {
+        app.print_sel.clear();
+    }
+    if select_all {
+        let ids: Vec<String> = app
+            .payments
+            .iter()
+            .filter(|pm| {
+                pm.contract_id == cid
+                    && pm.status == ctp_core::payment::PaymentStatus::Paid
+            })
+            .map(|pm| pm.id.clone())
+            .collect();
+        app.print_sel.extend(ids);
+    }
+    if batch_print {
+        app.open_batch_print();
+    }
 
     if submit {
         let amount = Money::parse_yuan(&app.pay_form.amount).unwrap_or(Money::ZERO);

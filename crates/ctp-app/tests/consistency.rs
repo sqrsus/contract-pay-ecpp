@@ -549,27 +549,34 @@ fn 付款打印九域解析与中文大写() {
 }
 
 #[test]
-fn 打印输出本期明确未实现且接口中立() {
-    use ctp_app::print::{PaymentPrintData, PrintContext, PrintError, TemplateKind, PAYMENT_TEMPLATE};
+fn 打印输出已接通且接口中立() {
+    use ctp_app::print::{adapters, PrintContext, TemplateKind, PAYMENT_TEMPLATE};
 
-    assert!(ctp_app::print::adapters().is_empty(), "本轮不接入填充实现");
+    // 已确认走 Word 模板；Excel 仍留作第二 adapter，接口不变
+    assert_eq!(adapters().len(), 1, "已接入 Word 填充器");
+    assert_eq!(adapters()[0].kind(), TemplateKind::Word);
     assert_eq!(PAYMENT_TEMPLATE.kind, TemplateKind::Word);
     assert_eq!(PAYMENT_TEMPLATE.alt_kind, Some(TemplateKind::Excel));
 
-    let data = PaymentPrintData {
-        payment_no: "X".into(),
-        contract_no: "Y".into(),
-        fields: Vec::new(),
-        generated_at: ctp_core::date::now_iso(),
-    };
+    let (mut conn, cid) = fixture(1000);
+    let pm = pay(&mut conn, &cid, 250).unwrap();
+    let data = service::payment_print_data(&conn, &pm.id).unwrap();
+
+    // 单份落盘出一条真正可打开的 docx（R-27：不再是空实现）
+    let dir = std::env::temp_dir().join("ctp-print-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("out.docx");
     let ctx = PrintContext {
         descriptor: &PAYMENT_TEMPLATE,
         data: &data,
-        template_path: std::path::Path::new("templates/付款打印模板.docx"),
-        output_path: std::path::Path::new("out.docx"),
+        template_path: std::path::Path::new("templates/payment_voucher.docx"),
+        output_path: &out,
     };
-    let err = ctp_app::print::render(&ctx).unwrap_err();
-    assert!(matches!(err, PrintError::NotImplemented(TemplateKind::Word)));
+    ctp_app::print::render(&ctx).unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(bytes.starts_with(b"PK"), "docx 应为 zip 容器");
+    let xml = ctp_app::docx::read_entry(&bytes, ctp_app::docx::DOC_XML).unwrap();
+    assert!(ctp_app::docx::residual_fields(&xml).is_empty(), "不应残留占位符");
 }
 
 #[test]

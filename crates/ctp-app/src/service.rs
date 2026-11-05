@@ -850,12 +850,38 @@ pub fn export_report(
     Ok((rows, cols))
 }
 
-// ---------------------------------------------------------------- 付款打印数据
+// ---------------------------------------------------------------- 付款打印
 
-/// 选中一张拨款单 → 解析 9 个合并域的取值（本轮只供界面预览，不产出 docx）。
+/// 选中一张拨款单 → 解析 9 个合并域的取值（界面预览用）。
 pub fn payment_print_data(
     conn: &Connection,
     payment_id: &str,
 ) -> std::result::Result<crate::print::PaymentPrintData, crate::print::PrintError> {
     crate::print::resolve(conn, payment_id)
+}
+
+/// 生成打印件字节流：单张传一个 id，批量按顺序传多个 id。
+///
+/// 作废一律拒绝、批量按「一份一页」合并，口径见 `print::render_payments`。
+pub fn print_payment_docx(
+    conn: &Connection,
+    payment_ids: &[String],
+) -> std::result::Result<crate::print::RenderedVoucher, crate::print::PrintError> {
+    crate::print::render_payments(conn, payment_ids)
+}
+
+/// 把已生成的 docx 字节落盘。写失败一律报错（不生成半成品）。
+pub fn write_print_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::result::Result<(), crate::print::PrintError> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                crate::print::PrintError::Template(format!("创建目录失败：{e}"))
+            })?;
+        }
+    }
+    std::fs::write(path, bytes)
+        .map_err(|e| crate::print::PrintError::Template(format!("写入打印件失败：{e}")))
 }

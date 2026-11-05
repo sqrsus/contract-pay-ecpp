@@ -162,6 +162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -775,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "ctp-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ctp-core",
  "ctp-store",
@@ -783,18 +792,19 @@ dependencies = [
  "rust_xlsxwriter",
  "serde_json",
  "thiserror 1.0.69",
+ "zip 2.6.1",
 ]
 
 [[package]]
 name = "ctp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "ctp-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ctp-app",
  "ctp-core",
@@ -807,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "ctp-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ctp-core",
  "rusqlite",
@@ -819,6 +829,17 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
 
 [[package]]
 name = "digest"
@@ -2811,7 +2832,7 @@ version = "0.102.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ca3d0e879a578c1313c2800ab0c6c029d38eed18098675e50341a30d32372ed"
 dependencies = [
- "zip",
+ "zip 9.3.0",
 ]
 
 [[package]]
@@ -4437,6 +4458,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "zip"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dcb24d0152526ae49b9b96c1dcf71850ca1e0b882e4e28ed898a93c41334744"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "zopfli",
 ]
 
 [[package]]

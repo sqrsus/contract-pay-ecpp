@@ -16,10 +16,10 @@ mod widgets;
 use ctp_app::checks::CheckReport;
 use ctp_app::print::PaymentPrintData;
 use ctp_app::report::ReportKind;
-use ctp_core::attachment::Attachment;
+use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::{Contract, ContractStatus};
 use ctp_core::ledger::{CategoryRow, ContractSummary, PeriodRow};
-use ctp_core::payment::Payment;
+use ctp_core::payment::{Payment, PaymentStatus};
 use ctp_core::project::{Contractor, Project};
 use ctp_store::{db, repo};
 use eframe::egui::{self, Color32, Margin, RichText, Rounding};
@@ -153,8 +153,11 @@ pub struct App {
     /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
     pub pay_detail: Option<Payment>,
     /// 付款打印件的 9 个合并域解析结果（`Dialog::PrintPreview`）。
-    /// 本轮只做数据预览，不产出 docx 文件。
     pub print_data: Option<PaymentPrintData>,
+    /// 本次要输出的拨款单（单张 = 1 条；批量 = 勾选的若干条，按列表顺序）
+    pub print_ids: Vec<String>,
+    /// 拨款管理页「批量打印」的勾选集合
+    pub print_sel: std::collections::BTreeSet<String>,
     /// 新建合同表单里的一次性提示（附件选择失败等）
     pub new_contract_flash: Option<String>,
     pub new_contract: ContractForm,
@@ -254,6 +257,8 @@ impl App {
             pay_form: PayForm::default(),
             pay_detail: None,
             print_data: None,
+            print_ids: Vec::new(),
+            print_sel: std::collections::BTreeSet::new(),
             new_contract: ContractForm::default(),
             new_contract_flash: None,
             modal_contract: None,
@@ -377,10 +382,49 @@ impl App {
                     self.open_contract_detail(&id);
                 }
             }
+            "material_print" => {
+                if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
+                    self.select(&id);
+                    self.screen = Screen::Contracts;
+                    self.open_material_print(&id);
+                }
+            }
             "print_preview" => {
-                if let Some(pm) = self.payments.first().cloned() {
+                // 作废单不允许打印，这里直接跳过作废的记录
+                if let Some(pm) = self
+                    .payments
+                    .iter()
+                    .find(|p| p.status == PaymentStatus::Paid)
+                    .cloned()
+                {
+                    self.pay_contract = Some(pm.contract_id.clone());
+                    self.sync_pay_text();
                     self.screen = Screen::Payments;
                     self.open_print_preview(&pm);
+                }
+            }
+            "print_batch" => {
+                // 勾选同一合同下前两张已付单，用于核对批量打印条与合并张数
+                if let Some(pm) = self
+                    .payments
+                    .iter()
+                    .find(|p| p.status == PaymentStatus::Paid)
+                    .cloned()
+                {
+                    self.pay_contract = Some(pm.contract_id.clone());
+                    self.sync_pay_text();
+                    self.screen = Screen::Payments;
+                    let ids: Vec<String> = self
+                        .payments
+                        .iter()
+                        .filter(|p| {
+                            p.contract_id == pm.contract_id
+                                && p.status == PaymentStatus::Paid
+                        })
+                        .take(2)
+                        .map(|p| p.id.clone())
+                        .collect();
+                    self.print_sel.extend(ids);
                 }
             }
             _ => {}
@@ -500,7 +544,7 @@ impl App {
         self.screen = Screen::Payments;
     }
 
-    /// 打印附件材料（预留）：加载该合同的附件元数据，打开材料清单。
+    /// 打印附件：加载该合同的附件元数据，打开材料清单（由用户在本机应用里打印）。
     pub fn open_material_print(&mut self, contract_id: &str) {
         self.att_contract = Some(contract_id.to_string());
         self.attachments = self
@@ -509,6 +553,48 @@ impl App {
             .and_then(|c| repo::list_attachments(c, contract_id).ok())
             .unwrap_or_default();
         self.dialog = Dialog::MaterialPrint;
+    }
+
+    /// 把某类合同附件实体化到临时目录，用本机应用打开。
+    ///
+    /// 附件存在库里没有原路径，每次打开都落一份临时副本；打开后由用户决定打哪几页。
+    pub fn open_attachment_file(&mut self, kind: AttachmentKind) {
+        let Some(cid) = self.att_contract.clone() else {
+            return;
+        };
+        let kind_code = kind.code().to_string();
+        let got: Result<Option<(String, Vec<u8>)>, String> = (|| {
+            let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
+            let list = repo::list_attachments(conn, &cid).map_err(|e| e.to_string())?;
+            let Some(a) = list.into_iter().find(|a| a.kind_code == kind_code) else {
+                return Ok(None);
+            };
+            let bytes = ctp_app::service::attachment_bytes(conn, &a.id)
+                .map_err(|e| e.to_string())?;
+            Ok(Some((a.file_name, bytes)))
+        })();
+        match got {
+            Ok(Some((name, bytes))) => {
+                let dir = std::env::temp_dir().join("ctp-attachments");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(&name);
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        if let Err(e) = dialogs::open_external(&path) {
+                            self.error(e);
+                        } else {
+                            self.success(format!(
+                                "已用本机应用打开「{}」，在应用内选择打印",
+                                kind.label()
+                            ));
+                        }
+                    }
+                    Err(e) => self.error(format!("写入临时文件失败：{e}")),
+                }
+            }
+            Ok(None) => self.error(format!("「{}」尚未上传", kind.label())),
+            Err(e) => self.error(format!("读取附件失败：{e}")),
+        }
     }
 
     /// 打开附件管理弹窗，并加载该合同的附件清单。
@@ -541,21 +627,143 @@ impl App {
         }
     }
 
-    /// 付款打印入口：选中一张拨款单 → 解析 9 个合并域 → 预览。
-    ///
-    /// 本轮按确认结论「暂时不需要输出」，不生成也不保存 docx；
-    /// 模板填充 adapter 接好后只需把预览窗口的按钮接到 `ctp_app::print::render`。
+    /// 付款打印入口：选中一张拨款单 → 解析 9 个合并域 → 打开打印弹窗。
     pub fn open_print_preview(&mut self, pm: &Payment) {
-        let data = self
-            .db
-            .as_ref()
-            .and_then(|c| ctp_app::service::payment_print_data(c, &pm.id).ok());
+        self.print_ids = vec![pm.id.clone()];
+        self.load_print_data();
+    }
+
+    /// 批量打印入口：拨款管理页勾选的若干张，按列表顺序成页（一份一页）。
+    pub fn open_batch_print(&mut self) {
+        if self.print_sel.is_empty() {
+            self.error("请先勾选要打印的拨款单");
+            return;
+        }
+        // 以列表顺序为准：勾选先后不影响成品里的顺序；只取当前合同下的单子
+        let cid = self.pay_contract.clone();
+        let ids: Vec<String> = self
+            .payments
+            .iter()
+            .filter(|p| {
+                Some(&p.contract_id) == cid.as_ref() && self.print_sel.contains(&p.id)
+            })
+            .map(|p| p.id.clone())
+            .collect();
+        if ids.is_empty() {
+            self.print_sel.clear();
+            self.error("勾选的拨款单已不在当前列表中，请重新勾选");
+            return;
+        }
+        self.print_ids = ids;
+        self.load_print_data();
+    }
+
+    fn load_print_data(&mut self) {
+        let data = match (self.db.as_ref(), self.print_ids.first()) {
+            (Some(conn), Some(id)) => ctp_app::service::payment_print_data(conn, id).ok(),
+            _ => None,
+        };
         match data {
             Some(d) => {
                 self.print_data = Some(d);
                 self.dialog = Dialog::PrintPreview;
             }
             None => self.error("解析付款打印数据失败"),
+        }
+    }
+
+    /// 生成打印件字节流（单张或批量）。任何失败都报错中止，不留半成品。
+    fn render_print_bytes(&mut self) -> Option<ctp_app::print::RenderedVoucher> {
+        let ids = self.print_ids.clone();
+        let out = self
+            .db
+            .as_ref()
+            .map(|conn| ctp_app::service::print_payment_docx(conn, &ids));
+        match out {
+            Some(Ok(v)) => Some(v),
+            Some(Err(e)) => {
+                self.error(format!("生成打印件失败：{e}"));
+                None
+            }
+            None => {
+                self.error("数据库未打开");
+                None
+            }
+        }
+    }
+
+    /// 打开并打印：生成 docx → 交给本机 Word → 由用户在 Word 里按 Ctrl+P 出纸。
+    ///
+    /// 已确认走「打开文档由应用弹打印对话框」这条路（本机装有 Word），
+    /// 打印份数、打印机、双面等选项都在 Word 的打印对话框里选。
+    pub fn print_open_word(&mut self) {
+        let Some(v) = self.render_print_bytes() else {
+            return;
+        };
+        let path = std::env::temp_dir()
+            .join("ctp-print")
+            .join(&v.default_name);
+        if let Err(e) = ctp_app::service::write_print_file(&path, &v.bytes) {
+            self.error(format!("写入打印件失败：{e}"));
+            return;
+        }
+        match crate::dialogs::open_external(&path) {
+            Ok(()) => self.success(format!(
+                "已在 Word 中打开 {} 张，按 Ctrl+P 选择打印机打印",
+                v.count
+            )),
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// 导出 Word：另存一份 .docx 到用户指定位置。
+    pub fn export_print_docx(&mut self) {
+        let Some(v) = self.render_print_bytes() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&v.default_name)
+            .add_filter("Word 文档", &["docx"])
+            .save_file()
+        else {
+            return;
+        };
+        match ctp_app::service::write_print_file(&path, &v.bytes) {
+            Ok(()) => self.success(format!(
+                "已导出 {} 张打印件 → {}",
+                v.count,
+                path.display()
+            )),
+            Err(e) => self.error(format!("导出失败：{e}")),
+        }
+    }
+
+    /// 导出 PDF：先落 docx，再交给本机 Word 固定版式导出。
+    pub fn export_print_pdf(&mut self) {
+        let Some(v) = self.render_print_bytes() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(v.pdf_name())
+            .add_filter("PDF 文件", &["pdf"])
+            .save_file()
+        else {
+            return;
+        };
+        let docx = std::env::temp_dir()
+            .join("ctp-print")
+            .join(&v.default_name);
+        if let Err(e) = ctp_app::service::write_print_file(&docx, &v.bytes) {
+            self.error(format!("写入临时 docx 失败：{e}"));
+            return;
+        }
+        match ctp_app::pdf::docx_to_pdf(&docx, &path) {
+            Ok(()) => self.success(format!(
+                "已导出 {} 张 PDF → {}（Word 固定版式）",
+                v.count,
+                path.display()
+            )),
+            Err(e) => self.error(format!("导出 PDF 失败：{e}")),
         }
     }
 

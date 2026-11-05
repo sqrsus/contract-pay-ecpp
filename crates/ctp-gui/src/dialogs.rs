@@ -1238,7 +1238,7 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
                 if widgets::primary_button(ui, &p, "关闭", true).clicked() {
                     close = true;
                 }
-                if widgets::ghost_button(ui, &p, "打印").clicked() {
+                if !voided && widgets::ghost_button(ui, &p, "打印").clicked() {
                     print = true;
                 }
                 if contract.is_some()
@@ -1261,36 +1261,49 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-// ---------------------------------------------------------------- 付款打印预览
+// ---------------------------------------------------------------- 付款打印
 
-/// 付款打印件的数据预览。
+/// 付款打印弹窗：核对 9 个域的取值，然后「打开并打印 / 导出 Word / 导出 PDF」。
 ///
-/// 按已确认口径：9 个 MERGEFIELD 全部解析成纯文本值，缺值留空；会计分类名 /
-/// 附件张数 / 当前日期三处保持空白；两张表同在一个 docx 一起输出。
-/// **本轮不生成、不保存任何 docx**——模板填充 adapter 尚未接入。
+/// 按已确认口径：9 个 MERGEFIELD 全部替换成纯文本值，缺值留空；会计分类名 /
+/// 附件张数 / 当前日期三处保持空白；两张表同在一个 docx 一起输出；批量时一份一页。
 fn print_preview(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
     let Some(data) = app.print_data.clone() else {
         app.dialog = Dialog::None;
         return;
     };
+    let batch = app.print_ids.len();
     let mut close = false;
+    let mut do_print = false;
+    let mut do_docx = false;
+    let mut do_pdf = false;
     let tpl = &ctp_app::print::PAYMENT_TEMPLATE;
+    let title = if batch > 1 {
+        format!("批量打印拨款单 · 共 {batch} 张")
+    } else {
+        format!("打印拨款单 · {}", data.payment_no)
+    };
 
-    modal(format!("付款打印数据预览 · {}", data.payment_no), &p)
+    modal(&title, &p)
         .default_width(760.0)
         .show(ctx, |ui| {
             ui.set_width(720.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} ｜ {} ｜ 两张表同份输出",
-                    tpl.name,
-                    tpl.kind.label()
-                ))
-                .size(14.0)
-                .strong()
-                .color(p.text),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} ｜ {}",
+                        tpl.name,
+                        tpl.kind.label()
+                    ))
+                    .size(14.0)
+                    .strong()
+                    .color(p.text),
+                );
+                if batch > 1 {
+                    widgets::badge(ui, &p, &format!("{batch} 张合并"), Tone::Primary);
+                }
+            });
             ui.add_space(4.0);
             ui.label(
                 RichText::new(format!(
@@ -1358,28 +1371,48 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
                 }
             });
             ui.add_space(6.0);
-            widgets::soft_box(&p, p.warn_soft).show(ui, |ui| {
+            widgets::soft_box(&p, p.primary_soft).show(ui, |ui| {
                 ui.set_width(700.0);
                 ui.label(
                     RichText::new(
-                        "本轮按确认结论只固化字段映射与数据解析，不输出 docx 文件。\
-                         后期接入 Word 填充 adapter 时，须按 w:fldChar 域边界整体替换 MERGEFIELD \
-                         （模板里 4 个域被 Word 拆成 3 个 run，纯字符串替换会漏），\
-                         业务层与界面无需改动。",
+                        "「打开并打印」把成品交给本机 Word 打开，在 Word 里按 Ctrl+P 选择打印机出纸；\
+                         生成的文档已把 9 个合并域整体替换为纯文本，Word 不会再把占位符更新出来。\
+                         作废单不允许打印；批量按勾选顺序一份一页。",
                     )
                     .size(11.5)
-                    .color(p.warn),
+                    .color(p.primary),
                 );
             });
             ui.add_space(10.0);
-            if widgets::primary_button(ui, &p, "关闭", true).clicked() {
-                close = true;
-            }
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "打开并打印", true).clicked() {
+                    do_print = true;
+                }
+                if widgets::ghost_button(ui, &p, "导出 Word").clicked() {
+                    do_docx = true;
+                }
+                if widgets::ghost_button(ui, &p, "导出 PDF").clicked() {
+                    do_pdf = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::ghost_button(ui, &p, "关闭").clicked() {
+                        close = true;
+                    }
+                });
+            });
         });
 
+    if do_print {
+        app.print_open_word();
+    } else if do_docx {
+        app.export_print_docx();
+    } else if do_pdf {
+        app.export_print_pdf();
+    }
     if close {
         app.dialog = Dialog::None;
         app.print_data = None;
+        app.print_ids.clear();
     }
 }
 
@@ -1388,7 +1421,7 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
 /// 把字节落到临时目录后用系统默认程序打开。
 ///
 /// 附件存在库里，没有「原文件路径」可复用，所以每次打开都先物化一份临时副本。
-fn open_external(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn open_external(path: &std::path::Path) -> Result<(), String> {
     #[cfg(windows)]
     let mut cmd = {
         // start 的第一个参数是窗口标题，必须显式给空串，否则带空格的路径会被当成标题
@@ -1684,6 +1717,10 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+/// 打印附件：**用本机已安装的应用打开原件**，由用户在应用里自行选择打印范围。
+///
+/// 已确认口径（R-27）：不接管附件的打印，不做合并、不套模板；合同附件多为扫描件
+/// （PDF / 图片 / Word），只能交给原应用处理。
 fn material_print(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
     let cno = app
@@ -1694,7 +1731,7 @@ fn material_print(app: &mut App, ctx: &egui::Context) {
         .unwrap_or_else(|| "—".into());
 
     let mut close = false;
-    let mut hint: Option<String> = None;
+    let mut open_kind: Option<AttachmentKind> = None;
 
     modal(format!("打印附件材料 · {cno}"), &p)
         .default_width(620.0)
@@ -1702,7 +1739,8 @@ fn material_print(app: &mut App, ctx: &egui::Context) {
             ui.set_width(580.0);
             ui.label(
                 RichText::new(
-                    "预留接口：用于打印中标通知书、审计报告、中期结算材料与合同正本。本期只做材料清点，模板渲染待接入。",
+                    "附件按原件打开：用本机已安装的应用（Word / PDF 阅读器等）打开后，\
+                     在该应用里选择打印范围出纸。系统不做合并、不套模板、不批量。",
                 )
                 .size(12.0)
                 .color(p.text_muted),
@@ -1741,28 +1779,20 @@ fn material_print(app: &mut App, ctx: &egui::Context) {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     let enabled = att.is_some();
-                                    let btn = widgets::ghost_button_sm_on(ui, &p, "打印", enabled);
+                                    let btn = widgets::ghost_button_sm_on(ui, &p, "打开", enabled);
                                     let btn = if enabled {
-                                        btn.on_hover_text("接口已预留，待接入材料模板渲染")
+                                        btn.on_hover_text("用本机应用打开原件，在应用内打印")
                                     } else {
-                                        btn.on_hover_text("该材料未上传，无法打印")
+                                        btn.on_hover_text("该材料未上传，无法打开")
                                     };
                                     if btn.clicked() && enabled {
-                                        hint = Some(format!(
-                                            "「{}」打印接口已预留，待接入模板渲染",
-                                            kind.label()
-                                        ));
+                                        open_kind = Some(kind);
                                     }
                                 },
                             );
                         });
                     });
                 ui.add_space(7.0);
-            }
-
-            if let Some(msg) = &hint {
-                ui.add_space(2.0);
-                ui.label(RichText::new(msg).size(11.5).color(p.warn));
             }
 
             ui.add_space(6.0);
@@ -1775,6 +1805,10 @@ fn material_print(app: &mut App, ctx: &egui::Context) {
 
     if close {
         app.dialog = Dialog::None;
+        return;
+    }
+    if let Some(kind) = open_kind {
+        app.open_attachment_file(kind);
     }
 }
 
