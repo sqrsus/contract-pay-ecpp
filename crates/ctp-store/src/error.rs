@@ -17,6 +17,9 @@ pub enum StoreError {
 
     #[error("字典缺失：{0}")]
     DictMissing(String),
+
+    #[error("报表导出失败：{0}")]
+    Export(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

@@ -10,3 +10,6 @@ ctp-store.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
+# 报表导出：write-only（只能新建 xlsx，不能读取/修改已有模板）。
+# 打印模板填充因此不走这个库，见 print.rs 与文档 ADR-06 / R-25。
+rust_xlsxwriter = "0.102"

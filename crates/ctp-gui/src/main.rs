@@ -14,6 +14,8 @@ mod theme;
 mod widgets;
 
 use ctp_app::checks::CheckReport;
+use ctp_app::print::PaymentPrintData;
+use ctp_app::report::ReportKind;
 use ctp_core::attachment::Attachment;
 use ctp_core::contract::{Contract, ContractStatus};
 use ctp_core::ledger::{CategoryRow, ContractSummary, PeriodRow};
@@ -146,6 +148,9 @@ pub struct App {
     pub pay_form: PayForm,
     /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
     pub pay_detail: Option<Payment>,
+    /// 付款打印件的 9 个合并域解析结果（`Dialog::PrintPreview`）。
+    /// 本轮只做数据预览，不产出 docx 文件。
+    pub print_data: Option<PaymentPrintData>,
     /// 新建合同表单里的一次性提示（附件选择失败等）
     pub new_contract_flash: Option<String>,
     pub new_contract: ContractForm,
@@ -238,6 +243,7 @@ impl App {
             pay_contract: None,
             pay_form: PayForm::default(),
             pay_detail: None,
+            print_data: None,
             new_contract: ContractForm::default(),
             new_contract_flash: None,
             audit_form: AuditForm::default(),
@@ -285,7 +291,7 @@ impl App {
         app
     }
 
-    /// 启动时直接打开某个弹窗（`CTP_DIALOG=new_contract|audit_price|edit_amount|payment_detail`）。
+    /// 启动时直接打开某个弹窗（`CTP_DIALOG=new_contract|audit_price|edit_amount|payment_detail|print_preview|attachments`）。
     ///
     /// 供自动化截图与问题复现使用；正常启动不受影响。
     fn open_initial_dialog(&mut self) {
@@ -336,6 +342,12 @@ impl App {
                 if let Some(pm) = self.payments.first().cloned() {
                     self.pay_detail = Some(pm);
                     self.dialog = Dialog::PaymentDetail;
+                }
+            }
+            "print_preview" => {
+                if let Some(pm) = self.payments.first().cloned() {
+                    self.screen = Screen::Payments;
+                    self.open_print_preview(&pm);
                 }
             }
             _ => {}
@@ -438,6 +450,57 @@ impl App {
         if let Some(pm) = self.payments.iter().find(|x| x.id == id) {
             self.pay_detail = Some(pm.clone());
             self.dialog = Dialog::PaymentDetail;
+        }
+    }
+
+    /// 付款打印入口：选中一张拨款单 → 解析 9 个合并域 → 预览。
+    ///
+    /// 本轮按确认结论「暂时不需要输出」，不生成也不保存 docx；
+    /// 模板填充 adapter 接好后只需把预览窗口的按钮接到 `ctp_app::print::render`。
+    pub fn open_print_preview(&mut self, pm: &Payment) {
+        let data = self
+            .db
+            .as_ref()
+            .and_then(|c| ctp_app::service::payment_print_data(c, &pm.id).ok());
+        match data {
+            Some(d) => {
+                self.print_data = Some(d);
+                self.dialog = Dialog::PrintPreview;
+            }
+            None => self.error("解析付款打印数据失败"),
+        }
+    }
+
+    /// 报表导出：弹保存框 → 从视图构造 `ReportResult` → 写 .xlsx → 落 EXPORT 审计日志。
+    ///
+    /// 屏幕表格与导出读的是同一份 `ReportResult` 构造逻辑（文档 4.4.2）。
+    pub fn export_report(&mut self, kind: ReportKind) {
+        // 闭包把不可变借用限制在内部，结束后才能安全地写 toast。
+        let outcome: Result<(usize, std::path::PathBuf), String> = (|| {
+            let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
+            let file_name = ctp_app::service::report_of(conn, kind)
+                .map(|r| r.default_file_name())
+                .unwrap_or_else(|_| format!("{}.xlsx", kind.file_stem()));
+            let path = rfd::FileDialog::new()
+                .set_file_name(&file_name)
+                .add_filter("Excel 工作簿", &["xlsx"])
+                .save_file()
+                // 用户取消保存框：用空串标记，不弹错误提示
+                .ok_or_else(String::new)?;
+            let (rows, _) = ctp_app::service::export_report(conn, kind, &path, "界面用户")
+                .map_err(|e| e.to_string())?;
+            Ok((rows, path))
+        })();
+
+        match outcome {
+            Ok((rows, path)) => self.success(format!(
+                "已导出「{}」{} 行 → {}",
+                kind.title(),
+                rows,
+                path.display()
+            )),
+            Err(e) if e.is_empty() => {}
+            Err(e) => self.error(format!("导出失败：{e}")),
         }
     }
 

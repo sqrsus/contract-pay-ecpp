@@ -378,6 +378,102 @@ fn 业务表审计列齐全() {
     assert!(bad.is_empty(), "M4：{bad:?}");
 }
 
+/// 每轮导出用独立临时文件，避免并行测试互相覆盖。
+fn tmp_xlsx(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "ctp_{}_{}_{}.xlsx",
+        tag,
+        std::process::id(),
+        ctp_core::date::now_iso().replace([':', '-', 'T', 'Z'], "")
+    ))
+}
+
+#[test]
+fn 报表导出与屏幕共用结果且写审计日志() {
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 100_000).unwrap();
+
+    // 屏幕与导出读同一份 ReportResult 构造逻辑，金额口径取自 V3 / V4 视图
+    let cat = service::report_of(&conn, ctp_app::report::ReportKind::CategorySummary).unwrap();
+    assert!(!cat.is_empty());
+    let row = cat
+        .rows
+        .iter()
+        .find(|r| r[0].display() == "C02")
+        .expect("C02 分类应在 V3 里");
+    assert_eq!(row[3].yuan(), Some(1_000_000.0));
+
+    let path = tmp_xlsx("period");
+    let (rows, cols) = service::export_report(
+        &conn,
+        ctp_app::report::ReportKind::PeriodSummary,
+        &path,
+        "t",
+    )
+    .unwrap();
+    assert_eq!(rows, 1);
+    assert_eq!(cols, 4);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[0..2], b"PK", "xlsx 必须是 zip 容器");
+    let _ = std::fs::remove_file(&path);
+
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action = 'EXPORT' \
+             AND target_id = 'PERIOD_SUMMARY_V4'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "FR-SYS-07：每次导出应留一条 EXPORT 日志");
+}
+
+#[test]
+fn 付款打印九域解析与中文大写() {
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 100_000).unwrap();
+    let pm = pay(&mut conn, &cid, 250_000).unwrap();
+
+    let data = service::payment_print_data(&conn, &pm.id).unwrap();
+    assert_eq!(data.fields.len(), 9);
+    assert_eq!(data.get("项目名称"), Some("测试合同"), "取合同名称，非项目名称");
+    assert_eq!(data.get("中标单位"), Some("某施工单位"), "取承包单位，非发包人");
+    assert_eq!(data.get("合同改成元"), Some("1000000.00"));
+    assert_eq!(data.get("审计价改成元"), Some("0.00"), "未审定填 0");
+    assert_eq!(data.get("已付款改成元"), Some("100000.00"), "本次之前的累计已付");
+    assert_eq!(data.get("本次付款小写"), Some("250000.00"));
+    assert_eq!(data.get("本次付款数大写"), Some("贰拾伍万圆整"));
+    assert_eq!(data.get("本次付款后累计"), Some("350000.00"));
+    assert_eq!(
+        data.get("合同约定_付款条件（保持与书面合同一致）"),
+        Some("按月计量支付")
+    );
+}
+
+#[test]
+fn 打印输出本期明确未实现且接口中立() {
+    use ctp_app::print::{PaymentPrintData, PrintContext, PrintError, TemplateKind, PAYMENT_TEMPLATE};
+
+    assert!(ctp_app::print::adapters().is_empty(), "本轮不接入填充实现");
+    assert_eq!(PAYMENT_TEMPLATE.kind, TemplateKind::Word);
+    assert_eq!(PAYMENT_TEMPLATE.alt_kind, Some(TemplateKind::Excel));
+
+    let data = PaymentPrintData {
+        payment_no: "X".into(),
+        contract_no: "Y".into(),
+        fields: Vec::new(),
+        generated_at: ctp_core::date::now_iso(),
+    };
+    let ctx = PrintContext {
+        descriptor: &PAYMENT_TEMPLATE,
+        data: &data,
+        template_path: std::path::Path::new("templates/付款打印模板.docx"),
+        output_path: std::path::Path::new("out.docx"),
+    };
+    let err = ctp_app::print::render(&ctx).unwrap_err();
+    assert!(matches!(err, PrintError::NotImplemented(TemplateKind::Word)));
+}
+
 #[test]
 fn 合同编号按年度递增且唯一() {
     let (mut conn, _cid) = fixture(1000);

@@ -209,6 +209,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // ---------------- 登记表单 + 明细
     let mut submit = false;
     let mut void_target: Option<ctp_core::payment::Payment> = None;
+    let mut print_target: Option<ctp_core::payment::Payment> = None;
 
     ui.horizontal_top(|ui| {
         let form_w = if avail_w > 900.0 { 344.0 } else { avail_w };
@@ -346,7 +347,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             .column(Column::auto().at_least(100.0))
                             .column(Column::remainder().at_least(96.0))
                             .column(Column::auto().at_least(62.0))
-                            .column(Column::auto().at_least(48.0))
+                            .column(Column::auto().at_least(86.0))
                             .header(26.0, |mut h| {
                                 for t in ["拨款单号", "开单日期", "金额", "事由", "状态", "操作"] {
                                     h.col(|ui| {
@@ -402,21 +403,32 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             }
                                         });
                                         row.col(|ui| {
-                                            if pm.status == ctp_core::payment::PaymentStatus::Paid
-                                                && ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("作废")
-                                                                .size(11.5)
-                                                                .color(p.danger),
-                                                        )
-                                                        .frame(false),
-                                                    )
-                                                    .on_hover_text("作废后不计入已付净额，可重新登记")
+                                            ui.horizontal(|ui| {
+                                                if widgets::link(ui, &p, "打印", 11.5)
+                                                    .on_hover_text("预览付款打印模板的 9 个合并域取值")
                                                     .clicked()
-                                            {
-                                                void_target = Some((*pm).clone());
-                                            }
+                                                {
+                                                    print_target = Some((*pm).clone());
+                                                }
+                                                if pm.status
+                                                    == ctp_core::payment::PaymentStatus::Paid
+                                                    && ui
+                                                        .add(
+                                                            egui::Button::new(
+                                                                RichText::new("作废")
+                                                                    .size(11.5)
+                                                                    .color(p.danger),
+                                                            )
+                                                            .frame(false),
+                                                        )
+                                                        .on_hover_text(
+                                                            "作废后不计入已付净额，可重新登记",
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    void_target = Some((*pm).clone());
+                                                }
+                                            });
                                         });
                                     });
                                 }
@@ -456,6 +468,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some(pm) = void_target {
         app.confirm_reason.clear();
         app.confirm = Some(Confirm::VoidPayment(pm));
+    }
+    if let Some(pm) = print_target {
+        app.open_print_preview(&pm);
     }
     if let Some(id) = goto_contract {
         app.goto_contract(&id);

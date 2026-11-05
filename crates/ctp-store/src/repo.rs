@@ -515,6 +515,26 @@ pub fn paid_net(conn: &Connection, contract_id: &str) -> Result<Money> {
     Ok(money(v))
 }
 
+/// 某张拨款单「本次之前」的累计已付（付款打印件 `已付款改成元` 的唯一取数实现）。
+///
+/// 排序口径与 V2 `v_payment_ledger` 的窗口函数一致：`(pay_date, payment_no)` 严格小于
+/// 本单；只计已实付、未逻辑删除的单据，作废单不计入。
+pub fn paid_before_payment(
+    conn: &Connection,
+    contract_id: &str,
+    pay_date: &str,
+    payment_no: &str,
+) -> Result<Money> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(amount_cent), 0) FROM pay_payment \
+         WHERE contract_id = ?1 AND is_deleted = 0 AND status IN ({}) \
+           AND (pay_date < ?2 OR (pay_date = ?2 AND payment_no < ?3))",
+        schema::PAID_STATUS_SQL
+    );
+    let v: i64 = conn.query_row(&sql, rusqlite::params![contract_id, pay_date, payment_no], |r| r.get(0))?;
+    Ok(money(v))
+}
+
 pub fn paid_payment_count(conn: &Connection, contract_id: &str) -> Result<i64> {
     let sql = format!(
         "SELECT COUNT(*) FROM pay_payment WHERE contract_id = ?1 AND is_deleted = 0 AND status IN ({})",

@@ -101,6 +101,21 @@ impl Money {
             .map_err(|_| DomainError::MoneyOverflow)
     }
 
+    /// 打印 / 导出用：固定两位小数的「元」字符串，无千分位，如 `1250000.00`。
+    ///
+    /// 模板里的合并域带 `\# "0.00"` 数字开关，填充成纯文本时须保持同样的形态；
+    /// 与 `format_yuan()` 的千分位展示口径不同，不要混用。
+    pub fn fixed_yuan(self) -> String {
+        let a = self.0.unsigned_abs();
+        let sign = if self.0 < 0 { "-" } else { "" };
+        format!("{sign}{}.{:02}", a / 100, a % 100)
+    }
+
+    /// 财务票据的中文大写（零壹贰…圆角分整），见 `amount_cn`。
+    pub fn rmb_uppercase(self) -> String {
+        crate::amount_cn::rmb_uppercase(self.0)
+    }
+
     /// 展示用：整数不带小数位（1,280,000），有角分时保留两位（12,345.67）。
     /// 负数按财务惯例用括号包裹：`(1,234.56)`。
     pub fn format_yuan(self) -> String {
@@ -180,6 +195,17 @@ mod tests {
         assert_eq!(Money::from_cent(128_000_000).format_yuan(), "1,280,000");
         assert_eq!(Money::from_cent(1_234_567).format_yuan(), "12,345.67");
         assert_eq!(Money::from_cent(-123_456).format_yuan(), "(1,234.56)");
+    }
+
+    #[test]
+    fn 打印用固定两位与中文大写() {
+        assert_eq!(Money::from_cent(1_250_000_00).fixed_yuan(), "1250000.00");
+        assert_eq!(Money::from_cent(5).fixed_yuan(), "0.05");
+        assert_eq!(Money::ZERO.fixed_yuan(), "0.00");
+        assert_eq!(
+            Money::from_cent(1_250_000_00).rmb_uppercase(),
+            "壹佰贰拾伍万圆整"
+        );
     }
 
     #[test]

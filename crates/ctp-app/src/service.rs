@@ -724,3 +724,46 @@ pub fn set_tolerance(conn: &mut Connection, bp: Rate, operator: &str) -> Result<
     db::set_meta(conn, "tol_bp", &bp.bp().to_string(), operator)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------- 报表导出
+
+/// 从视图行构造报表结果（屏幕表格与导出共用这一份）。
+pub fn report_of(conn: &Connection, kind: crate::report::ReportKind) -> Result<crate::report::ReportResult> {
+    use crate::report::{ReportKind, ReportResult};
+    Ok(match kind {
+        ReportKind::CategorySummary => ReportResult::category(&repo::category_summary(conn)?),
+        ReportKind::PeriodSummary => ReportResult::period(&repo::period_summary(conn)?),
+    })
+}
+
+/// 导出一张报表到 .xlsx，并写一条 `EXPORT` 审计日志（FR-SYS-07）。
+///
+/// 只用 `&Connection`：导出不改业务数据，审计日志是普通 INSERT，不需要 `BEGIN IMMEDIATE`。
+pub fn export_report(
+    conn: &Connection,
+    kind: crate::report::ReportKind,
+    path: &std::path::Path,
+    operator: &str,
+) -> Result<(usize, usize)> {
+    let result = report_of(conn, kind)?;
+    let (rows, cols) = crate::xlsx::write_report(&result, path, operator)?;
+    let detail = serde_json::json!({
+        "report": kind.code(),
+        "file": path.to_string_lossy(),
+        "rows": rows,
+        "columns": cols,
+    })
+    .to_string();
+    db::insert_audit_log(conn, "report", kind.code(), "EXPORT", Some(&detail), operator)?;
+    Ok((rows, cols))
+}
+
+// ---------------------------------------------------------------- 付款打印数据
+
+/// 选中一张拨款单 → 解析 9 个合并域的取值（本轮只供界面预览，不产出 docx）。
+pub fn payment_print_data(
+    conn: &Connection,
+    payment_id: &str,
+) -> std::result::Result<crate::print::PaymentPrintData, crate::print::PrintError> {
+    crate::print::resolve(conn, payment_id)
+}

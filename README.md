@@ -15,7 +15,8 @@ D:\pay2
 ├─ Cargo.toml                 工作区
 ├─ crates/
 │  ├─ ctp-core/               领域层（无外部依赖，口径都在这里）
-│  │  ├─ money.rs             金额（分，i64）+ 宽容解析 + 财务括号显示
+│  │  ├─ money.rs             金额（分，i64）+ 宽容解析 + 财务括号显示 + 打印用固定两位
+│  │  ├─ amount_cn.rs         人民币金额转中文大写（零壹贰…圆角分整）
 │  │  ├─ rate.rs              比率（万分比）+ Rate::ratio（H1 的唯一实现）
 │  │  ├─ contract.rs          合同实体、状态机、有效计价基准、业务字段清单（M1）
 │  │  ├─ payment.rs           拨款单实体、PAID/VOID 两态（H5）
@@ -32,17 +33,28 @@ D:\pay2
 │  │  ├─ repo.rs              仓储与视图映射；附件读写；DB-06 结构自检
 │  │  └─ seed.rs              基础字典
 │  ├─ ctp-app/                应用服务（事务、留痕、额度校验）
-│  │  ├─ service.rs           合同登记/生效/作废、金额编辑、审计价、拨款、附件、档案自动建档
+│  │  ├─ service.rs           合同登记/生效/作废、金额编辑、审计价、拨款、附件、档案自动建档、报表导出
+│  │  ├─ report.rs            ReportResult：屏幕表格 / Excel 导出 / 后期打印共用的唯一数据源
+│  │  ├─ xlsx.rs              rust_xlsxwriter 写出（表头 / 冻结 / 合计公式 / #,##0.00）
+│  │  ├─ print.rs             付款打印模板描述符 + 9 域字段映射 + PrintAdapter 预留（本轮不产出 docx）
 │  │  ├─ checks.rs            六项口径自检（界面「运行自检」的唯一实现）
 │  │  ├─ history.rs           金额与审计价变更历史（JSON，保留 50 条）
-│  │  └─ tests/consistency.rs 15 项集成断言（评审条目逐条对应）
-│  └─ ctp-gui/                egui 桌面界面：六个页面 + 四类弹窗，浅色 / 深色双主题
+│  │  └─ tests/consistency.rs 18 项集成断言（评审条目逐条对应）
+│  └─ ctp-gui/                egui 桌面界面：六个页面 + 六类弹窗，浅色 / 深色双主题
 ├─ scripts/                   WSL 构建 / 端到端演练 / 界面截图核验
 └─ docs/口径主表.md           金额与比率的单一事实来源
 ```
 
-技术栈：Rust 1.99（edition 2021）+ rusqlite 0.32（bundled，自带 SQLite，无系统依赖）。
-无 WebView、无前端框架、无 Node —— 与文档 ADR-06 的技术前提一致。
+技术栈：Rust 1.99（edition 2021）+ rusqlite 0.32（bundled，自带 SQLite，无系统依赖）
++ rust_xlsxwriter 0.102（报表导出）。无 WebView、无前端框架、无 Node
+—— 与文档 ADR-06 的技术前提一致。
+
+> **注意**：`rust_xlsxwriter` 是 **write-only**，只能新建 .xlsx，**不能读取或修改已有的 Excel
+> 模板**。因此「读取 Excel 模板 → 填充占位符」不可行；打印模板填充走另一条链路
+> （Word 邮件合并域），见下文「付款打印模板」与文档 R-25。
+
+**交付形态只有 GUI**：工作区唯一的 bin 是 `ctp-gui`，命令行版本已按要求清理，
+不提供也不计划补 CLI。
 
 ---
 
@@ -58,7 +70,7 @@ export CARGO_TARGET_DIR="$HOME/target-ctp"
 cd /mnt/d/pay2
 
 cargo build --workspace          # 编译（首次会编译 bundled SQLite，约 1 分钟）
-cargo test  --workspace          # 53 项测试
+cargo test  --workspace          # 69 项测试
 ```
 
 或直接跑现成脚本：
@@ -99,6 +111,51 @@ P0 全在本期、外键无悬空、已付口径与「仅 PAID 合计」一致�
 - 保存后的附件在合同详情卡的「附件 n/4」里管理：打开（落地临时文件后调系统默认程序）、
   另存、替换、删除。
 
+### 报表导出（`rust_xlsxwriter`）
+
+「分类汇总」（V3）与「期间统计」（V4）两页标题右侧各有「导出 Excel」按钮：
+弹出保存框 → 生成单页 .xlsx → 写一条 `EXPORT` 审计日志。
+
+- **屏幕表格、柱状图、导出共用同一份 `ReportResult`**（`ctp-app/src/report.rs`），
+  列配置驱动，不再各自查库、各自算合计；
+- 版式：标题行 + 口径说明行 + 表头行（冻结前三行）+ 数据行 + 合计行；
+  金额列写**数值**并套 `#,##0.00`（单位「元」，库内存分），合计用 `SUM` 公式，
+  便于在 Excel 里二次筛选计算；页脚注明导出人 / 导出时间 / 系统版本；
+- 文件名默认 `{报表名}_{yyyyMMdd_HHmm}.xlsx`。
+
+### 付款打印模板（本期只预留接口，不产出打印件）
+
+实物模板为 `付款打印模板.docx`（Word 邮件合并域 MERGEFIELD，9 个唯一域名 / 11 处，
+两张表同在一个文档）。本轮按确认结论**只固化字段映射与数据解析，不生成 docx 文件**：
+
+- 入口：**拨款管理页选中一条付款单 → 「打印」**（拨款明细行内，或拨款单详情弹窗里），
+  打开「付款打印数据预览」窗口，逐项列出 9 个域的取值与来源；
+- 字段映射（已确认口径）：
+
+  | 合并域 | 取值来源 |
+  |---|---|
+  | `项目名称` | **合同名称**（不是项目名称） |
+  | `中标单位` | **承包单位** |
+  | `合同改成元` | 合同价（元、两位小数） |
+  | `审计价改成元` | 审计价；**未审定填 0**（输出 `0.00`） |
+  | `已付款改成元` | **本次之前**的累计已付 |
+  | `本次付款小写` | 本次金额 |
+  | `本次付款数大写` | 本次金额 → 中文大写（本期新增能力） |
+  | `本次付款后累计` | 已付 + 本次 |
+  | `合同约定_付款条件（保持与书面合同一致）` | 付款条款 |
+
+- **留空**：会计分类名、附件张数、当前日期三处无合并域，保持空白供手工填写 / 签字；
+  其他字段缺失时也一律留空，不写「—」、不拒绝生成；
+- 预留接口：`ctp-app/src/print.rs` 的 `PrintTemplate` 描述符（`FillStrategy`、
+  `MissingPolicy`、`OutputScope` 均已固化）+ `PrintAdapter` trait + `PrintContext`
+  + 注册表，本轮 `adapters()` 为空实现。后期接 Word 填充只需加一个 adapter，
+  业务层与界面不用改；Excel 版模板留作第二个 adapter；
+- **实现注意**：模板里 4 个域的 `«…»` 被 Word 拆成 3 个 run，后期填充必须按
+  `w:fldChar begin/separate/end` 域边界整体替换为纯文本，纯字符串替换会漏；
+- 选型结论：就「填充现成模板」而言 **Word 更容易**（docx 是 zip，只需 `zip` 一个轻量
+  依赖、版式 100% 保真）；Excel 真模板必须另引可读写库（`umya-spreadsheet` 等），
+  而 `rust_xlsxwriter` 做不到。两条路线与取舍详见开发文档 R-25。
+
 窗口可自由缩放，最小 1000×640；宽度小于 1100px 时左侧导航折叠为缩写并带悬停提示。
 右上角可切换浅色 / 深色。
 
@@ -114,8 +171,9 @@ P0 全在本期、外键无悬空、已付口径与「仅 PAID 合计」一致�
 $env:CTP_SELFTEST=1; .\ctp-gui.exe        # 跑 40 帧后退出，写 data/smoke.txt（页名 / 合同数 / 拨款数）
 $env:CTP_SHOT="out.ppm"; .\ctp-gui.exe    # 等界面稳定后由渲染器保存一帧，退出码 0
 $env:CTP_SCREEN="payments"; $env:CTP_THEME="dark"   # 指定启动页与主题
-$env:CTP_DIALOG="new_contract"             # 启动即打开弹窗；另有 attachments / payment_detail / audit_price / edit_amount / void_payment
+$env:CTP_DIALOG="new_contract"             # 启动即打开弹窗；另有 attachments / payment_detail / print_preview / audit_price / edit_amount / void_payment
 $env:CTP_DIALOG="new_contract"; $env:CTP_STEP="1"   # 直达新建合同的第二步（附件）
+$env:CTP_DIALOG="print_preview"            # 启动即预览第一张拨款单的 9 个合并域取值
 ```
 
 `scripts/gui_probe.py` 在此之上提供截图与点击回放。打印窗口（PrintWindow）对
@@ -165,10 +223,21 @@ GPU 呈现的窗口常返回空白，可加 `grab=screen` 改走屏幕直抓。
 3. **合同状态保留 8 个枚举值**以便库内往返，但只有 5 个可流转（`ContractStatus::PHASE_STATUSES`）。
 4. **合同编号**沿用「当前实现」口径 `HT-{年}-{三位流水}`，目标态四位流水属二期（4.2.4 已注明需迁移）。
 
+### R-25 三条决策（2026-11-05，正文需求描述未改）
+
+1. **只保留 GUI**：工作区唯一 bin 为 `ctp-gui`，不做、也不再补命令行版本；
+2. **去掉「允许未分类暂存于草稿」**：`ct_contract_item.category_id` 保持 `NOT NULL`，
+   不重建表、不加迁移；`ct_contract.category_id` 也保持现状（新建合同不录入会计分类，
+   写空值），不改表结构；
+3. **去掉清单明细**：`ct_contract_item` 不做录入界面 / 命令 / 批量导入 / BR-05 闭合校验。
+   **空表与 V3 视图里「按清单行分摊」的分支都保留**（删它们要重建视图、动迁移，收益为零），
+   标注为「分支保留但本期无录入入口，恒不命中；未审定合同走 R-20 主导分类整笔归集」。
+
 ---
 
 ## 五、下一步建议（按投入产出）
 
-1. 补 `ct_contract_item` 的录入界面/命令，让「未审定合同按清单行分摊」这条路径有真实数据；
-2. 报表层接入 `rust_xlsxwriter`，用视图列配置直接导出（E-07 延期中，但只需读视图）；
+1. 接入 Word 打印模板填充 adapter（`zip` 依赖 + 按 `fldChar` 域边界替换 MERGEFIELD），
+   把「付款打印数据预览」的按钮接到 `ctp_app::print::render`；Excel 版模板作为第二个 adapter；
+2. 合同台账 / 拨款一览两页也接 `ReportResult`，让全部报表统一走列配置驱动；
 3. 二期恢复申请与审批时，只需加 4 张预留表并把 `inflight` 从 0 改为两类占用，`PaymentQuota` 无需改动。

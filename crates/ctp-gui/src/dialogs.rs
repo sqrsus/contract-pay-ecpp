@@ -24,6 +24,8 @@ pub enum Dialog {
     AuditPrice,
     EditAmount,
     PaymentDetail,
+    /// 付款打印数据预览（本轮只预览 9 个合并域，不产出 docx）
+    PrintPreview,
     /// 合同附件管理（从合同详情卡的「附件 n/4」进来）
     Attachments,
 }
@@ -247,6 +249,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::AuditPrice => audit_price(app, ctx),
         Dialog::EditAmount => edit_amount(app, ctx),
         Dialog::PaymentDetail => payment_detail(app, ctx),
+        Dialog::PrintPreview => print_preview(app, ctx),
         Dialog::Attachments => attachments(app, ctx),
     }
     if app.confirm.is_some() {
@@ -1092,6 +1095,7 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
         .unwrap_or_else(|| pm.created_at.clone());
     let mut close = false;
     let mut goto = false;
+    let mut print = false;
 
     modal(format!("拨款单 {}", pm.payment_no), &p)
         .default_width(560.0)
@@ -1173,6 +1177,9 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
                 if widgets::primary_button(ui, &p, "关闭", true).clicked() {
                     close = true;
                 }
+                if widgets::ghost_button(ui, &p, "打印").clicked() {
+                    print = true;
+                }
                 if contract.is_some() && widgets::ghost_button(ui, &p, "查看所属合同").clicked() {
                     goto = true;
                 }
@@ -1186,6 +1193,130 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
         app.dialog = Dialog::None;
         app.pay_detail = None;
         app.goto_contract(&pm.contract_id);
+    } else if print {
+        app.open_print_preview(&pm);
+    }
+}
+
+// ---------------------------------------------------------------- 付款打印预览
+
+/// 付款打印件的数据预览。
+///
+/// 按已确认口径：9 个 MERGEFIELD 全部解析成纯文本值，缺值留空；会计分类名 /
+/// 附件张数 / 当前日期三处保持空白；两张表同在一个 docx 一起输出。
+/// **本轮不生成、不保存任何 docx**——模板填充 adapter 尚未接入。
+fn print_preview(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+    let Some(data) = app.print_data.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let mut close = false;
+    let tpl = &ctp_app::print::PAYMENT_TEMPLATE;
+
+    modal(format!("付款打印数据预览 · {}", data.payment_no), &p)
+        .default_width(760.0)
+        .show(ctx, |ui| {
+            ui.set_width(720.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} ｜ {} ｜ 两张表同份输出",
+                    tpl.name,
+                    tpl.kind.label()
+                ))
+                .size(14.0)
+                .strong()
+                .color(p.text),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "合同 {} · {} 个唯一合并域（模板内 11 处）· 解析时间 {}",
+                    if data.contract_no.is_empty() {
+                        "—"
+                    } else {
+                        &data.contract_no
+                    },
+                    data.fields.len(),
+                    data.generated_at
+                ))
+                .size(11.5)
+                .color(p.text_muted),
+            );
+            ui.add_space(8.0);
+            widgets::divider(ui, &p);
+
+            egui::Grid::new("print_field_grid")
+                .num_columns(3)
+                .spacing(egui::vec2(14.0, 8.0))
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["合并域（MERGEFIELD）", "取值", "数据来源"] {
+                        ui.label(RichText::new(h).size(12.0).strong().color(p.text_muted));
+                    }
+                    ui.end_row();
+                    for f in &data.fields {
+                        ui.label(RichText::new(f.merge_field).size(12.0).color(p.text_muted));
+                        let shown = if f.value.is_empty() {
+                            "（留空）"
+                        } else {
+                            f.value.as_str()
+                        };
+                        ui.add_sized(
+                            [300.0, 20.0],
+                            egui::Label::new(
+                                RichText::new(shown)
+                                    .size(12.5)
+                                    .color(if f.value.is_empty() { p.text_muted } else { p.text }),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(if f.value.is_empty() {
+                            format!("{}：{}", f.merge_field, f.note)
+                        } else {
+                            f.value.clone()
+                        });
+                        ui.label(RichText::new(f.source).size(11.5).color(p.text_muted));
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(8.0);
+            widgets::divider(ui, &p);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("保持空白（手工填写 / 签字）：")
+                        .size(11.5)
+                        .strong()
+                        .color(p.text_muted),
+                );
+                for f in tpl.manual_blank_fields {
+                    widgets::badge(ui, &p, f, Tone::Neutral);
+                }
+            });
+            ui.add_space(6.0);
+            widgets::soft_box(&p, p.warn_soft).show(ui, |ui| {
+                ui.set_width(700.0);
+                ui.label(
+                    RichText::new(
+                        "本轮按确认结论只固化字段映射与数据解析，不输出 docx 文件。\
+                         后期接入 Word 填充 adapter 时，须按 w:fldChar 域边界整体替换 MERGEFIELD \
+                         （模板里 4 个域被 Word 拆成 3 个 run，纯字符串替换会漏），\
+                         业务层与界面无需改动。",
+                    )
+                    .size(11.5)
+                    .color(p.warn),
+                );
+            });
+            ui.add_space(10.0);
+            if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                close = true;
+            }
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+        app.print_data = None;
     }
 }
 
