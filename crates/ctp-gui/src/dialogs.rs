@@ -27,7 +27,7 @@ pub enum Dialog {
     DeliveryDate,
     EditAmount,
     PaymentDetail,
-    /// 付款打印数据预览（本轮只预览 9 个合并域，不产出 docx）
+    /// 付款打印预览：按真实版面渲染的整页位图，确认后直接送打印
     PrintPreview,
     /// 合同附件管理（从合同详情卡的「附件 n/4」进来）
     Attachments,
@@ -1263,156 +1263,160 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
 
 // ---------------------------------------------------------------- 付款打印
 
-/// 付款打印弹窗：核对 9 个域的取值，然后「打开并打印 / 导出 Word / 导出 PDF」。
+/// 付款打印预览：显示按真实版面渲染出来的整页图，确认后直接弹系统打印对话框。
 ///
-/// 按已确认口径：9 个 MERGEFIELD 全部替换成纯文本值，缺值留空；会计分类名 /
-/// 附件张数 / 当前日期三处保持空白；两张表同在一个 docx 一起输出；批量时一份一页。
+/// 与出纸共用同一份版面代码（`ctp_app::paper`），所以预览就是成品。
+/// A4 横向、每张单据两页；批量时按列表顺序连续排页。
 fn print_preview(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
-    let Some(data) = app.print_data.clone() else {
+    if app.print_vouchers.is_empty() {
         app.dialog = Dialog::None;
         return;
-    };
-    let batch = app.print_ids.len();
+    }
+    let sheets = app.print_vouchers.len();
+    let total_pages = sheets * ctp_app::paper::PAGES_PER_VOUCHER;
+    let page = app.print_page.min(total_pages.saturating_sub(1));
+    let first_no = app.print_vouchers[0].payment_no.clone();
     let mut close = false;
     let mut do_print = false;
-    let mut do_docx = false;
-    let mut do_pdf = false;
-    let tpl = &ctp_app::print::PAYMENT_TEMPLATE;
-    let title = if batch > 1 {
-        format!("批量打印拨款单 · 共 {batch} 张")
+
+    // ---- 当前页位图（带缓存，只在换页/首次时渲染）
+    if app.print_tex.as_ref().map(|(_, i)| *i) != Some(page) {
+        let rendered = {
+            let v = &app.print_vouchers[page / ctp_app::paper::PAGES_PER_VOUCHER];
+            let sub = page % ctp_app::paper::PAGES_PER_VOUCHER;
+            ctp_app::render_print_page(v, sub, 150.0)
+        };
+        match rendered {
+            Ok(pv) => {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [pv.width as usize, pv.height as usize],
+                    &pv.rgba,
+                );
+                let tex = ctx.load_texture(
+                    format!("print-page-{page}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                app.print_tex = Some((tex, page));
+            }
+            Err(e) => {
+                app.print_tex = None;
+                app.error(format!("渲染预览失败：{e}"));
+                app.dialog = Dialog::None;
+                return;
+            }
+        }
+    }
+
+    let title = if sheets > 1 {
+        format!("批量打印拨款单 · 共 {sheets} 张")
     } else {
-        format!("打印拨款单 · {}", data.payment_no)
+        format!("打印拨款单 · {first_no}")
     };
 
-    modal(&title, &p)
-        .default_width(760.0)
-        .show(ctx, |ui| {
-            ui.set_width(720.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} ｜ {}",
-                        tpl.name,
-                        tpl.kind.label()
-                    ))
+    modal(&title, &p).default_width(824.0).show(ctx, |ui| {
+        ui.set_width(784.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("A4 横向 · 每张两页 · 直接送打印机")
                     .size(14.0)
                     .strong()
                     .color(p.text),
-                );
-                if batch > 1 {
-                    widgets::badge(ui, &p, &format!("{batch} 张合并"), Tone::Primary);
-                }
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "合同 {} · {} 个唯一合并域（模板内 11 处）· 解析时间 {}",
-                    if data.contract_no.is_empty() {
-                        "—"
-                    } else {
-                        &data.contract_no
-                    },
-                    data.fields.len(),
-                    data.generated_at
-                ))
-                .size(11.5)
-                .color(p.text_muted),
             );
-            ui.add_space(8.0);
-            widgets::divider(ui, &p);
-
-            egui::Grid::new("print_field_grid")
-                .num_columns(3)
-                .spacing(egui::vec2(14.0, 8.0))
-                .striped(true)
-                .show(ui, |ui| {
-                    for h in ["合并域（MERGEFIELD）", "取值", "数据来源"] {
-                        ui.label(RichText::new(h).size(12.0).strong().color(p.text_muted));
-                    }
-                    ui.end_row();
-                    for f in &data.fields {
-                        ui.label(RichText::new(f.merge_field).size(12.0).color(p.text_muted));
-                        let shown = if f.value.is_empty() {
-                            "（留空）"
-                        } else {
-                            f.value.as_str()
-                        };
-                        ui.add_sized(
-                            [300.0, 20.0],
-                            egui::Label::new(
-                                RichText::new(shown)
-                                    .size(12.5)
-                                    .color(if f.value.is_empty() { p.text_muted } else { p.text }),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(if f.value.is_empty() {
-                            format!("{}：{}", f.merge_field, f.note)
-                        } else {
-                            f.value.clone()
-                        });
-                        ui.label(RichText::new(f.source).size(11.5).color(p.text_muted));
-                        ui.end_row();
-                    }
-                });
-
-            ui.add_space(8.0);
-            widgets::divider(ui, &p);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("保持空白（手工填写 / 签字）：")
-                        .size(11.5)
-                        .strong()
-                        .color(p.text_muted),
-                );
-                for f in tpl.manual_blank_fields {
-                    widgets::badge(ui, &p, f, Tone::Neutral);
+            if sheets > 1 {
+                widgets::badge(ui, &p, &format!("{sheets} 张 / {total_pages} 页"), Tone::Primary);
+            }
+        });
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(format!(
+                "第 1 页《财务支出审核监督表》· 第 2 页《工程项目进度款支付申请表》{}",
+                if sheets > 1 {
+                    "· 多张单据按列表顺序连续排列"
+                } else {
+                    ""
                 }
-            });
-            ui.add_space(6.0);
-            widgets::soft_box(&p, p.primary_soft).show(ui, |ui| {
-                ui.set_width(700.0);
-                ui.label(
-                    RichText::new(
-                        "「打开并打印」把成品交给本机 Word 打开，在 Word 里按 Ctrl+P 选择打印机出纸；\
-                         生成的文档已把 9 个合并域整体替换为纯文本，Word 不会再把占位符更新出来。\
-                         作废单不允许打印；批量按勾选顺序一份一页。",
-                    )
-                    .size(11.5)
-                    .color(p.primary),
-                );
-            });
+            ))
+            .size(11.5)
+            .color(p.text_muted),
+        );
+
+        // ---- 翻页条
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let can_prev = page > 0;
+            if widgets::ghost_button_sm_on(ui, &p, "上一页", can_prev).clicked() && can_prev {
+                app.print_page = page - 1;
+            }
+            let can_next = page + 1 < total_pages;
+            if widgets::ghost_button_sm_on(ui, &p, "下一页", can_next).clicked() && can_next {
+                app.print_page = page + 1;
+            }
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::primary_button(ui, &p, "打开并打印", true).clicked() {
-                    do_print = true;
-                }
-                if widgets::ghost_button(ui, &p, "导出 Word").clicked() {
-                    do_docx = true;
-                }
-                if widgets::ghost_button(ui, &p, "导出 PDF").clicked() {
-                    do_pdf = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::ghost_button(ui, &p, "关闭").clicked() {
-                        close = true;
-                    }
-                });
-            });
+            let sheet_no = page / ctp_app::paper::PAGES_PER_VOUCHER + 1;
+            let sub = page % ctp_app::paper::PAGES_PER_VOUCHER + 1;
+            let mut txt = format!("第 {} / {} 页", page + 1, total_pages);
+            if sheets > 1 {
+                txt.push_str(&format!("（第 {sheet_no} 张 · 其第 {sub} 页）"));
+            }
+            ui.label(RichText::new(txt).size(12.0).color(p.text_muted));
         });
 
+        // ---- 纸张预览
+        ui.add_space(6.0);
+        egui::Frame::none()
+            .fill(p.surface_alt)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                // A4 横向比例 297:210，宽度取 760 时高度约 537
+                ui.add_space(1.0);
+                if let Some((tex, _)) = &app.print_tex {
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(760.0, 537.4)));
+                } else {
+                    widgets::empty_state(ui, &p, "预览渲染失败");
+                }
+            });
+
+        ui.add_space(8.0);
+        widgets::soft_box(&p, p.primary_soft).show(ui, |ui| {
+            ui.set_width(764.0);
+            ui.label(
+                RichText::new(
+                    "「打印」直接弹系统打印对话框，由 Windows 驱动出纸，不需要 Word、Edge 或任何外部软件。\
+                     纸型须为 A4 横向；若对话框首选项里是纵向，程序会拦下并提示改纸型。\
+                     作废单不允许打印；会计分类名、附件张数、日期三处按口径留空待手填。",
+                )
+                .size(11.5)
+                .color(p.primary),
+            );
+        });
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if widgets::primary_button(ui, &p, "打印", true)
+                .on_hover_text("弹系统打印对话框并输出")
+                .clicked()
+            {
+                do_print = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::ghost_button(ui, &p, "关闭").clicked() {
+                    close = true;
+                }
+            });
+        });
+    });
+
     if do_print {
-        app.print_open_word();
-    } else if do_docx {
-        app.export_print_docx();
-    } else if do_pdf {
-        app.export_print_pdf();
+        app.print_now();
     }
     if close {
         app.dialog = Dialog::None;
-        app.print_data = None;
+        app.print_vouchers.clear();
         app.print_ids.clear();
+        app.print_tex = None;
+        app.print_page = 0;
     }
 }
 

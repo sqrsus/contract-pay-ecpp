@@ -528,7 +528,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 {
                                                     if widgets::link(ui, &p, "打印拨款单", 11.0)
                                                         .on_hover_text(
-                                                            "核对 9 个合并域后交给 Word 打印，可导出 Word / PDF",
+                                                            "预览两页版面后直接送打印机（不经过 Word）",
                                                         )
                                                         .clicked()
                                                     {

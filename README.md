@@ -36,22 +36,24 @@ D:\pay2
 │  │  ├─ service.rs           合同登记/生效/作废、金额编辑、审计价、拨款、附件、档案自动建档、报表导出
 │  │  ├─ report.rs            ReportResult：屏幕表格 / Excel 导出 / 后期打印共用的唯一数据源
 │  │  ├─ xlsx.rs              rust_xlsxwriter 写出（表头 / 冻结 / 合计公式 / #,##0.00）
-│  │  ├─ print.rs             付款打印模板描述符 + 9 域字段映射 + PrintAdapter 预留（本轮不产出 docx）
+│  │  ├─ print.rs             9 域描述符与取值解析 → 折成版面字段（Voucher）
+│  │  ├─ paper.rs             设备无关版面层：两页横向 A4 的坐标与绘制（出纸与预览共用）
+│  │  ├─ gdi.rs               打印后端（仅 Windows）：PrintDlgW + StartDocW 出纸 / 内存 DIB 预览
 │  │  ├─ checks.rs            六项口径自检（界面「运行自检」的唯一实现）
 │  │  ├─ history.rs           金额与审计价变更历史（JSON，保留 50 条）
-│  │  └─ tests/consistency.rs 18 项集成断言（评审条目逐条对应）
+│  │  └─ tests/consistency.rs 21 项集成断言（评审条目逐条对应）
 │  └─ ctp-gui/                egui 桌面界面：六个页面 + 六类弹窗，浅色 / 深色双主题
 ├─ scripts/                   WSL 构建 / 端到端演练 / 界面截图核验
 └─ docs/口径主表.md           金额与比率的单一事实来源
 ```
 
 技术栈：Rust 1.99（edition 2021）+ rusqlite 0.32（bundled，自带 SQLite，无系统依赖）
-+ rust_xlsxwriter 0.102（报表导出）。无 WebView、无前端框架、无 Node
-—— 与文档 ADR-06 的技术前提一致。
++ rust_xlsxwriter 0.102（报表导出）+ windows-sys 0.59 / raw-window-handle 0.6（打印，仅 Windows）。
+无 WebView、无前端框架、无 Node，打印也不依赖任何办公软件 —— 与文档 ADR-06 的技术前提一致。
 
 > **注意**：`rust_xlsxwriter` 是 **write-only**，只能新建 .xlsx，**不能读取或修改已有的 Excel
-> 模板**。因此「读取 Excel 模板 → 填充占位符」不可行；打印模板填充走另一条链路
-> （Word 邮件合并域），见下文「付款打印模板」与文档 R-25。
+> 模板**。因此「读取 Excel 模板 → 填充占位符」不可行。打印件则完全不走模板文件：
+> 版面写在 `paper.rs` 里、用 GDI 直接画到打印机，见下文「付款打印」与文档 R-28。
 
 **交付形态只有 GUI**：工作区唯一的 bin 是 `ctp-gui`，命令行版本已按要求清理，
 不提供也不计划补 CLI。
@@ -70,7 +72,7 @@ export CARGO_TARGET_DIR="$HOME/target-ctp"
 cd /mnt/d/pay2
 
 cargo build --workspace          # 编译（首次会编译 bundled SQLite，约 1 分钟）
-cargo test  --workspace          # 69 项测试
+cargo test  --workspace          # 96 项测试
 ```
 
 或直接跑现成脚本：
@@ -123,38 +125,47 @@ P0 全在本期、外键无悬空、已付口径与「仅 PAID 合计」一致�
   便于在 Excel 里二次筛选计算；页脚注明导出人 / 导出时间 / 系统版本；
 - 文件名默认 `{报表名}_{yyyyMMdd_HHmm}.xlsx`。
 
-### 付款打印模板（本期只预留接口，不产出打印件）
+### 付款打印（不依赖任何外部软件）
 
-实物模板为 `付款打印模板.docx`（Word 邮件合并域 MERGEFIELD，9 个唯一域名 / 11 处，
-两张表同在一个文档）。本轮按确认结论**只固化字段映射与数据解析，不生成 docx 文件**：
+打印由程序自己排版、自己画到打印机：**不经过 Word / Edge / PDF 阅读器**，也不需要本机装任何办公软件。
 
-- 入口：**拨款管理页选中一条付款单 → 「打印」**（拨款明细行内，或拨款单详情弹窗里），
-  打开「付款打印数据预览」窗口，逐项列出 9 个域的取值与来源；
-- 字段映射（已确认口径）：
+- 入口三处，共用一套逻辑：总览「最近拨款」行内文字链、合同台账展开明细行内、拨款管理明细行内；
+- 点开后是**核对窗**：左侧真实位图预览（可翻页），右侧 9 个域的取值与来源；
+  点「打印」直接弹 Windows 系统打印对话框出纸；
+- 版面：两页横向 A4 —— 第 1 页「财务支出审核监督表」、第 2 页「工程项目进度款支付申请表」，
+  坐标从实物模板 PDF 逐线量取（`paper.rs` 的 `S1_ROWS` / `S2_COLS` 等常量）；
+- 批量：仅拨款单，明细里勾选若干条 → 「批量打印所选」，合并成一份、**每张两页**；
+- 作废单不允许打印（入口不出现 + 生成前校验双保险），也不可勾选；
+- **纸型必须 A4 横向**：A4 纵向会裁掉右半边，程序取到打印机后立刻拦下并提示改纸型，不静默打半张；
+- 字段映射（口径与模板一致）：
 
-  | 合并域 | 取值来源 |
-  |---|---|
-  | `项目名称` | **合同名称**（不是项目名称） |
-  | `中标单位` | **承包单位** |
-  | `合同改成元` | 合同价（元、两位小数） |
-  | `审计价改成元` | 审计价；**未审定填 0**（输出 `0.00`） |
-  | `已付款改成元` | **本次之前**的累计已付 |
-  | `本次付款小写` | 本次金额 |
-  | `本次付款数大写` | 本次金额 → 中文大写（本期新增能力） |
-  | `本次付款后累计` | 已付 + 本次 |
-  | `合同约定_付款条件（保持与书面合同一致）` | 付款条款 |
+  | 域 | 取值来源 | 落在版面哪里 |
+  |---|---|---|
+  | 项目名称 | **合同名称**（不是项目名称） | 第 1 页支付用途说明 + 第 2 页项目名称 |
+  | 中标单位 | **承包单位** | 第 2 页施工单位 |
+  | 合同改成元 | 合同价（元、两位小数） | 第 2 页合同价 |
+  | 审计价改成元 | 审计价；**未审定填 0**（输出 `0.00`） | 第 2 页审计价 |
+  | 已付款改成元 | **本次之前**的累计已付（按开单日期、排除作废） | 第 2 页目前已累计支付金额 |
+  | 本次付款小写 | 本次金额 | 第 1 页小写 + 第 2 页本期申请支付金额 |
+  | 本次付款数大写 | 本次金额 → 人民币中文大写 | 第 1 页大写 |
+  | 本次付款后累计 | 已付 + 本次 | 第 2 页本期末累计支付金额 |
+  | 合同约定_付款条件 | 付款条款 | 第 2 页合同履行情况 |
 
-- **留空**：会计分类名、附件张数、当前日期三处无合并域，保持空白供手工填写 / 签字；
-  其他字段缺失时也一律留空，不写「—」、不拒绝生成；
-- 预留接口：`ctp-app/src/print.rs` 的 `PrintTemplate` 描述符（`FillStrategy`、
-  `MissingPolicy`、`OutputScope` 均已固化）+ `PrintAdapter` trait + `PrintContext`
-  + 注册表，本轮 `adapters()` 为空实现。后期接 Word 填充只需加一个 adapter，
-  业务层与界面不用改；Excel 版模板留作第二个 adapter；
-- **实现注意**：模板里 4 个域的 `«…»` 被 Word 拆成 3 个 run，后期填充必须按
-  `w:fldChar begin/separate/end` 域边界整体替换为纯文本，纯字符串替换会漏；
-- 选型结论：就「填充现成模板」而言 **Word 更容易**（docx 是 zip，只需 `zip` 一个轻量
-  依赖、版式 100% 保真）；Excel 真模板必须另引可读写库（`umya-spreadsheet` 等），
-  而 `rust_xlsxwriter` 做不到。两条路线与取舍详见开发文档 R-25。
+- **留空**：会计分类名、附件张数、当前日期三处保持空白供手工填写 / 签字；
+  其他字段缺失时也一律留空，不写「—」；
+- 实现分两层：
+  - `ctp-app/src/paper.rs` —— 设备无关版面层。`Canvas` trait（`line` / `rect` / `draw_text` /
+    `measure_text`，mm 坐标）是唯一绘图接口，`paint()` 是唯一排版入口。**出纸与预览共用这一份代码**，
+    所以预览图就是成品；
+  - `ctp-app/src/gdi.rs`（`#[cfg(windows)]`）—— 两个后端。`print_vouchers` 走
+    `PrintDlgW`（弹系统打印对话框取 DC）+ `StartDocW` / `StartPage` / `EndPage` / `EndDoc`（多页作业）；
+    `render_page` 走 `CreateDIBSection` 渲染到内存供界面预览。两者只差坐标缩放。
+- **工程坑（`windows-sys 0.59`）**：`StartDocW` / `StartPage` / `EndPage` / `EndDoc` / `DOCINFOW`
+  定义在 `Win32::Storage::Xps`（不是 `Win32::Graphics::Printing`），要开 `Win32_Storage_Xps` feature；
+  `RECT` 在 `Win32::Foundation`。`CreateFontW` 用负高度表示字符高度，pt→px 为 `dpi × 25.4 / 72`。
+  内存 DIB 的 BGRA→RGBA 必须在 `DeleteObject(dib)` **之前**拷完，否则读已释放内存会直接崩
+  （`STATUS_ACCESS_VIOLATION`）。
+- 打印附件另走一条：按原件交给系统默认程序打开，由用户自己选打印范围，程序不接管、不合并、不批量。
 
 窗口可自由缩放，最小 1000×640；宽度小于 1100px 时左侧导航折叠为缩写并带悬停提示。
 右上角可切换浅色 / 深色。
@@ -171,9 +182,9 @@ P0 全在本期、外键无悬空、已付口径与「仅 PAID 合计」一致�
 $env:CTP_SELFTEST=1; .\ctp-gui.exe        # 跑 40 帧后退出，写 data/smoke.txt（页名 / 合同数 / 拨款数）
 $env:CTP_SHOT="out.ppm"; .\ctp-gui.exe    # 等界面稳定后由渲染器保存一帧，退出码 0
 $env:CTP_SCREEN="payments"; $env:CTP_THEME="dark"   # 指定启动页与主题
-$env:CTP_DIALOG="new_contract"             # 启动即打开弹窗；另有 attachments / payment_detail / print_preview / audit_price / edit_amount / void_payment
+$env:CTP_DIALOG="new_contract"             # 启动即打开弹窗；另有 attachments / payment_detail / print_preview / print_batch / material_print / audit_price / edit_amount / void_payment / contract_detail
 $env:CTP_DIALOG="new_contract"; $env:CTP_STEP="1"   # 直达新建合同的第二步（附件）
-$env:CTP_DIALOG="print_preview"            # 启动即预览第一张拨款单的 9 个合并域取值
+$env:CTP_DIALOG="print_preview"            # 启动即打开打印核对窗（真实位图预览 + 九域取值）
 ```
 
 `scripts/gui_probe.py` 在此之上提供截图与点击回放。打印窗口（PrintWindow）对
@@ -237,7 +248,8 @@ GPU 呈现的窗口常返回空白，可加 `grab=screen` 改走屏幕直抓。
 
 ## 五、下一步建议（按投入产出）
 
-1. 接入 Word 打印模板填充 adapter（`zip` 依赖 + 按 `fldChar` 域边界替换 MERGEFIELD），
-   把「付款打印数据预览」的按钮接到 `ctp_app::print::render`；Excel 版模板作为第二个 adapter；
-2. 合同台账 / 拨款一览两页也接 `ReportResult`，让全部报表统一走列配置驱动；
+1. 合同台账 / 拨款一览两页也接 `ReportResult`，让全部报表统一走列配置驱动；
+2. 打印件如需再调整版式，改 `paper.rs` 的版面常量即可（改版需重新发版）；
+   若要接第二台非 Windows 打印机或留 PDF，在 `gdi.rs` 旁加一个同 `Canvas` 语义的后端即可，
+   `paper::paint` 不用动；
 3. 二期恢复申请与审批时，只需加 4 张预留表并把 `inflight` 从 0 改为两类占用，`PaymentQuota` 无需改动。

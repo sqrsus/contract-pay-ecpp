@@ -1,30 +1,32 @@
-//! Word 模板的**成品渲染**：内置 docx 模板 → 按域边界替换 9 个合并域 →
-//! 单份或多份（批量）合成一个 docx 字节流。
+//! 付款打印：**字段口径 + 版面数据**。
 //!
-//! 模板实物解析结论（2026-11-05 复核）：11 处域 / 9 个唯一域名、两张表同在一个 docx、
-//! 无动态明细行；`w:fldCharType` 三态各 11 次且无嵌套；其中 4 个域的 `«…»` 被 Word
-//! 拆成 3 个 run，因此填充必须按**域边界**处理（见 `docx` 模块），不能按字符串替换。
+//! 本模块只负责两件事，不碰任何图形接口：
+//! 1. 把模板里的 9 个域与系统字段的映射固化成 `PAYMENT_TEMPLATE` 描述符；
+//! 2. 把一张拨款单解析成 `Voucher`（版面直接可用的文本），供 `paper` 排版。
 //!
-//! 输出通道已确认（R-27）：打开 Word 由用户按打印 → 弹系统打印对话框出纸；
-//! 同时保留「导出 Word」与「导出 PDF」（PDF 交给本机 Word 固定版式导出）。
+//! 输出通道（R-28 起）：**不再经过 Word / PDF**。`paper` 用毫米坐标描述两页版面，
+//! `gdi` 把同一份版面分别画到打印机 DC（弹系统打印对话框）与内存位图（界面预览），
+//! 二者像素一致。原 Word 模板填充、docx→PDF 两条链路已整体移除。
+//!
+//! 模板实物解析结论（2026-11-05 复核，改版式时仍需遵守）：11 处域 / 9 个唯一域名、
+//! 两张表原在同一 docx（现按该 docx 的 PDF 逐线复刻为 `paper` 的两页），
+//! 无动态明细行；4 个域的 `«…»` 在 XML 里被拆成 3 个 run。
+//! 版式基准文件保留在 `docs/版式基准_付款打印模板.docx`。
 
-use crate::docx::{self, FieldValue};
-use ctp_core::date::{now_iso, today_iso};
+use crate::paper::{self, Voucher};
+use ctp_core::date::now_iso;
 use ctp_core::money::Money;
 use ctp_core::payment::PaymentStatus;
 use ctp_store::{repo, StoreError};
 use rusqlite::Connection;
 use std::fmt;
-use std::path::Path;
-
-/// 内置的 Word 模板（已确认「模板打包进程序」，不依赖外部文件）。
-///
-/// 文件名用 ASCII：`include_bytes!` 里出现中文路径在不同工具链上容易出岔子。
-pub const TEMPLATE_BYTES: &[u8] = include_bytes!("../templates/payment_voucher.docx");
 
 // ---------------------------------------------------------------- 模板决策常量
 
-/// 模板类型。接口保持中立，Word 先行、Excel 留作第二个 adapter。
+/// 原始模板类型。
+///
+/// R-28 起输出已改为 `paper` + GDI 直接排版，不再填充这份模板；
+/// 保留该枚举只是为了存档「9 个域当初来自哪种模板」，并让描述符字段保持稳定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateKind {
     Word,
@@ -41,7 +43,7 @@ impl TemplateKind {
 
     pub fn label(self) -> &'static str {
         match self {
-            TemplateKind::Word => "Word 邮件合并域模板",
+            TemplateKind::Word => "Word 邮件合并域模板（版式基准）",
             TemplateKind::Excel => "Excel 单元格模板",
         }
     }
@@ -229,12 +231,16 @@ pub static MANUAL_BLANK_FIELDS: &[&str] = &[
     "当前日期（部门 / 年月日）",
 ];
 
+/// 付款打印的版式描述符：9 个域的来源与口径都固定在这里。
+///
+/// R-28 起这张单据由 `paper` 直接排版，本描述符只承担两件事：
+/// 声明每个域「取哪个系统字段」，以及存档版式基准文件的位置。
 pub static PAYMENT_TEMPLATE: TemplateDescriptor = TemplateDescriptor {
     id: "payment_voucher_v1",
-    name: "付款打印模板（财务支出审核监督表 + 工程项目进度款支付申请表）",
+    name: "付款打印（财务支出审核监督表 + 工程项目进度款支付申请表）",
     kind: TemplateKind::Word,
     alt_kind: Some(TemplateKind::Excel),
-    template_file_hint: "templates/付款打印模板.docx",
+    template_file_hint: "docs/版式基准_付款打印模板.docx",
     fill_strategy: FillStrategy::ReplaceFieldWithText,
     missing_policy: MissingPolicy::Blank,
     output_scope: OutputScope::BothTablesOneFile,
@@ -282,14 +288,8 @@ impl PaymentPrintData {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrintError {
-    #[error("打印模板文件缺失或不可读：{0}")]
-    MissingTemplate(String),
-
     #[error("字段缺失且当前策略为拒绝生成：{0}")]
     MissingField(&'static str),
-
-    #[error("生成打印件失败：{0}")]
-    Template(String),
 
     #[error("该拨款单已作废，不允许打印：{0}")]
     Voided(String),
@@ -297,8 +297,11 @@ pub enum PrintError {
     #[error("没有选中任何拨款单")]
     NothingSelected,
 
-    #[error("导出 PDF 失败：{0}")]
-    Pdf(String),
+    #[error("打印失败：{0}")]
+    Print(String),
+
+    #[error("已取消打印")]
+    Cancelled,
 
     #[error("{0}")]
     Store(#[from] StoreError),
@@ -387,135 +390,70 @@ pub fn resolve(conn: &Connection, payment_id: &str) -> Result<PaymentPrintData, 
     })
 }
 
-// ---------------------------------------------------------------- 成品渲染
+// ---------------------------------------------------------------- 版面数据
 
-/// 把解析好的 9 个域转成 docx 填充用的（域名, 取值）对。
+/// 把解析结果折叠成版面直接可用的文本。
 ///
-/// 域名的口径由 `PAYMENT_FIELDS` 固定，`resolve()` 已按同一份描述符产出，两边顺序一致。
-pub fn data_values(data: &PaymentPrintData) -> Vec<FieldValue> {
-    data.fields
-        .iter()
-        .map(|f| FieldValue::new(f.merge_field, f.value.clone()))
-        .collect()
-}
-
-/// 用内置模板生成 docx 字节流。`copies` 的每一份对应一张单据，一份一页。
-pub fn render_docx(copies: &[Vec<FieldValue>]) -> Result<Vec<u8>, PrintError> {
-    let template = docx::read_entry(TEMPLATE_BYTES, docx::DOC_XML).map_err(|e| {
-        PrintError::MissingTemplate(format!("内置打印模板不可读（{e}）；请确认程序完整"))
-    })?;
-    let merged =
-        docx::render_document(&template, copies).map_err(|e| PrintError::Template(e.to_string()))?;
-    docx::rewrite_entry(TEMPLATE_BYTES, docx::DOC_XML, &merged)
-        .map_err(|e| PrintError::Template(e.to_string()))
-}
-
-/// 一次输出的成品：字节流 + 张数 + 建议文件名。
-#[derive(Debug)]
-pub struct RenderedVoucher {
-    pub bytes: Vec<u8>,
-    pub count: usize,
-    /// 导出弹窗的默认文件名（不含目录）
-    pub default_name: String,
-    /// 手册核对用：参与输出的单号（按输出顺序）
-    pub payment_nos: Vec<String>,
-}
-
-impl RenderedVoucher {
-    /// PDF 导出时用的默认文件名（同主名换后缀）。
-    pub fn pdf_name(&self) -> String {
-        self.default_name.replace(".docx", ".pdf")
+/// 9 个域里有两处「一域多贴」：表 1 的支付用途说明与表 2 的项目名称同值。
+/// 版面按语义取用（`project_name` 一处填两处），不在这里重复展开。
+pub fn to_voucher(data: &PaymentPrintData) -> Voucher {
+    let get = |name: &str| data.get(name).unwrap_or("").to_string();
+    Voucher {
+        payment_no: data.payment_no.clone(),
+        project_name: get("项目名称"),
+        contractor: get("中标单位"),
+        contract_amount: get("合同改成元"),
+        audit_amount: get("审计价改成元"),
+        paid_before: get("已付款改成元"),
+        this_amount: get("本次付款小写"),
+        this_amount_cn: get("本次付款数大写"),
+        cumulative: get("本次付款后累计"),
+        terms: get("合同约定_付款条件（保持与书面合同一致）"),
     }
 }
 
-/// 生成一张或一批拨款单的打印件。
+/// 解析一批拨款单，供打印与预览使用。
 ///
 /// * 作废单一律拒绝（已确认「作废不允许打印」）；
-/// * 批量按传入顺序依次成页，每份一份（已确认「勾选若干条 → 合并输出」）。
-pub fn render_payments(
-    conn: &Connection,
-    payment_ids: &[String],
-) -> Result<RenderedVoucher, PrintError> {
+/// * 顺序按传入顺序（界面按列表顺序传，勾选先后不影响成品次序）。
+pub fn vouchers(conn: &Connection, payment_ids: &[String]) -> Result<Vec<Voucher>, PrintError> {
     if payment_ids.is_empty() {
         return Err(PrintError::NothingSelected);
     }
-    let mut copies: Vec<Vec<FieldValue>> = Vec::with_capacity(payment_ids.len());
-    let mut nos: Vec<String> = Vec::with_capacity(payment_ids.len());
+    let mut out = Vec::with_capacity(payment_ids.len());
     for id in payment_ids {
         let pm = repo::get_payment(conn, id)?;
         if pm.status != PaymentStatus::Paid {
             return Err(PrintError::Voided(pm.payment_no));
         }
-        let data = resolve(conn, id)?;
-        nos.push(data.payment_no.clone());
-        copies.push(data_values(&data));
+        out.push(to_voucher(&resolve(conn, id)?));
     }
-    let bytes = render_docx(&copies)?;
-    let default_name = if nos.len() == 1 {
-        format!("拨款单_{}.docx", nos[0])
-    } else {
-        format!(
-            "拨款单_{}_等{}张_{}.docx",
-            nos[0],
-            nos.len(),
-            today_iso().replace('-', "")
-        )
-    };
-    Ok(RenderedVoucher {
-        bytes,
-        count: nos.len(),
-        default_name,
-        payment_nos: nos,
-    })
+    Ok(out)
 }
 
-// ---------------------------------------------------------------- 适配器
-
-/// 渲染入参：业务层 / 界面都不接触模板文件格式细节。
-pub struct PrintContext<'a> {
-    pub descriptor: &'static TemplateDescriptor,
-    pub data: &'a PaymentPrintData,
-    pub template_path: &'a Path,
-    pub output_path: &'a Path,
+/// 这批单据总共印几页。
+pub fn page_count(count: usize) -> usize {
+    count * paper::PAGES_PER_VOUCHER
 }
 
-/// 打印模板填充器。Word 已实现；Excel 留作第二个 adapter。
-pub trait PrintAdapter {
-    fn kind(&self) -> TemplateKind;
-    fn render(&self, ctx: &PrintContext<'_>) -> Result<(), PrintError>;
-}
-
-/// Word 模板填充器：内置模板 → 域替换 → 落盘。
+/// 打印件名称：单张带单号，多张带首单号与张数。
 ///
-/// `template_path` 不再使用（模板已打包进程序），保留字段只为接口稳定。
-pub struct WordAdapter;
-
-impl PrintAdapter for WordAdapter {
-    fn kind(&self) -> TemplateKind {
-        TemplateKind::Word
-    }
-
-    fn render(&self, ctx: &PrintContext<'_>) -> Result<(), PrintError> {
-        let bytes = render_docx(&[data_values(ctx.data)])?;
-        std::fs::write(ctx.output_path, bytes)
-            .map_err(|e| PrintError::Template(format!("写入打印件失败：{e}")))
+/// 只用于打印作业名与界面提示（不再落盘，所以没有扩展名）。
+pub fn doc_name(vs: &[Voucher]) -> String {
+    match vs {
+        [] => "拨款单".to_string(),
+        [one] => format!("拨款单 {}", one.payment_no),
+        [first, ..] => format!("拨款单 {} 等 {} 张", first.payment_no, vs.len()),
     }
 }
 
-pub fn adapters() -> Vec<Box<dyn PrintAdapter>> {
-    vec![Box::new(WordAdapter)]
-}
-
-/// 统一的落盘入口：把一张单据写成 docx 文件。
-pub fn render(ctx: &PrintContext<'_>) -> Result<(), PrintError> {
-    let kind = ctx.descriptor.kind;
-    match adapters().into_iter().find(|a| a.kind() == kind) {
-        Some(adapter) => adapter.render(ctx),
-        None => Err(PrintError::Template(format!(
-            "{} 的填充实现尚未接入",
-            kind.label()
-        ))),
-    }
+/// 一页的预览位图（RGBA8，逐行自上而下）。
+///
+/// 由打印后端按同一份 `paper` 版面渲染，供界面显示；与出纸结果像素一致。
+pub struct Preview {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -526,70 +464,96 @@ mod tests {
     fn 描述符固化了九域与已确认口径() {
         let d = &PAYMENT_TEMPLATE;
         assert_eq!(d.fields.len(), 9);
-        assert_eq!(d.kind, TemplateKind::Word);
         assert_eq!(d.alt_kind, Some(TemplateKind::Excel));
         assert_eq!(d.fill_strategy, FillStrategy::ReplaceFieldWithText);
         assert_eq!(d.missing_policy, MissingPolicy::Blank);
         assert_eq!(d.output_scope, OutputScope::BothTablesOneFile);
         assert_eq!(d.manual_blank_fields.len(), 3);
-        assert!(d.fields.iter().any(|f| f.merge_field == "合同约定_付款条件（保持与书面合同一致）"));
+        assert!(d
+            .fields
+            .iter()
+            .any(|f| f.merge_field == "合同约定_付款条件（保持与书面合同一致）"));
         assert!(d.fields.iter().any(|f| f.merge_field == "本次付款数大写"));
     }
 
     #[test]
-    fn 注册表与填充实现已接入() {
+    fn 注册表可按键查找() {
         assert_eq!(find_template("payment_voucher_v1").unwrap().id, PAYMENT_TEMPLATE.id);
         assert!(find_template("not_exist").is_none());
-        assert_eq!(adapters().len(), 1, "Word 填充器已接入");
-        assert_eq!(adapters()[0].kind(), TemplateKind::Word);
-    }
-
-    #[test]
-    fn 内置模板可读且九域都在() {
-        let xml = docx::read_entry(TEMPLATE_BYTES, docx::DOC_XML).expect("内置模板应可读");
-        let names = docx::field_names(&xml);
-        assert_eq!(names.len(), 11, "模板内 11 处合并域");
-        let mut unique = names.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), 9, "9 个唯一域名");
-        // 描述符覆盖了模板里的所有域名（含带 \# "0.00" 开关的四个）
-        for n in &unique {
-            assert!(
-                PAYMENT_FIELDS.iter().any(|f| f.merge_field == n),
-                "描述符缺少域名 {n}"
-            );
-        }
-    }
-
-    #[test]
-    fn 单张与批量都能生成且无残留占位符() {
-        let values: Vec<FieldValue> = PAYMENT_FIELDS
-            .iter()
-            .enumerate()
-            .map(|(i, f)| FieldValue::new(f.merge_field, format!("v{i}")))
-            .collect();
-        let one = render_docx(&[values.clone()]).expect("单张生成失败");
-        assert!(!one.is_empty());
-        let two = render_docx(&[values.clone(), values]).expect("批量生成失败");
-        assert!(two.len() > one.len(), "两份应比一份大");
-        for bytes in [&one, &two] {
-            let xml = docx::read_entry(bytes, docx::DOC_XML).expect("成品应可读");
-            assert!(docx::residual_fields(&xml).is_empty(), "成品不应残留合并域");
-            assert!(!xml.contains("MERGEFIELD"), "成品不应残留域代码");
-        }
     }
 
     #[test]
     fn 缺值策略按口径留空或拒绝() {
-        assert_eq!(
-            apply_policy(None, MissingPolicy::Blank, "x").unwrap(),
-            ""
-        );
-        assert_eq!(
-            apply_policy(None, MissingPolicy::Dash, "x").unwrap(),
-            "—"
-        );
+        assert_eq!(apply_policy(None, MissingPolicy::Blank, "x").unwrap(), "");
+        assert_eq!(apply_policy(None, MissingPolicy::Dash, "x").unwrap(), "—");
         assert!(apply_policy(None, MissingPolicy::Reject, "x").is_err());
+    }
+
+    fn data_with(pairs: &[(&'static str, &str)]) -> PaymentPrintData {
+        let mut fields = Vec::new();
+        for b in PAYMENT_FIELDS {
+            let v = pairs
+                .iter()
+                .find(|(n, _)| *n == b.merge_field)
+                .map(|(_, v)| (*v).to_string())
+                .unwrap_or_default();
+            fields.push(ResolvedField {
+                merge_field: b.merge_field,
+                label: b.label,
+                value: v,
+                source: b.source.label(),
+                note: b.note,
+            });
+        }
+        PaymentPrintData {
+            payment_no: "FK-1".into(),
+            contract_no: "HT-1".into(),
+            fields,
+            generated_at: now_iso(),
+        }
+    }
+
+    #[test]
+    fn 九域按语义折叠到版面字段() {
+        let d = data_with(&[
+            ("本次付款数大写", "陆佰圆整"),
+            ("本次付款小写", "600.00"),
+            ("项目名称", "XX 公路改建工程"),
+            ("中标单位", "YY 路桥有限公司"),
+            ("合同改成元", "1000.00"),
+            ("审计价改成元", "0.00"),
+            ("已付款改成元", "0.00"),
+            ("本次付款后累计", "600.00"),
+            ("合同约定_付款条件（保持与书面合同一致）", "已完成 60%"),
+        ]);
+        let v = to_voucher(&d);
+        assert_eq!(v.this_amount_cn, "陆佰圆整");
+        assert_eq!(v.this_amount, "600.00");
+        assert_eq!(v.project_name, "XX 公路改建工程");
+        assert_eq!(v.contractor, "YY 路桥有限公司");
+        assert_eq!(v.contract_amount, "1000.00");
+        assert_eq!(v.audit_amount, "0.00");
+        assert_eq!(v.paid_before, "0.00");
+        assert_eq!(v.cumulative, "600.00");
+        assert_eq!(v.terms, "已完成 60%");
+        assert_eq!(v.payment_no, "FK-1");
+    }
+
+    #[test]
+    fn 缺域折叠成空串而不是占位符() {
+        let v = to_voucher(&data_with(&[]));
+        for s in [&v.project_name, &v.contractor, &v.terms, &v.this_amount] {
+            assert!(s.is_empty());
+        }
+    }
+
+    #[test]
+    fn 打印件名称随张数变化() {
+        let one = to_voucher(&data_with(&[]));
+        assert!(doc_name(&[one.clone()]).contains("拨款单 FK-1"));
+        assert_eq!(doc_name(&[]), "拨款单");
+        let many = vec![one; 3];
+        assert!(doc_name(&many).contains("等 3 张"));
+        assert_eq!(page_count(many.len()), 6, "每张两页");
     }
 }

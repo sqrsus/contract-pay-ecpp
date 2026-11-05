@@ -14,7 +14,6 @@ mod theme;
 mod widgets;
 
 use ctp_app::checks::CheckReport;
-use ctp_app::print::PaymentPrintData;
 use ctp_app::report::ReportKind;
 use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::{Contract, ContractStatus};
@@ -24,6 +23,7 @@ use ctp_core::project::{Contractor, Project};
 use ctp_store::{db, repo};
 use eframe::egui::{self, Color32, Margin, RichText, Rounding};
 use rusqlite::Connection;
+use raw_window_handle::HasWindowHandle;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -152,10 +152,16 @@ pub struct App {
     pub pay_form: PayForm,
     /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
     pub pay_detail: Option<Payment>,
-    /// 付款打印件的 9 个合并域解析结果（`Dialog::PrintPreview`）。
-    pub print_data: Option<PaymentPrintData>,
-    /// 本次要输出的拨款单（单张 = 1 条；批量 = 勾选的若干条，按列表顺序）
+    /// 本次要打印的拨款单版面数据（单张 = 1 条；批量 = 勾选的若干条，按列表顺序）
+    pub print_vouchers: Vec<ctp_app::Voucher>,
+    /// 本次要输出的拨款单 id（与 `print_vouchers` 同序，用于提示）
     pub print_ids: Vec<String>,
+    /// 打印预览当前页（0 .. 2N），一页对应单据的一页
+    pub print_page: usize,
+    /// 预览位图纹理及其对应页码，避免每帧重绘
+    pub print_tex: Option<(egui::TextureHandle, usize)>,
+    /// 主窗口句柄（打印对话框的 owner），未取到时为 0
+    pub hwnd: isize,
     /// 拨款管理页「批量打印」的勾选集合
     pub print_sel: std::collections::BTreeSet<String>,
     /// 新建合同表单里的一次性提示（附件选择失败等）
@@ -256,8 +262,11 @@ impl App {
             pay_contract_text: String::new(),
             pay_form: PayForm::default(),
             pay_detail: None,
-            print_data: None,
+            print_vouchers: Vec::new(),
             print_ids: Vec::new(),
+            print_page: 0,
+            print_tex: None,
+            hwnd: 0,
             print_sel: std::collections::BTreeSet::new(),
             new_contract: ContractForm::default(),
             new_contract_flash: None,
@@ -627,13 +636,13 @@ impl App {
         }
     }
 
-    /// 付款打印入口：选中一张拨款单 → 解析 9 个合并域 → 打开打印弹窗。
+    /// 付款打印入口：选中一张拨款单 → 解析版面数据 → 打开预览弹窗。
     pub fn open_print_preview(&mut self, pm: &Payment) {
         self.print_ids = vec![pm.id.clone()];
-        self.load_print_data();
+        self.load_print_vouchers();
     }
 
-    /// 批量打印入口：拨款管理页勾选的若干张，按列表顺序成页（一份一页）。
+    /// 批量打印入口：拨款管理页勾选的若干张，按列表顺序成页（一张两页）。
     pub fn open_batch_print(&mut self) {
         if self.print_sel.is_empty() {
             self.error("请先勾选要打印的拨款单");
@@ -655,115 +664,47 @@ impl App {
             return;
         }
         self.print_ids = ids;
-        self.load_print_data();
+        self.load_print_vouchers();
     }
 
-    fn load_print_data(&mut self) {
-        let data = match (self.db.as_ref(), self.print_ids.first()) {
-            (Some(conn), Some(id)) => ctp_app::service::payment_print_data(conn, id).ok(),
-            _ => None,
-        };
-        match data {
-            Some(d) => {
-                self.print_data = Some(d);
-                self.dialog = Dialog::PrintPreview;
-            }
-            None => self.error("解析付款打印数据失败"),
-        }
-    }
-
-    /// 生成打印件字节流（单张或批量）。任何失败都报错中止，不留半成品。
-    fn render_print_bytes(&mut self) -> Option<ctp_app::print::RenderedVoucher> {
+    /// 解析版面数据并打开预览。取数与打印同一入口，不存在第二套口径。
+    fn load_print_vouchers(&mut self) {
         let ids = self.print_ids.clone();
         let out = self
             .db
             .as_ref()
-            .map(|conn| ctp_app::service::print_payment_docx(conn, &ids));
+            .map(|conn| ctp_app::service::print_vouchers(conn, &ids));
         match out {
-            Some(Ok(v)) => Some(v),
-            Some(Err(e)) => {
-                self.error(format!("生成打印件失败：{e}"));
-                None
+            Some(Ok(vs)) if !vs.is_empty() => {
+                self.print_vouchers = vs;
+                self.print_page = 0;
+                self.print_tex = None;
+                self.dialog = Dialog::PrintPreview;
             }
-            None => {
-                self.error("数据库未打开");
-                None
-            }
+            Some(Ok(_)) => self.error("没有可打印的拨款单"),
+            Some(Err(e)) => self.error(format!("准备打印数据失败：{e}")),
+            None => self.error("数据库未打开"),
         }
     }
 
-    /// 打开并打印：生成 docx → 交给本机 Word → 由用户在 Word 里按 Ctrl+P 出纸。
+    /// 打印：直接弹系统「打印」对话框并出纸，不经过 Word / PDF。
     ///
-    /// 已确认走「打开文档由应用弹打印对话框」这条路（本机装有 Word），
-    /// 打印份数、打印机、双面等选项都在 Word 的打印对话框里选。
-    pub fn print_open_word(&mut self) {
-        let Some(v) = self.render_print_bytes() else {
-            return;
-        };
-        let path = std::env::temp_dir()
-            .join("ctp-print")
-            .join(&v.default_name);
-        if let Err(e) = ctp_app::service::write_print_file(&path, &v.bytes) {
-            self.error(format!("写入打印件失败：{e}"));
+    /// 用户取消对话框不算错误（`Ok(0)`）；其余失败一律报错中止。
+    pub fn print_now(&mut self) {
+        if self.print_vouchers.is_empty() {
+            self.error("没有可打印的拨款单");
             return;
         }
-        match crate::dialogs::open_external(&path) {
-            Ok(()) => self.success(format!(
-                "已在 Word 中打开 {} 张，按 Ctrl+P 选择打印机打印",
-                v.count
+        let vs = self.print_vouchers.clone();
+        let name = ctp_app::print::doc_name(&vs);
+        match ctp_app::print_vouchers_now(self.hwnd, &vs, &name) {
+            Ok(0) => {}
+            Ok(pages) => self.success(format!(
+                "已向打印机发送 {} 张单据、共 {} 页",
+                vs.len(),
+                pages
             )),
-            Err(e) => self.error(e),
-        }
-    }
-
-    /// 导出 Word：另存一份 .docx 到用户指定位置。
-    pub fn export_print_docx(&mut self) {
-        let Some(v) = self.render_print_bytes() else {
-            return;
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&v.default_name)
-            .add_filter("Word 文档", &["docx"])
-            .save_file()
-        else {
-            return;
-        };
-        match ctp_app::service::write_print_file(&path, &v.bytes) {
-            Ok(()) => self.success(format!(
-                "已导出 {} 张打印件 → {}",
-                v.count,
-                path.display()
-            )),
-            Err(e) => self.error(format!("导出失败：{e}")),
-        }
-    }
-
-    /// 导出 PDF：先落 docx，再交给本机 Word 固定版式导出。
-    pub fn export_print_pdf(&mut self) {
-        let Some(v) = self.render_print_bytes() else {
-            return;
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(v.pdf_name())
-            .add_filter("PDF 文件", &["pdf"])
-            .save_file()
-        else {
-            return;
-        };
-        let docx = std::env::temp_dir()
-            .join("ctp-print")
-            .join(&v.default_name);
-        if let Err(e) = ctp_app::service::write_print_file(&docx, &v.bytes) {
-            self.error(format!("写入临时 docx 失败：{e}"));
-            return;
-        }
-        match ctp_app::pdf::docx_to_pdf(&docx, &path) {
-            Ok(()) => self.success(format!(
-                "已导出 {} 张 PDF → {}（Word 固定版式）",
-                v.count,
-                path.display()
-            )),
-            Err(e) => self.error(format!("导出 PDF 失败：{e}")),
+            Err(e) => self.error(e.to_string()),
         }
     }
 
@@ -1061,7 +1002,15 @@ fn shorten_path(path: &str) -> String {    let s = path.replace('\\', "/");
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 取一次主窗口句柄，打印对话框用它做 owner（避免被主窗挡住）
+        if self.hwnd == 0 {
+            if let Ok(h) = frame.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
+                    self.hwnd = w.hwnd.get() as isize;
+                }
+            }
+        }
         // 自动截图：`CTP_SHOT=<文件.ppm>`。走渲染器自己的截图通道，
         // 不依赖窗口是否在前台，也不受遮挡影响（PrintWindow 对 GPU 窗口常返回空白）。
         if self.shot.is_some() {

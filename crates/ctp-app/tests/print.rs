@@ -1,13 +1,16 @@
-//! 集成测试：付款打印件的**成品**口径。
+//! 集成测试：付款打印的**数据与版面**口径。
 //!
-//! | 用例 | 对应确认口径（R-27） |
+//! | 用例 | 对应口径 |
 //! |---|---|
-//! | `单张成品包含九个域取值且无残留占位符` | 9 域映射 / 缺值留空 / 残留即失败 |
-//! | `批量按一份一页合并` | 勾选若干条 → 合并输出 |
+//! | `版面数据含九个域取值` | 9 域映射 / 缺值留空 |
+//! | `批量按列表顺序一张两页` | 勾选若干条 → 一张两页、连续排页 |
 //! | `作废单拒绝打印` | 作废不允许打印 |
-//! | `已付款按开单日期取本次之前累计` | 取数按开单日期、排除作废 |
+//! | `已付款按开单日期取本次之前累计且排除作废` | 取数按开单日期、排除作废 |
+//! | `预览渲染两页且版面有实际内容` | 版面能渲染、尺寸为 A4 横向 |
+//!
+//! R-28 起打印不再经过 docx / Word，故原来针对 docx 字节的断言整体替换为
+//! 「版面数据 + 渲染位图」两类断言。
 
-use ctp_app::docx;
 use ctp_app::service::{self, NewContract, NewPayment};
 use ctp_core::contract::ContractType;
 use ctp_core::money::Money;
@@ -104,59 +107,47 @@ fn pay(conn: &mut Connection, cid: &str, yuan: i64, date: &str) -> String {
 }
 
 #[test]
-fn 单张成品包含九个域取值且无残留占位符() {
+fn 版面数据含九个域取值() {
     let (mut conn, cid) = fixture();
     let pid = pay(&mut conn, &cid, 300, "2026-03-31");
 
-    let v = service::print_payment_docx(&conn, std::slice::from_ref(&pid)).unwrap();
-    assert_eq!(v.count, 1);
-    assert!(v.default_name.starts_with("拨款单_"), "{}", v.default_name);
+    let vs = service::print_vouchers(&conn, std::slice::from_ref(&pid)).unwrap();
+    assert_eq!(vs.len(), 1);
+    let v = &vs[0];
 
-    let xml = docx::read_entry(&v.bytes, docx::DOC_XML).expect("成品应是合法 docx");
-    assert!(!xml.contains("MERGEFIELD"), "不应残留域代码");
-    assert!(docx::residual_fields(&xml).is_empty(), "不应残留占位符");
-
-    // 9 个域的取值逐个核对（合同名 / 承包单位 / 合同价 / 审计价 0 / 已付 0 / 本次 / 大写 / 累计 / 条款）
-    for expect in [
-        "测试合同",
-        "某施工单位",
-        "1000.00",
-        "0.00",
-        "300.00",
-        "叁佰圆整",
-        "按月计量支付",
-    ] {
-        assert!(xml.contains(expect), "成品里缺少取值 {expect}");
-    }
-    // 三处手工留空的位置在模板里本来就没有域，成品里不应出现「会计分类名」这类占位
-    assert!(!xml.contains("«"));
+    // 9 个域逐个核对（合同名 / 承包单位 / 合同价 / 审计价 0 / 已付 0 / 本次 / 大写 / 累计 / 条款）
+    assert_eq!(v.project_name, "测试合同");
+    assert_eq!(v.contractor, "某施工单位");
+    assert_eq!(v.contract_amount, "1000.00");
+    assert_eq!(v.audit_amount, "0.00");
+    assert_eq!(v.paid_before, "0.00");
+    assert_eq!(v.this_amount, "300.00");
+    assert_eq!(v.this_amount_cn, "叁佰圆整");
+    assert_eq!(v.cumulative, "300.00");
+    assert_eq!(v.terms, "按月计量支付");
+    assert!(v.payment_no.starts_with("BK-"), "{}", v.payment_no);
 }
 
 #[test]
-fn 批量按一份一页合并() {
+fn 批量按列表顺序一张两页() {
     let (mut conn, cid) = fixture();
     let a = pay(&mut conn, &cid, 100, "2026-02-28");
     let b = pay(&mut conn, &cid, 200, "2026-03-31");
 
-    let one = service::print_payment_docx(&conn, std::slice::from_ref(&a)).unwrap();
-    let two = service::print_payment_docx(&conn, &[a.clone(), b.clone()]).unwrap();
+    let one = service::print_vouchers(&conn, std::slice::from_ref(&a)).unwrap();
+    let two = service::print_vouchers(&conn, &[a, b]).unwrap();
 
-    assert_eq!(two.count, 2);
-    assert!(two.bytes.len() > one.bytes.len(), "两份应大于一份");
-    let xml = docx::read_entry(&two.bytes, docx::DOC_XML).unwrap();
-    assert_eq!(
-        xml.matches("<w:br w:type=\"page\"/>").count(),
-        1,
-        "两份之间应有一个分页符"
-    );
-    // 模板正文中段本身有一个连续分节符（sectPr），每份带一个，末尾再保留一个 body 级
-    assert_eq!(
-        xml.matches("<w:sectPr").count(),
-        3,
-        "两份各带一个中段分节符 + 末尾一个"
-    );
-    // 第二张的「已付款」应含第一张（累计 100.00），成品里两份取值都在
-    assert!(xml.contains("100.00") && xml.contains("200.00"));
+    assert_eq!(one.len(), 1);
+    assert_eq!(two.len(), 2, "两张单据");
+    assert_eq!(ctp_app::print::page_count(two.len()), 4, "每张两页");
+
+    // 第二张的「已付款」含第一张（累计 100.00），说明顺序与取数都对
+    assert_eq!(two[0].paid_before, "0.00");
+    assert_eq!(two[1].paid_before, "100.00");
+    assert_eq!(two[1].cumulative, "300.00");
+
+    let name = ctp_app::print::doc_name(&two);
+    assert!(name.contains("等 2 张"), "{name}");
 }
 
 #[test]
@@ -165,7 +156,7 @@ fn 作废单拒绝打印() {
     let pid = pay(&mut conn, &cid, 100, "2026-02-28");
     service::void_payment(&mut conn, &pid, "录错重登", "t").unwrap();
 
-    let err = service::print_payment_docx(&conn, &[pid]).unwrap_err();
+    let err = service::print_vouchers(&conn, &[pid]).unwrap_err();
     assert!(
         matches!(err, ctp_app::PrintError::Voided(_)),
         "作废单应被拒绝，实际：{err}"
@@ -176,7 +167,6 @@ fn 作废单拒绝打印() {
 fn 已付款按开单日期取本次之前累计且排除作废() {
     let (mut conn, cid) = fixture();
     let first = pay(&mut conn, &cid, 100, "2026-02-28");
-    // 同一天日期、单号更大的那张，在它之前累计应包含 first
     let second = pay(&mut conn, &cid, 200, "2026-03-31");
     let voided = pay(&mut conn, &cid, 50, "2026-03-15");
     service::void_payment(&mut conn, &voided, "录错重登", "t").unwrap();
@@ -190,42 +180,87 @@ fn 已付款按开单日期取本次之前累计且排除作废() {
     assert_eq!(d1.get("已付款改成元"), Some("0.00"));
 }
 
-/// 走真实 Word 导出 PDF。
-///
-/// 依赖本机装 Microsoft Word，故默认 `#[ignore]`；手动执行：
-/// `cargo test -p ctp-app --test print -- --ignored`
+/// 渲染出的位图尺寸必须是 A4 横向，且纸上真有内容（不是一张全白）。
+#[cfg(windows)]
 #[test]
-#[ignore = "需要本机 Microsoft Word"]
-fn 用_word_把成品导出成_pdf() {
+fn 预览渲染两页且版面有实际内容() {
     let (mut conn, cid) = fixture();
-    let a = pay(&mut conn, &cid, 600, "2026-02-28");
-    let v = service::print_payment_docx(&conn, &[a]).unwrap();
-    let dir = std::env::temp_dir().join("ctp-print-sample");
-    std::fs::create_dir_all(&dir).unwrap();
-    let docx_path = dir.join(&v.default_name);
-    std::fs::write(&docx_path, &v.bytes).unwrap();
+    let pid = pay(&mut conn, &cid, 600, "2026-02-28");
+    let vs = service::print_vouchers(&conn, &[pid]).unwrap();
 
-    let pdf_path = dir.join(v.pdf_name());
-    ctp_app::pdf::docx_to_pdf(&docx_path, &pdf_path).expect("Word 导出 PDF 失败");
-    let head = std::fs::read(&pdf_path).unwrap();
-    assert!(head.starts_with(b"%PDF"), "应产出合法 PDF");
-    println!("PDF 已生成：{}", pdf_path.display());
+    for page in 0..ctp_app::paper::PAGES_PER_VOUCHER {
+        let pv = ctp_app::render_print_page(&vs[0], page, 100.0).expect("渲染失败");
+        // 100 dpi 下 A4 横向约 1169 × 827
+        assert!(pv.width > pv.height, "必须是横向：{}×{}", pv.width, pv.height);
+        assert_eq!(pv.rgba.len(), (pv.width * pv.height * 4) as usize);
+        let dark = pv
+            .rgba
+            .chunks_exact(4)
+            .filter(|px| px[0] < 128 && px[1] < 128 && px[2] < 128)
+            .count();
+        assert!(dark > 5000, "第 {page} 页几乎没有笔迹（dark={dark}）");
+        assert!(
+            pv.rgba.chunks_exact(4).all(|px| px[3] == 255),
+            "预览必须完全不透明"
+        );
+    }
 }
 
-/// 落一份真实成品到临时目录，便于用 Word 打开肉眼核对版式。
+/// 落两页预览到临时目录（BMP，24 位），便于用图片查看器核对版面。
 ///
-/// 断言只写在内存里；文件落盘是给人看的辅助产物，路径打在测试输出里。
+/// 与出纸共用同一份版面代码，所以看上图就等于看上纸。
+#[cfg(windows)]
 #[test]
-fn 落一份成品供肉眼核对() {
+fn 落一份预览供肉眼核对() {
     let (mut conn, cid) = fixture();
     let a = pay(&mut conn, &cid, 600, "2026-02-28");
     let b = pay(&mut conn, &cid, 300, "2026-03-31");
-    let v = service::print_payment_docx(&conn, &[a, b]).unwrap();
-    let dir = std::env::temp_dir().join("ctp-print-sample");
+    let vs = service::print_vouchers(&conn, &[a, b]).unwrap();
+    let dir = std::env::temp_dir().join("ctp-print-preview");
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(&v.default_name);
-    std::fs::write(&path, &v.bytes).unwrap();
-    println!("样品已生成：{}", path.display());
-    assert!(path.is_file());
-    let _ = repo::list_payments(&conn, Some(&cid)).unwrap();
+
+    for (i, v) in vs.iter().enumerate() {
+        for page in 0..ctp_app::paper::PAGES_PER_VOUCHER {
+            let pv = ctp_app::render_print_page(v, page, 150.0).unwrap();
+            let path = dir.join(format!("voucher{i}_p{page}.bmp"));
+            std::fs::write(&path, to_bmp(&pv.rgba, pv.width, pv.height)).unwrap();
+            println!("预览已生成：{}", path.display());
+        }
+    }
+    assert!(dir.join("voucher0_p0.bmp").is_file());
+}
+
+/// RGBA8（自上而下）→ 24 位 BMP（自下而上，行按 4 字节对齐）。
+#[cfg(windows)]
+fn to_bmp(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let row = ((w as usize * 3 + 3) / 4) * 4;
+    let size = row * h as usize;
+    let mut out = Vec::with_capacity(54 + size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + size) as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(size as u32).to_le_bytes());
+    out.extend_from_slice(&2835i32.to_le_bytes());
+    out.extend_from_slice(&2835i32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    let mut line = vec![0u8; row];
+    for y in (0..h as usize).rev() {
+        for x in 0..w as usize {
+            let p = (y * w as usize + x) * 4;
+            line[x * 3] = rgba[p + 2];
+            line[x * 3 + 1] = rgba[p + 1];
+            line[x * 3 + 2] = rgba[p];
+        }
+        out.extend_from_slice(&line);
+        line.iter_mut().for_each(|b| *b = 0);
+    }
+    out
 }

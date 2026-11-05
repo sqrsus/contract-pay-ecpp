@@ -549,34 +549,26 @@ fn 付款打印九域解析与中文大写() {
 }
 
 #[test]
-fn 打印输出已接通且接口中立() {
-    use ctp_app::print::{adapters, PrintContext, TemplateKind, PAYMENT_TEMPLATE};
+fn 打印走版面数据且不依赖外部软件() {
+    use ctp_app::print::{page_count, TemplateKind, PAYMENT_TEMPLATE};
 
-    // 已确认走 Word 模板；Excel 仍留作第二 adapter，接口不变
-    assert_eq!(adapters().len(), 1, "已接入 Word 填充器");
-    assert_eq!(adapters()[0].kind(), TemplateKind::Word);
+    // 描述符仍固化 Word 模板来源（版式基准），但输出已改由 paper + GDI 直接排版
     assert_eq!(PAYMENT_TEMPLATE.kind, TemplateKind::Word);
     assert_eq!(PAYMENT_TEMPLATE.alt_kind, Some(TemplateKind::Excel));
 
     let (mut conn, cid) = fixture(1000);
     let pm = pay(&mut conn, &cid, 250).unwrap();
-    let data = service::payment_print_data(&conn, &pm.id).unwrap();
 
-    // 单份落盘出一条真正可打开的 docx（R-27：不再是空实现）
-    let dir = std::env::temp_dir().join("ctp-print-test");
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.join("out.docx");
-    let ctx = PrintContext {
-        descriptor: &PAYMENT_TEMPLATE,
-        data: &data,
-        template_path: std::path::Path::new("templates/payment_voucher.docx"),
-        output_path: &out,
-    };
-    ctp_app::print::render(&ctx).unwrap();
-    let bytes = std::fs::read(&out).unwrap();
-    assert!(bytes.starts_with(b"PK"), "docx 应为 zip 容器");
-    let xml = ctp_app::docx::read_entry(&bytes, ctp_app::docx::DOC_XML).unwrap();
-    assert!(ctp_app::docx::residual_fields(&xml).is_empty(), "不应残留占位符");
+    // 9 域解析仍是唯一取数入口
+    let data = service::payment_print_data(&conn, &pm.id).unwrap();
+    assert_eq!(data.get("本次付款小写"), Some("250.00"));
+
+    // 打印入口直接吐版面数据，一张两页
+    let vs = service::print_vouchers(&conn, &[pm.id.clone()]).unwrap();
+    assert_eq!(vs.len(), 1);
+    assert_eq!(vs[0].this_amount, "250.00");
+    assert_eq!(page_count(vs.len()), 2);
+    assert_eq!(vs[0].payment_no, pm.payment_no);
 }
 
 #[test]
