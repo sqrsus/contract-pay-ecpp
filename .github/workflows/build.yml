@@ -3,7 +3,7 @@ name: build
 # 触发条件：
 #   - push 到 main            → 跑测试 + 编 release，产物作为 artifact 保留 30 天
 #   - 向 main 提 PR           → 只跑测试，避免重复构建
-#   - 推送 v* 标签            → 额外创建 GitHub Release，附上两平台二进制与校验和
+#   - 推送 v* 标签            → 额外创建 GitHub Release，附上 Windows 二进制与校验和
 #   - 手动 workflow_dispatch → 按需重跑
 on:
   push:
@@ -58,9 +58,10 @@ jobs:
         run: cargo test --workspace --locked
 
   # ---------------------------------------------------------------------------
-  # 第 2 关：两平台编译 release profile 的可执行文件。
-  # Windows 用 msvc 目标（runner 自带 VS Build Tools，rusqlite bundled 能直接编 sqlite3.c）；
-  # Linux 产物仅用于验证代码可移植性，桌面使用以 Windows 版为准。
+  # 第 2 关：编译 release profile 的可执行文件。
+  # Windows 用 msvc 目标（runner 自带 VS Build Tools，rusqlite bundled 能直接编 sqlite3.c）。
+  # 【临时调整】Linux 产物暂停构建，只保留 Windows 版；matrix 结构刻意保留，
+  # 恢复时只需把下面 include 里的 ubuntu-latest 一项加回来，并恢复「安装 Linux 图形依赖」步骤。
   # ---------------------------------------------------------------------------
   build:
     name: build (${{ matrix.artifact }})
@@ -72,24 +73,9 @@ jobs:
           - os: windows-latest
             artifact: ctp-windows-x64
             bin: ctp-gui.exe
-          - os: ubuntu-latest
-            artifact: ctp-linux-x86_64
-            bin: ctp-gui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: 安装 Linux 图形依赖
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev \
-            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -114,7 +100,7 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 第 3 关：只有打 v* 标签才发布。把两个平台的产物下载下来，
+  # 第 3 关：只有打 v* 标签才发布。把产物下载下来，
   # 生成 SHA256SUMS.txt 一并挂到 Release，便于分发时校验完整性。
   # ---------------------------------------------------------------------------
   release:
