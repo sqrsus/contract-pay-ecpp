@@ -7,7 +7,7 @@ use ctp_core::money::Money;
 use ctp_core::payment::{PayMethod, Payment, PaymentStatus};
 use ctp_core::project::{Contact, Contractor, Project};
 use ctp_core::rate::Rate;
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 
 fn conv<T>(v: Option<T>, field: &str) -> rusqlite::Result<T> {
     v.ok_or_else(|| {
@@ -729,4 +729,208 @@ pub fn audit_column_violations(conn: &Connection) -> Result<Vec<String>> {
         }
     }
     Ok(bad)
+}
+
+// ---------------------------------------------------------------- 档案查找
+//
+// 新建合同的三个输入框允许「输入任意字符 + 联想」，落库前要把文本解析成
+// 具体档案：先按精确匹配找，找不到再由 service 层自动建档。
+
+/// 按「项目编码 或 项目名称」精确查找（未删除的）。
+pub fn find_project_by_text(conn: &Connection, text: &str) -> Result<Option<Project>> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let sql = "SELECT id, project_code, project_name, remark, is_deleted, version, \
+        created_at, created_by, updated_at, updated_by \
+        FROM prj_project WHERE is_deleted = 0 AND (project_code = ?1 OR project_name = ?1) \
+        ORDER BY project_code LIMIT 1";
+    let p = conn
+        .query_row(sql, [t], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                project_code: row.get(1)?,
+                project_name: row.get(2)?,
+                remark: row.get(3)?,
+                is_deleted: row.get::<_, i64>(4)? != 0,
+                version: row.get(5)?,
+                created_at: row.get(6)?,
+                created_by: row.get(7)?,
+                updated_at: row.get(8)?,
+                updated_by: row.get(9)?,
+            })
+        })
+        .optional()?;
+    Ok(p)
+}
+
+/// 按单位名称精确查找（未删除的）。甲方与承包单位共用这张表，故不区分角色。
+pub fn find_contractor_by_name(conn: &Connection, name: &str) -> Result<Option<Contractor>> {
+    let t = name.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let sql = "SELECT id, contractor_name, role_type, credit_code, bank_name, bank_account, remark, \
+        is_deleted, version, created_at, created_by, updated_at, updated_by \
+        FROM org_contractor WHERE is_deleted = 0 AND contractor_name = ?1 LIMIT 1";
+    let c = conn
+        .query_row(sql, [t], |row| {
+            let role: String = row.get(2)?;
+            Ok(Contractor {
+                id: row.get(0)?,
+                contractor_name: row.get(1)?,
+                role_type: ctp_core::project::ContractorRole::from_code(&role)
+                    .unwrap_or(ctp_core::project::ContractorRole::Other),
+                credit_code: row.get(3)?,
+                bank_name: row.get(4)?,
+                bank_account: row.get(5)?,
+                remark: row.get(6)?,
+                is_deleted: row.get::<_, i64>(7)? != 0,
+                version: row.get(8)?,
+                created_at: row.get(9)?,
+                created_by: row.get(10)?,
+                updated_at: row.get(11)?,
+                updated_by: row.get(12)?,
+            })
+        })
+        .optional()?;
+    Ok(c)
+}
+
+/// 历史合同里出现过的发包人名称（去重）。
+///
+/// 甲方改为可联想输入后，老数据的 `party_a` 没有对应档案，
+/// 用它兜住「以前录过的甲方这次还得能手打出来」的问题。
+pub fn list_party_a_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT party_a FROM ct_contract \
+         WHERE is_deleted = 0 AND length(trim(party_a)) > 0 ORDER BY party_a",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ---------------------------------------------------------------- 合同附件
+
+const ATTACHMENT_COLS: &str = "id, contract_id, att_type, file_name, mime_type, size_bytes, \
+    sha256, remark, created_at, created_by, updated_at, updated_by, version";
+
+fn map_attachment(row: &Row) -> rusqlite::Result<ctp_core::attachment::Attachment> {
+    Ok(ctp_core::attachment::Attachment {
+        id: row.get(0)?,
+        contract_id: row.get(1)?,
+        kind_code: row.get(2)?,
+        file_name: row.get(3)?,
+        mime_type: row.get(4)?,
+        size_bytes: row.get(5)?,
+        sha256: row.get(6)?,
+        remark: row.get(7)?,
+        created_at: row.get(8)?,
+        created_by: row.get(9)?,
+        updated_at: row.get(10)?,
+        updated_by: row.get(11)?,
+        version: row.get(12)?,
+    })
+}
+
+/// 某合同的附件元数据（不含字节），按类别顺序返回。
+pub fn list_attachments(
+    conn: &Connection,
+    contract_id: &str,
+) -> Result<Vec<ctp_core::attachment::Attachment>> {
+    let sql = format!(
+        "SELECT {ATTACHMENT_COLS} FROM ct_contract_attachment WHERE contract_id = ?1 \
+         ORDER BY CASE att_type WHEN 'BID_NOTICE' THEN 1 WHEN 'CONTRACT' THEN 2 \
+         WHEN 'PROGRESS_SETTLEMENT' THEN 3 ELSE 4 END"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([contract_id], map_attachment)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// 写入或替换某类附件。`(contract_id, att_type)` 唯一，冲突即覆盖。
+pub fn upsert_attachment(
+    conn: &Connection,
+    a: &ctp_core::attachment::Attachment,
+    content: &[u8],
+) -> Result<()> {
+    let size = content.len() as i64;
+    if size <= 0 {
+        return Err(StoreError::Inconsistent("附件内容为空".into()));
+    }
+    if size > ctp_core::attachment::MAX_ATTACHMENT_BYTES {
+        return Err(StoreError::Inconsistent(format!(
+            "附件超过 {} MB 上限",
+            ctp_core::attachment::MAX_ATTACHMENT_BYTES / 1024 / 1024
+        )));
+    }
+    conn.execute(
+        "INSERT INTO ct_contract_attachment \
+            (id, contract_id, att_type, file_name, mime_type, size_bytes, sha256, content, \
+             remark, created_at, created_by, updated_at, updated_by, version) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?10,?11,1) \
+         ON CONFLICT(contract_id, att_type) DO UPDATE SET \
+            file_name = excluded.file_name, mime_type = excluded.mime_type, \
+            size_bytes = excluded.size_bytes, sha256 = excluded.sha256, \
+            content = excluded.content, remark = excluded.remark, \
+            updated_at = excluded.updated_at, updated_by = excluded.updated_by, \
+            version = ct_contract_attachment.version + 1",
+        rusqlite::params![
+            a.id,
+            a.contract_id,
+            a.kind_code,
+            a.file_name,
+            a.mime_type,
+            size,
+            a.sha256,
+            content,
+            a.remark,
+            a.updated_at,
+            a.updated_by
+        ],
+    )?;
+    Ok(())
+}
+
+/// 取附件字节（打开 / 另存时用）。调用方需自行控制内存，单文件上限 50 MB。
+pub fn attachment_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT content FROM ct_contract_attachment WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    bytes.ok_or_else(|| StoreError::Inconsistent(format!("附件 {id} 不存在")))
+}
+
+/// 删除一条附件；返回是否真的删掉了。
+pub fn delete_attachment(conn: &Connection, id: &str) -> Result<bool> {
+    let n = conn.execute("DELETE FROM ct_contract_attachment WHERE id = ?1", [id])?;
+    Ok(n > 0)
+}
+
+/// 该合同是否已上传某一类附件。
+pub fn has_attachment(
+    conn: &Connection,
+    contract_id: &str,
+    kind_code: &str,
+) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ct_contract_attachment WHERE contract_id = ?1 AND att_type = ?2",
+        rusqlite::params![contract_id, kind_code],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// 附件数量（详情卡的「附件 n/4」用）。
+pub fn attachment_count(conn: &Connection, contract_id: &str) -> Result<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ct_contract_attachment WHERE contract_id = ?1",
+        [contract_id],
+        |r| r.get(0),
+    )?;
+    Ok(n)
 }

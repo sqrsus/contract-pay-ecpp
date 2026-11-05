@@ -43,6 +43,9 @@ pub enum DomainError {
     #[error("单据状态 {0} 不允许该操作")]
     IllegalState(String),
 
+    #[error("合同附件缺失：{0}（合同正本为必传项，补齐后才能生效）")]
+    AttachmentRequired(&'static str),
+
     #[error("口径违例：{0}")]
     Invariant(String),
 }

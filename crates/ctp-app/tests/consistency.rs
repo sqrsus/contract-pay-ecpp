@@ -13,6 +13,7 @@
 //! | `业务表审计列齐全` | M4 / DB-06 |
 
 use ctp_app::service::{self, NewContract, NewPayment};
+use ctp_core::attachment::AttachmentKind;
 use ctp_core::contract::ContractStatus;
 use ctp_core::error::DomainError;
 use ctp_core::money::Money;
@@ -83,8 +84,23 @@ fn fixture(amount_yuan: i64) -> (Connection, String) {
         "t",
     )
     .unwrap();
+    attach_contract(&conn, &c.id);
     service::activate_contract(&mut conn, &c.id, "t").unwrap();
     (conn, c.id)
+}
+
+/// 补一份「合同正本」附件：生效校验要求它必须在位。
+fn attach_contract(conn: &Connection, contract_id: &str) {
+    service::save_attachment(
+        conn,
+        contract_id,
+        ctp_core::attachment::AttachmentKind::Contract,
+        "合同正本.pdf",
+        Some("application/pdf"),
+        b"%PDF-1.4 test",
+        "t",
+    )
+    .unwrap();
 }
 
 fn pay(conn: &mut Connection, contract_id: &str, yuan: i64) -> ctp_store::Result<ctp_core::payment::Payment> {
@@ -301,17 +317,25 @@ fn 新建合同先草稿再生效后才能拨款() {
         Some(DomainError::ContractNotPayable(_))
     ));
 
-    // 2) 生效后可付
+    // 2) 没有合同附件时不允许生效（合同正本为必传项）
+    let err = service::activate_contract(&mut conn, &c.id, "t").unwrap_err();
+    assert!(matches!(
+        err.domain(),
+        Some(DomainError::AttachmentRequired(_))
+    ));
+
+    // 3) 补齐合同附件后可生效
+    attach_contract(&conn, &c.id);
     let a = service::activate_contract(&mut conn, &c.id, "t").unwrap();
     assert_eq!(a.status, ContractStatus::Active);
     assert!(a.is_payable());
 
-    // 3) 首笔拨款把「生效」推进到「履行中」
+    // 4) 首笔拨款把「生效」推进到「履行中」
     pay(&mut conn, &c.id, 100).unwrap();
     let after = repo::get_contract(&conn, &c.id).unwrap();
     assert_eq!(after.status, ContractStatus::Performing);
 
-    // 4) 已是履行中，重复生效被状态机拒绝
+    // 5) 已是履行中，重复生效被状态机拒绝
     assert!(service::activate_contract(&mut conn, &c.id, "t").is_err());
 }
 
@@ -425,3 +449,175 @@ fn 合同必填项与字典校验生效() {
     .unwrap_err();
     assert!(matches!(err.domain(), Some(DomainError::InvalidDict(_))));
 }
+
+// ---------------------------------------------------------------- 附件与自动建档
+
+#[test]
+fn 名称输入自动建档_同名复用不重复() {
+    let mut conn = db::open_in_memory().unwrap();
+    db::migrate(&mut conn).unwrap();
+    ctp_store::seed::seed_reference(&conn, "t").unwrap();
+    // 刻意不插任何项目与单位：完全靠输入框文本建档
+
+    let mk = |name: &str, date: &str| NewContract {
+        project_text: Some("新建市政道路工程".into()),
+        contractor_text: Some("某某建工集团有限公司".into()),
+        party_a: "某某市城建局".into(),
+        contract_name: name.into(),
+        contract_category_code: "GC".into(),
+        sign_date: date.into(),
+        original_amount: Money::from_cent(100_000),
+        payment_terms: "月结".into(),
+        ..Default::default()
+    };
+
+    let c = service::create_contract(&mut conn, mk("自动建档一", "2026-03-01"), "t").unwrap();
+    assert_eq!(c.project_id.len() > 0, true);
+
+    let projects = repo::list_projects(&conn).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert!(projects[0].project_code.starts_with("PRJ-"));
+    assert_eq!(projects[0].project_name, "新建市政道路工程");
+
+    let orgs = repo::list_contractors(&conn).unwrap();
+    assert_eq!(orgs.len(), 2, "承包单位 + 甲方各一条");
+    let owner = orgs
+        .iter()
+        .find(|x| x.contractor_name == "某某市城建局")
+        .unwrap();
+    assert_eq!(owner.role_type, ContractorRole::Owner);
+    let builder = orgs
+        .iter()
+        .find(|x| x.contractor_name == "某某建工集团有限公司")
+        .unwrap();
+    assert_eq!(builder.role_type, ContractorRole::Construct);
+
+    // 第二份合同用同样三个名称：全部复用，不新增档案
+    service::create_contract(&mut conn, mk("自动建档二", "2026-04-01"), "t").unwrap();
+    assert_eq!(repo::list_projects(&conn).unwrap().len(), 1);
+    assert_eq!(repo::list_contractors(&conn).unwrap().len(), 2);
+}
+
+#[test]
+fn 附件每类一份_替换即覆盖且可删除() {
+    let mut conn = db::open_in_memory().unwrap();
+    db::migrate(&mut conn).unwrap();
+    ctp_store::seed::seed_reference(&conn, "t").unwrap();
+    project_and_org(&conn);
+    let c = service::create_contract(
+        &mut conn,
+        NewContract {
+            project_id: "PJ-1".into(),
+            contract_name: "附件测试".into(),
+            contract_category_code: "GC".into(),
+            party_a: "某建设单位".into(),
+            contractor_id: "ORG-1".into(),
+            sign_date: "2026-01-10".into(),
+            original_amount: Money::from_cent(100_000),
+            payment_terms: "月结".into(),
+            ..Default::default()
+        },
+        "t",
+    )
+    .unwrap();
+
+    // 没附件不能生效
+    assert!(service::activate_contract(&mut conn, &c.id, "t").is_err());
+
+    service::save_attachment(
+        &conn,
+        &c.id,
+        AttachmentKind::Contract,
+        "合同正本.pdf",
+        Some("application/pdf"),
+        b"PDF-1",
+        "t",
+    )
+    .unwrap();
+    service::save_attachment(
+        &conn,
+        &c.id,
+        AttachmentKind::BidNotice,
+        "中标通知书.pdf",
+        None,
+        b"BID",
+        "t",
+    )
+    .unwrap();
+    assert_eq!(service::list_attachments(&conn, &c.id).unwrap().len(), 2);
+
+    // 同类再传：覆盖而不是新增
+    service::save_attachment(
+        &conn,
+        &c.id,
+        AttachmentKind::Contract,
+        "合同正本-v2.pdf",
+        None,
+        b"PDF-2-longer",
+        "t",
+    )
+    .unwrap();
+    let list = service::list_attachments(&conn, &c.id).unwrap();
+    assert_eq!(list.len(), 2, "同类仍是两条中的一条");
+    let con = list.iter().find(|a| a.kind_code == "CONTRACT").unwrap();
+    assert_eq!(con.file_name, "合同正本-v2.pdf");
+    assert_eq!(con.size_bytes, 12);
+    assert_eq!(service::attachment_bytes(&conn, &con.id).unwrap(), b"PDF-2-longer");
+
+    // 合同正本在位后可生效
+    service::activate_contract(&mut conn, &c.id, "t").unwrap();
+
+    // 删除后计数下降
+    service::delete_attachment(&conn, &con.id, "t").unwrap();
+    assert_eq!(service::list_attachments(&conn, &c.id).unwrap().len(), 1);
+}
+
+#[test]
+fn 附件空文件与超限被拒() {
+    let mut conn = db::open_in_memory().unwrap();
+    db::migrate(&mut conn).unwrap();
+    ctp_store::seed::seed_reference(&conn, "t").unwrap();
+    project_and_org(&conn);
+    let c = service::create_contract(
+        &mut conn,
+        NewContract {
+            project_id: "PJ-1".into(),
+            contract_name: "附件边界".into(),
+            contract_category_code: "GC".into(),
+            party_a: "某建设单位".into(),
+            contractor_id: "ORG-1".into(),
+            sign_date: "2026-01-10".into(),
+            original_amount: Money::from_cent(100_000),
+            payment_terms: "月结".into(),
+            ..Default::default()
+        },
+        "t",
+    )
+    .unwrap();
+
+    let empty = service::save_attachment(
+        &conn,
+        &c.id,
+        AttachmentKind::Contract,
+        "空.pdf",
+        None,
+        b"",
+        "t",
+    )
+    .unwrap_err();
+    assert!(empty.to_string().contains("为空"));
+
+    let over = vec![0u8; (ctp_core::attachment::MAX_ATTACHMENT_BYTES + 1) as usize];
+    let err = service::save_attachment(
+        &conn,
+        &c.id,
+        AttachmentKind::Contract,
+        "超大.pdf",
+        None,
+        &over,
+        "t",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("上限"));
+}
+

@@ -16,6 +16,8 @@ enum Act {
     Amount,
     Void,
     ToPayments(String),
+    /// 打开附件管理弹窗
+    Attachments,
 }
 
 const STATUSES: [ContractStatus; 6] = [
@@ -306,6 +308,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
         }
+        Some(Act::Attachments) => {
+            if let Some(id) = app.selected.clone() {
+                app.open_attachments(&id);
+            }
+        }
         Some(Act::Audit) => {
             if let Some(s) = app.selected_summary() {
                 app.audit_form.amount = if s.is_audited {
@@ -364,14 +371,18 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                     .unwrap_or_else(|| s.status.clone()),
                 tone,
             );
-            // 草稿的唯一主行动放标题行，避免底部按钮挤成两行把卡片撑高
-            if is_draft {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::primary_button_sm(ui, &p, "设为生效").clicked() {
-                        *action = Some(Act::Activate);
-                    }
-                });
-            }
+            // 标题行右侧放「设为生效 / 作废」：前者是草稿态主行动，
+            // 后者是低频危险操作，都不占底部操作区，避免按钮换行把卡片撑高
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if s.status != "VOID"
+                    && widgets::danger_button_sm(ui, &p, "作废").clicked()
+                {
+                    *action = Some(Act::Void);
+                }
+                if is_draft && widgets::primary_button_sm(ui, &p, "设为生效").clicked() {
+                    *action = Some(Act::Activate);
+                }
+            });
         });
         ui.label(RichText::new(&s.contract_name).size(12.5).color(p.text_muted));
         ui.add_space(8.0);
@@ -444,7 +455,17 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
         widgets::divider(ui, &p);
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+            let att_label = format!("附件 {}/4", app.att_count.clamp(0, 4));
+            let att_btn = widgets::ghost_button_sm(ui, &p, &att_label);
+            let att_btn = if app.att_count == 0 {
+                att_btn.on_hover_text("四类附件均未上传；合同正本为必传项")
+            } else {
+                att_btn.on_hover_text("查看 / 上传 / 替换 / 另存附件")
+            };
+            if att_btn.clicked() {
+                *action = Some(Act::Attachments);
+            }
             if widgets::ghost_button_sm(ui, &p, "登记审计价").clicked() {
                 *action = Some(Act::Audit);
             }
@@ -460,9 +481,14 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
             if pay.clicked() && can_pay {
                 *action = Some(Act::ToPayments(s.contract_id.clone()));
             }
-            if s.status != "VOID" && widgets::danger_button_sm(ui, &p, "作废").clicked() {
-                *action = Some(Act::Void);
-            }
         });
+        if is_draft {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("草稿不可登记拨款；点标题行「设为生效」即可，生效要求合同附件已在位。")
+                    .size(10.5)
+                    .color(p.text_muted),
+            );
+        }
     });
 }

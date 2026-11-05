@@ -35,6 +35,8 @@ fn configure(conn: &Connection) -> Result<()> {
 
 /// 建表 + 建索引 + 建视图，全部在一个事务内完成；重复执行幂等。
 pub fn migrate(conn: &mut Connection) -> Result<()> {
+    // 角色枚举扩展要在建表之前做：老库的 CHECK 不含 OWNER，只能重建表。
+    migrate_contractor_role(conn)?;
     {
         let tx = conn.transaction()?;
         for (_, sql) in schema::table_statements() {
@@ -57,6 +59,72 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 
 pub fn schema_version(conn: &Connection) -> Result<Option<String>> {
     get_meta(conn, "schema_version")
+}
+
+/// 把 `org_contractor.role_type` 的 CHECK 扩到含 `OWNER`。
+///
+/// SQLite 无法修改已有 CHECK 约束，只能「建新表 → 搬数据 → 换名」。
+/// 因为 `ct_contract.contractor_id` 引用本表，重建时必须临时关闭外键
+/// （`PRAGMA foreign_keys` 在事务内不生效，故放在事务外切换）。
+/// 已是新结构（新库或已迁移）时直接返回，保证幂等。
+fn migrate_contractor_role(conn: &mut Connection) -> Result<()> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'org_contractor'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(ddl) = existing else {
+        // 新库：表还不存在，后面建表语句直接就是新结构
+        return Ok(());
+    };
+    if ddl.contains("'OWNER'") {
+        return Ok(());
+    }
+
+    // 复用同一份建表语句，只把表名换掉，避免两处 DDL 漂移
+    let create = schema::table_statements()
+        .into_iter()
+        .find(|(name, _)| *name == "org_contractor")
+        .map(|(_, sql)| {
+            sql.replace(
+                "CREATE TABLE IF NOT EXISTS org_contractor",
+                "CREATE TABLE org_contractor_migrated",
+            )
+        })
+        .unwrap_or_default();
+    if create.trim().is_empty() {
+        return Ok(());
+    }
+
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let outcome = (|| -> Result<()> {
+        let views = schema::view_statements();
+        let tx = conn.transaction()?;
+        // 视图引用 org_contractor：不先摘掉，DROP TABLE 会让 SQLite 判定 schema 损坏
+        for (name, _) in &views {
+            tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
+        }
+        tx.execute_batch(&create)?;
+        tx.execute_batch(
+            "INSERT INTO org_contractor_migrated \
+                (id, contractor_name, role_type, credit_code, bank_name, bank_account, \
+                 remark, is_deleted, created_at, created_by, updated_at, updated_by, version) \
+             SELECT id, contractor_name, role_type, credit_code, bank_name, bank_account, \
+                 remark, is_deleted, created_at, created_by, updated_at, updated_by, version \
+             FROM org_contractor;
+             DROP TABLE org_contractor;
+             ALTER TABLE org_contractor_migrated RENAME TO org_contractor;",
+        )?;
+        for (_, sql) in &views {
+            tx.execute_batch(sql)?;
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    outcome
 }
 
 pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {

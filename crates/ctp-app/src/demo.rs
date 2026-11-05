@@ -1,4 +1,5 @@
 use crate::service::{self, NewContract, NewPayment};
+use ctp_core::attachment::AttachmentKind;
 use ctp_core::date::today_iso;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
@@ -8,6 +9,46 @@ use rusqlite::Connection;
 
 fn yuan(v: i64) -> Money {
     Money::from_cent(v * 100)
+}
+
+/// 演示附件。真实项目当然是扫描件，这里落一段可读文本占位，
+/// 目的是让「附件 3/4」「生效前必须齐备」这些链路在演示库里真的能走通。
+fn seed_attachments(
+    conn: &Connection,
+    contract_id: &str,
+    operator: &str,
+    with_audit: bool,
+) -> Result<()> {
+    let items: &[(AttachmentKind, &str)] = &[
+        (AttachmentKind::Contract, "合同正本"),
+        (AttachmentKind::BidNotice, "中标通知书"),
+    ];
+    for (kind, title) in items {
+        let body = format!("演示占位件：{title}\n本文件由演示数据生成，仅用于验证附件链路。");
+        let name = format!("{title}.txt");
+        service::save_attachment(
+            conn,
+            contract_id,
+            *kind,
+            &name,
+            Some("text/plain"),
+            body.as_bytes(),
+            operator,
+        )?;
+    }
+    if with_audit {
+        let body = "演示占位件：审计报告\n本文件由演示数据生成，仅用于验证附件链路。";
+        service::save_attachment(
+            conn,
+            contract_id,
+            AttachmentKind::AuditReport,
+            "审计报告.txt",
+            Some("text/plain"),
+            body.as_bytes(),
+            operator,
+        )?;
+    }
+    Ok(())
 }
 
 /// 演示数据：覆盖「未审定 / 已审定 / 已作废一笔」三种典型形态，
@@ -125,6 +166,7 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
         },
         operator,
     )?;
+    seed_attachments(conn, &c1.id, operator, false)?;
     service::activate_contract(conn, &c1.id, operator)?;
 
     let mut p = NewPayment::new(&c1.id, yuan(1_000_000), "2026-03-31");
@@ -156,6 +198,7 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
         },
         operator,
     )?;
+    seed_attachments(conn, &c2.id, operator, true)?;
     service::activate_contract(conn, &c2.id, operator)?;
     service::register_audit_price(
         conn,
@@ -190,6 +233,7 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
         },
         operator,
     )?;
+    seed_attachments(conn, &c3.id, operator, false)?;
     service::activate_contract(conn, &c3.id, operator)?;
     let mut p = NewPayment::new(&c3.id, yuan(200_000), "2026-05-31");
     p.reason = Some("首批供货（金额录错，稍后作废重登）".into());

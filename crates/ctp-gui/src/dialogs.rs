@@ -7,11 +7,13 @@ use crate::theme::Palette;
 use crate::widgets::{self, Tone};
 use crate::App;
 use ctp_app::service::{self, NewContract, NewPayment};
+use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::ContractType;
 use ctp_core::date::{is_iso_date, today_iso};
 use ctp_core::dict;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
+use ctp_core::project::ContractorRole;
 use ctp_core::rate::Rate;
 use eframe::egui::{self, RichText};
 
@@ -22,18 +24,45 @@ pub enum Dialog {
     AuditPrice,
     EditAmount,
     PaymentDetail,
+    /// 合同附件管理（从合同详情卡的「附件 n/4」进来）
+    Attachments,
 }
 
-/// 新建合同表单。
+/// 新建时暂存于内存的附件。点「保存合同」才随合同一起落库，
+/// 避免合同保存失败时在库里留下孤儿附件。
+pub struct PendingAttachment {
+    pub kind: AttachmentKind,
+    pub file_name: String,
+    pub mime: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl PendingAttachment {
+    pub fn size_label(&self) -> String {
+        let n = self.bytes.len();
+        if n < 1024 {
+            format!("{n} B")
+        } else if n < 1024 * 1024 {
+            format!("{:.0} KB", n as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+        }
+    }
+}
+
+/// 新建合同表单（两步：基本信息 → 附件）。
 pub struct ContractForm {
+    /// 0 = 基本信息，1 = 附件
+    pub step: usize,
     pub name: String,
-    pub project_idx: usize,
-    pub contractor_idx: usize,
+    /// 所属项目：可输入项目编码或名称
+    pub project_text: String,
+    /// 承包单位：可输入任意名称
+    pub contractor_text: String,
+    /// 发包人（甲方）：可输入任意名称
+    pub party_a: String,
     pub ctype_idx: usize,
     pub category_idx: usize,
-    /// 0 = 不分类，其余对应 `ACCOUNTING_CATEGORIES[i-1]`
-    pub acc_idx: usize,
-    pub party_a: String,
     pub sign_date: String,
     pub amount: String,
     pub duration: String,
@@ -46,18 +75,20 @@ pub struct ContractForm {
     pub remark: String,
     /// 保存后立即置为「生效」，否则存为草稿。
     pub activate: bool,
+    /// 四类附件，每类至多一条
+    pub attachments: Vec<PendingAttachment>,
 }
 
 impl Default for ContractForm {
     fn default() -> Self {
         Self {
+            step: 0,
             name: String::new(),
-            project_idx: 0,
-            contractor_idx: 0,
+            project_text: String::new(),
+            contractor_text: String::new(),
+            party_a: String::new(),
             ctype_idx: 0,
             category_idx: 0,
-            acc_idx: 0,
-            party_a: String::new(),
             sign_date: today_iso(),
             amount: String::new(),
             duration: String::new(),
@@ -69,7 +100,18 @@ impl Default for ContractForm {
             terms: "按月计量支付，进度款支付至已完工程量的 80%，竣工验收后支付至 97%，质保金 3% 满一年退还。".into(),
             remark: String::new(),
             activate: true,
+            attachments: Vec::new(),
         }
+    }
+}
+
+impl ContractForm {
+    pub fn attachment(&self, kind: AttachmentKind) -> Option<&PendingAttachment> {
+        self.attachments.iter().find(|a| a.kind == kind)
+    }
+
+    pub fn has_contract_copy(&self) -> bool {
+        self.attachment(AttachmentKind::Contract).is_some()
     }
 }
 
@@ -205,6 +247,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::AuditPrice => audit_price(app, ctx),
         Dialog::EditAmount => edit_amount(app, ctx),
         Dialog::PaymentDetail => payment_detail(app, ctx),
+        Dialog::Attachments => attachments(app, ctx),
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
@@ -213,21 +256,149 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
 // ---------------------------------------------------------------- 新建合同
 
+/// MIME 粗映射：只用于给附件加个类型标注，判断不出来不影响存储。
+fn mime_of(file_name: &str) -> Option<&'static str> {
+    let ext = file_name.rsplit('.').next()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "txt" => "text/plain",
+        _ => return None,
+    })
+}
+
+/// 弹系统文件对话框，把文件读进内存；超过 50 MB 直接拒绝。
+fn pick_attachment(kind: AttachmentKind) -> Result<PendingAttachment, String> {
+    let path = rfd::FileDialog::new()
+        .set_title(format!("选择{}", kind.label()))
+        .add_filter(
+            "常见附件",
+            &["pdf", "doc", "docx", "xls", "xlsx", "jpg", "jpeg", "png", "txt"],
+        )
+        .add_filter("全部文件", &["*"])
+        .pick_file()
+        .ok_or_else(|| "已取消选择".to_string())?;
+
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件信息失败：{e}"))?;
+    let max = ctp_core::attachment::MAX_ATTACHMENT_BYTES;
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "附件".to_string());
+    if meta.len() as i64 > max {
+        return Err(format!(
+            "「{file_name}」{:.1} MB，超过 {} MB 上限",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            max / 1024 / 1024
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败：{e}"))?;
+    if bytes.is_empty() {
+        return Err(format!("「{file_name}」内容为空"));
+    }
+    Ok(PendingAttachment {
+        kind,
+        mime: mime_of(&file_name).map(|s| s.to_string()),
+        file_name,
+        bytes,
+    })
+}
+
+/// 步骤胶囊：「1 基本信息 → 2 附件」。
+fn step_chip(ui: &mut egui::Ui, p: &Palette, no: u32, label: &str, active: bool) {
+    let (fg, bg) = if active {
+        Tone::Primary.colors(p)
+    } else {
+        Tone::Neutral.colors(p)
+    };
+    egui::Frame::none()
+        .fill(bg)
+        .rounding(egui::Rounding::same(20.0))
+        .inner_margin(egui::Margin::symmetric(11.0, 4.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{no} {label}"))
+                    .size(12.0)
+                    .color(fg),
+            );
+        });
+}
+
+/// 带字段标签的联想输入框。
+fn ac_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    id: &str,
+    text: &mut String,
+    hints: &[String],
+    hint_text: &str,
+    w: f32,
+) -> Option<String> {
+    ui.vertical(|ui| {
+        widgets::field_label(ui, p, label);
+        widgets::autocomplete(ui, id, p, text, hints, w, hint_text)
+    })
+    .inner
+}
+
 fn new_contract(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
-    let mut submit = false;
-    let mut cancel = false;
 
-    let projects: Vec<(String, String)> = app
+    // 候选先克隆出来：闭包里要可变借用 `app.new_contract`，不能再读 `app.projects`
+    let project_hints: Vec<String> = app
         .projects
         .iter()
-        .map(|x| (x.id.clone(), format!("{} {}", x.project_code, x.project_name)))
+        .map(|x| format!("{} {}", x.project_code, x.project_name))
         .collect();
-    let contractors: Vec<(String, String)> = app
+    let mut unit_hints: Vec<String> = app
         .contractors
         .iter()
-        .map(|x| (x.id.clone(), x.contractor_name.clone()))
+        .filter(|c| c.role_type != ContractorRole::Owner)
+        .map(|c| c.contractor_name.clone())
         .collect();
+    unit_hints.sort();
+    unit_hints.dedup();
+    let mut owner_hints: Vec<String> = app
+        .contractors
+        .iter()
+        .filter(|c| c.role_type == ContractorRole::Owner)
+        .map(|c| c.contractor_name.clone())
+        .collect();
+    owner_hints.extend(app.party_a_names.iter().cloned());
+    owner_hints.sort();
+    owner_hints.dedup();
+
+    // 第一步的完整性：与保存时的校验共用同一套条件
+    let amount_ok = Money::parse_yuan(&app.new_contract.amount)
+        .map(|m| m.cent() > 0)
+        .unwrap_or(false);
+    let base_ok = !app.new_contract.name.trim().is_empty()
+        && !app.new_contract.project_text.trim().is_empty()
+        && !app.new_contract.contractor_text.trim().is_empty()
+        && !app.new_contract.party_a.trim().is_empty()
+        && amount_ok
+        && is_iso_date(&app.new_contract.sign_date)
+        && !app.new_contract.terms.trim().is_empty();
+
+    let step = app.new_contract.step;
+    let activate = app.new_contract.activate;
+    let has_contract_copy = app.new_contract.has_contract_copy();
+    // 勾了「立即生效」就必须先有合同附件，否则生效那一步必然被业务规则拒掉
+    let can_save = base_ok && (!activate || has_contract_copy);
+
+    let mut submit = false;
+    let mut cancel = false;
+    let mut next = false;
+    let mut back = false;
+    let mut pick: Option<AttachmentKind> = None;
+    let mut remove: Option<AttachmentKind> = None;
+    let mut flash: Option<String> = None;
 
     modal("新建合同", &p)
         .default_width(980.0)
@@ -236,276 +407,431 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
         .show(ctx, |ui| {
             ui.set_width(940.0);
-            ui.label(
-                RichText::new("合同编号按「HT-年份-流水」自动生成；带 * 为必填。")
-                    .size(12.0)
-                    .color(p.text_muted),
-            );
-            ui.add_space(10.0);
-
-            // 左栏基础字段、右栏长文本：整体压在 600px 高以内，不需要滚动
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(612.0, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::Grid::new("ct_form")
-                            .num_columns(2)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                            field(ui, &p, "* 合同名称", 300.0, &mut app.new_contract.name);
-                            field(ui, &p, "发包人（甲方）", 300.0, &mut app.new_contract.party_a);
-                            ui.end_row();
-
-                            ui.vertical(|ui| {
-                                widgets::field_label(ui, &p, "* 所属项目");
-                                combo(
-                                    ui,
-                                    "project",
-                                    300.0,
-                                    app.new_contract.project_idx,
-                                    projects.iter().map(|x| x.1.clone()).collect(),
-                                    &mut app.new_contract.project_idx,
-                                );
-                            });
-                            ui.vertical(|ui| {
-                                widgets::field_label(ui, &p, "* 承包单位");
-                                combo(
-                                    ui,
-                                    "contractor",
-                                    300.0,
-                                    app.new_contract.contractor_idx,
-                                    contractors.iter().map(|x| x.1.clone()).collect(),
-                                    &mut app.new_contract.contractor_idx,
-                                );
-                            });
-                            ui.end_row();
-
-                            ui.vertical(|ui| {
-                                widgets::field_label(ui, &p, "合同类型");
-                                let labels: Vec<String> =
-                                    CONTRACT_TYPES.iter().map(|t| t.label().to_string()).collect();
-                                combo(
-                                    ui,
-                                    "ctype",
-                                    300.0,
-                                    app.new_contract.ctype_idx,
-                                    labels,
-                                    &mut app.new_contract.ctype_idx,
-                                );
-                            });
-                            ui.vertical(|ui| {
-                                widgets::field_label(ui, &p, "* 合同类别");
-                                let labels: Vec<String> = dict::CONTRACT_CATEGORIES
-                                    .iter()
-                                    .map(|(_, n)| n.to_string())
-                                    .collect();
-                                combo(
-                                    ui,
-                                    "category",
-                                    300.0,
-                                    app.new_contract.category_idx,
-                                    labels,
-                                    &mut app.new_contract.category_idx,
-                                );
-                            });
-                            ui.end_row();
-
-                            ui.vertical(|ui| {
-                                widgets::field_label(ui, &p, "会计分类");
-                                let mut labels = vec!["（不分类）".to_string()];
-                                labels.extend(
-                                    dict::ACCOUNTING_CATEGORIES
-                                        .iter()
-                                        .map(|(c, n)| format!("{c} {n}")),
-                                );
-                                combo(
-                                    ui,
-                                    "acc",
-                                    300.0,
-                                    app.new_contract.acc_idx,
-                                    labels,
-                                    &mut app.new_contract.acc_idx,
-                                );
-                            });
-                            field(
-                                ui,
-                                &p,
-                                "* 签订日期（YYYY-MM-DD）",
-                                300.0,
-                                &mut app.new_contract.sign_date,
-                            );
-                            ui.end_row();
-
-                            field(ui, &p, "* 合同金额（元）", 300.0, &mut app.new_contract.amount);
-                            field(ui, &p, "工期（日历天）", 300.0, &mut app.new_contract.duration);
-                            ui.end_row();
-
-                            field(
-                                ui,
-                                &p,
-                                "计划开工（YYYY-MM-DD）",
-                                300.0,
-                                &mut app.new_contract.planned_start,
-                            );
-                            field(
-                                ui,
-                                &p,
-                                "计划竣工（YYYY-MM-DD）",
-                                300.0,
-                                &mut app.new_contract.planned_end,
-                            );
-                            ui.end_row();
-
-                            ui.vertical(|ui| {
-                                widgets::field_label(ui, &p, "计价方式");
-                                let labels: Vec<String> =
-                                    PRICING.iter().map(|x| x.to_string()).collect();
-                                combo(
-                                    ui,
-                                    "pricing",
-                                    300.0,
-                                    app.new_contract.pricing_idx,
-                                    labels,
-                                    &mut app.new_contract.pricing_idx,
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                field(ui, &p, "质保金率 %", 138.0, &mut app.new_contract.retention);
-                                field(ui, &p, "预付款率 %", 138.0, &mut app.new_contract.advance);
-                            });
-                            ui.end_row();
-                        });
-                    },
-                );
-
-                ui.add_space(16.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(300.0, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        widgets::field_label(ui, &p, "* 付款条款");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut app.new_contract.terms)
-                                .desired_rows(9)
-                                .desired_width(300.0)
-                                .margin(egui::Margin::symmetric(8.0, 6.0)),
-                        );
-                        ui.add_space(8.0);
-                        widgets::field_label(ui, &p, "备注");
-                        ui.add(
-                            egui::TextEdit::multiline(&mut app.new_contract.remark)
-                                .desired_rows(7)
-                                .desired_width(300.0)
-                                .margin(egui::Margin::symmetric(8.0, 6.0)),
-                        );
-                    },
-                );
-            });
-
-            // 校验
-            let amount_ok = Money::parse_yuan(&app.new_contract.amount)
-                .map(|m| m.cent() > 0)
-                .unwrap_or(false);
-            let name_ok = !app.new_contract.name.trim().is_empty();
-            let terms_ok = !app.new_contract.terms.trim().is_empty();
-            let date_ok = is_iso_date(&app.new_contract.sign_date);
-            let base_ok = !projects.is_empty() && !contractors.is_empty();
-            let ok = amount_ok && name_ok && terms_ok && date_ok && base_ok;
-
-            ui.add_space(12.0);
-            if !base_ok {
-                ui.label(
-                    RichText::new("缺少项目或参建单位：请先在「总览」页载入演示数据。")
-                        .size(12.0)
-                        .color(p.warn),
-                );
-                ui.add_space(6.0);
-            }
             ui.horizontal(|ui| {
-                if widgets::primary_button(ui, &p, "保存合同", ok).clicked() && ok {
-                    submit = true;
-                }
-                if widgets::ghost_button(ui, &p, "取消").clicked() {
-                    cancel = true;
-                }
-                ui.add_space(10.0);
-                ui.scope(|ui| {
-                    ui.style_mut().visuals.selection.bg_fill = p.primary;
-                    ui.checkbox(
-                        &mut app.new_contract.activate,
-                        RichText::new("保存后立即生效（可直接拨款）").size(12.5).color(p.text),
-                    )
-                    .on_hover_text("不勾选则保存为草稿，需在合同详情卡点「设为生效」后才能登记拨款");
+                step_chip(ui, &p, 1, "基本信息", step == 0);
+                ui.label(RichText::new("→").size(12.0).color(p.text_muted));
+                step_chip(ui, &p, 2, "附件", step == 1);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("合同编号按「HT-年份-流水」自动生成；带 * 为必填")
+                            .size(11.5)
+                            .color(p.text_muted),
+                    );
                 });
             });
-            if !ok {
-                ui.add_space(4.0);
+            ui.add_space(12.0);
+
+            if step == 0 {
+                // ---------------- 第一步：基本信息（左栏字段 / 右栏长文本）
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(612.0, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::Grid::new("ct_form")
+                                .num_columns(2)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    field(ui, &p, "* 合同名称", 300.0, &mut app.new_contract.name);
+                                    ac_field(
+                                        ui,
+                                        &p,
+                                        "* 发包人（甲方）",
+                                        "party_a",
+                                        &mut app.new_contract.party_a,
+                                        &owner_hints,
+                                        "输入名称，可从已有业主中联想",
+                                        300.0,
+                                    );
+                                    ui.end_row();
+
+                                    ac_field(
+                                        ui,
+                                        &p,
+                                        "* 所属项目",
+                                        "project",
+                                        &mut app.new_contract.project_text,
+                                        &project_hints,
+                                        "输入项目编码或名称",
+                                        300.0,
+                                    );
+                                    ac_field(
+                                        ui,
+                                        &p,
+                                        "* 承包单位",
+                                        "contractor",
+                                        &mut app.new_contract.contractor_text,
+                                        &unit_hints,
+                                        "输入名称，可从已有单位中联想",
+                                        300.0,
+                                    );
+                                    ui.end_row();
+
+                                    ui.vertical(|ui| {
+                                        widgets::field_label(ui, &p, "合同类型");
+                                        let labels: Vec<String> = CONTRACT_TYPES
+                                            .iter()
+                                            .map(|t| t.label().to_string())
+                                            .collect();
+                                        combo(
+                                            ui,
+                                            "ctype",
+                                            300.0,
+                                            app.new_contract.ctype_idx,
+                                            labels,
+                                            &mut app.new_contract.ctype_idx,
+                                        );
+                                    });
+                                    ui.vertical(|ui| {
+                                        widgets::field_label(ui, &p, "* 合同类别");
+                                        let labels: Vec<String> = dict::CONTRACT_CATEGORIES
+                                            .iter()
+                                            .map(|(_, n)| n.to_string())
+                                            .collect();
+                                        combo(
+                                            ui,
+                                            "category",
+                                            300.0,
+                                            app.new_contract.category_idx,
+                                            labels,
+                                            &mut app.new_contract.category_idx,
+                                        );
+                                    });
+                                    ui.end_row();
+
+                                    field(
+                                        ui,
+                                        &p,
+                                        "* 签订日期（YYYY-MM-DD）",
+                                        300.0,
+                                        &mut app.new_contract.sign_date,
+                                    );
+                                    field(
+                                        ui,
+                                        &p,
+                                        "* 合同金额（元）",
+                                        300.0,
+                                        &mut app.new_contract.amount,
+                                    );
+                                    ui.end_row();
+
+                                    field(
+                                        ui,
+                                        &p,
+                                        "工期（日历天）",
+                                        300.0,
+                                        &mut app.new_contract.duration,
+                                    );
+                                    ui.vertical(|ui| {
+                                        widgets::field_label(ui, &p, "计价方式");
+                                        let labels: Vec<String> =
+                                            PRICING.iter().map(|x| x.to_string()).collect();
+                                        combo(
+                                            ui,
+                                            "pricing",
+                                            300.0,
+                                            app.new_contract.pricing_idx,
+                                            labels,
+                                            &mut app.new_contract.pricing_idx,
+                                        );
+                                    });
+                                    ui.end_row();
+
+                                    field(
+                                        ui,
+                                        &p,
+                                        "计划开工（YYYY-MM-DD）",
+                                        300.0,
+                                        &mut app.new_contract.planned_start,
+                                    );
+                                    field(
+                                        ui,
+                                        &p,
+                                        "计划竣工（YYYY-MM-DD）",
+                                        300.0,
+                                        &mut app.new_contract.planned_end,
+                                    );
+                                    ui.end_row();
+
+                                    ui.horizontal(|ui| {
+                                        field(
+                                            ui,
+                                            &p,
+                                            "质保金率 %",
+                                            138.0,
+                                            &mut app.new_contract.retention,
+                                        );
+                                        field(
+                                            ui,
+                                            &p,
+                                            "预付款率 %",
+                                            138.0,
+                                            &mut app.new_contract.advance,
+                                        );
+                                    });
+                                    ui.label("");
+                                    ui.end_row();
+                                });
+                        },
+                    );
+
+                    ui.add_space(16.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(300.0, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            widgets::field_label(ui, &p, "* 付款条款");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut app.new_contract.terms)
+                                    .desired_rows(9)
+                                    .desired_width(300.0)
+                                    .margin(egui::Margin::symmetric(8.0, 6.0)),
+                            );
+                            ui.add_space(8.0);
+                            widgets::field_label(ui, &p, "备注");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut app.new_contract.remark)
+                                    .desired_rows(7)
+                                    .desired_width(300.0)
+                                    .margin(egui::Margin::symmetric(8.0, 6.0)),
+                            );
+                        },
+                    );
+                });
+
+                ui.add_space(10.0);
                 ui.label(
-                    RichText::new("请补全必填项并检查金额与日期格式")
-                        .size(11.5)
-                        .color(p.text_muted),
+                    RichText::new(
+                        "所属项目、承包单位、发包人可直接输入新名称：库里没有会自动建档，项目编码自动生成。",
+                    )
+                    .size(11.5)
+                    .color(p.text_muted),
                 );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if widgets::primary_button(ui, &p, "下一步：附件", base_ok).clicked() && base_ok {
+                        next = true;
+                    }
+                    if widgets::ghost_button(ui, &p, "取消").clicked() {
+                        cancel = true;
+                    }
+                    ui.add_space(10.0);
+                    ui.scope(|ui| {
+                        ui.style_mut().visuals.selection.bg_fill = p.primary;
+                        ui.checkbox(
+                            &mut app.new_contract.activate,
+                            RichText::new("保存后立即生效（可直接拨款）")
+                                .size(12.5)
+                                .color(p.text),
+                        )
+                        .on_hover_text("不勾选则保存为草稿，补齐合同附件后可在详情卡点「设为生效」");
+                    });
+                });
+                if !base_ok {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("请补全必填项（名称、项目、单位、甲方、金额、日期、付款条款）")
+                            .size(11.5)
+                            .color(p.text_muted),
+                    );
+                }
+            } else {
+                // ---------------- 第二步：附件（四类分项，每类一份）
+                ui.label(
+                    RichText::new(
+                        "四类附件分项存放，「合同」为必传项，其余三类可选；每类仅一份，重新选择即替换。单份不超过 50 MB。",
+                    )
+                    .size(12.0)
+                    .color(p.text_muted),
+                );
+                ui.add_space(10.0);
+
+                for kind in AttachmentKind::ALL {
+                    let existing = app
+                        .new_contract
+                        .attachment(kind)
+                        .map(|a| (a.file_name.clone(), a.size_label()));
+                    egui::Frame::none()
+                        .fill(p.surface_alt)
+                        .rounding(egui::Rounding::same(9.0))
+                        .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                        .show(ui, |ui| {
+                            ui.set_width(908.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(kind.label()).size(13.0).strong().color(p.text),
+                                );
+                                if kind.is_required() {
+                                    widgets::badge(ui, &p, "必传", Tone::Danger);
+                                }
+                                ui.add_space(10.0);
+                                match &existing {
+                                    Some((name, size)) => {
+                                        ui.label(
+                                            RichText::new(name).size(12.5).color(p.primary),
+                                        );
+                                        ui.label(
+                                            RichText::new(size).size(11.5).color(p.text_muted),
+                                        );
+                                    }
+                                    None => {
+                                        ui.label(
+                                            RichText::new("未上传").size(12.5).color(p.text_muted),
+                                        );
+                                    }
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if existing.is_some() {
+                                            if widgets::ghost_button_sm(ui, &p, "移除").clicked()
+                                            {
+                                                remove = Some(kind);
+                                            }
+                                            if widgets::ghost_button_sm(ui, &p, "替换").clicked()
+                                            {
+                                                pick = Some(kind);
+                                            }
+                                        } else if widgets::ghost_button_sm(ui, &p, "选择文件")
+                                            .clicked()
+                                        {
+                                            pick = Some(kind);
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(7.0);
+                }
+
+                if let Some(msg) = &app.new_contract_flash {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(msg).size(11.5).color(p.danger));
+                }
+                if activate && !has_contract_copy {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(
+                            "已勾选「保存后立即生效」：请先上传合同附件，或取消勾选先存为草稿。",
+                        )
+                        .size(11.5)
+                        .color(p.warn),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if widgets::ghost_button(ui, &p, "上一步").clicked() {
+                        back = true;
+                    }
+                    if widgets::primary_button(ui, &p, "保存合同", can_save).clicked() && can_save {
+                        submit = true;
+                    }
+                    if widgets::ghost_button(ui, &p, "取消").clicked() {
+                        cancel = true;
+                    }
+                    ui.add_space(10.0);
+                    ui.scope(|ui| {
+                        ui.style_mut().visuals.selection.bg_fill = p.primary;
+                        ui.checkbox(
+                            &mut app.new_contract.activate,
+                            RichText::new("保存后立即生效（可直接拨款）")
+                                .size(12.5)
+                                .color(p.text),
+                        );
+                    });
+                });
             }
         });
 
+    // ---------------- 交互落地
     if cancel {
         app.dialog = Dialog::None;
+        app.new_contract = ContractForm::default();
+        app.new_contract_flash = None;
+        return;
     }
+    if next {
+        app.new_contract.step = 1;
+        app.new_contract_flash = None;
+    }
+    if back {
+        app.new_contract.step = 0;
+        app.new_contract_flash = None;
+    }
+    if let Some(kind) = remove {
+        app.new_contract.attachments.retain(|a| a.kind != kind);
+        app.new_contract_flash = None;
+    }
+    if let Some(kind) = pick {
+        match pick_attachment(kind) {
+            Ok(att) => {
+                app.new_contract.attachments.retain(|a| a.kind != kind);
+                app.new_contract.attachments.push(att);
+                app.new_contract_flash = None;
+            }
+            Err(e) => {
+                // 用户点「取消」不算错误，不打扰
+                if e != "已取消选择" {
+                    flash = Some(e);
+                }
+            }
+        }
+        if let Some(msg) = flash {
+            app.new_contract_flash = Some(msg);
+        }
+    }
+
     if submit {
-        let project_id = projects
-            .get(app.new_contract.project_idx)
-            .map(|x| x.0.clone())
-            .unwrap_or_default();
-        let contractor_id = contractors
-            .get(app.new_contract.contractor_idx)
-            .map(|x| x.0.clone())
-            .unwrap_or_default();
-        let amount = Money::parse_yuan(&app.new_contract.amount).unwrap_or(Money::ZERO);
+        let f = &app.new_contract;
+        let project_text = f.project_text.trim().to_string();
+        let contractor_text = f.contractor_text.trim().to_string();
+        let party_a = f.party_a.trim().to_string();
+        let name = f.name.trim().to_string();
+        let amount = Money::parse_yuan(&f.amount).unwrap_or(Money::ZERO);
         let ctype = CONTRACT_TYPES
-            .get(app.new_contract.ctype_idx)
+            .get(f.ctype_idx)
             .copied()
             .unwrap_or(ContractType::Construct);
         let cat_code = dict::CONTRACT_CATEGORIES
-            .get(app.new_contract.category_idx)
+            .get(f.category_idx)
             .map(|(c, _)| c.to_string())
             .unwrap_or_default();
-        let acc = if app.new_contract.acc_idx == 0 {
-            None
-        } else {
-            dict::ACCOUNTING_CATEGORIES
-                .get(app.new_contract.acc_idx - 1)
-                .map(|(c, _)| c.to_string())
-        };
-        let pricing = match app.new_contract.pricing_idx {
+        let pricing = match f.pricing_idx {
             0 => None,
             1 => Some(ctp_core::contract::PricingMethod::LumpSum),
             2 => Some(ctp_core::contract::PricingMethod::UnitPrice),
             _ => Some(ctp_core::contract::PricingMethod::CostPlus),
         };
-        let duration = app.new_contract.duration.trim().parse::<i64>().unwrap_or(0);
-        let retention = pct_to_bp(&app.new_contract.retention);
-        let advance = pct_to_bp(&app.new_contract.advance);
-        let name = app.new_contract.name.trim().to_string();
-        let party_a = app.new_contract.party_a.trim().to_string();
-        let sign_date = app.new_contract.sign_date.trim().to_string();
-        let planned_start = opt(&app.new_contract.planned_start);
-        let planned_end = opt(&app.new_contract.planned_end);
-        let terms = app.new_contract.terms.trim().to_string();
-        let remark = opt(&app.new_contract.remark);
+        let duration = f.duration.trim().parse::<i64>().unwrap_or(0);
+        let retention = pct_to_bp(&f.retention);
+        let advance = pct_to_bp(&f.advance);
+        let sign_date = f.sign_date.trim().to_string();
+        let planned_start = opt(&f.planned_start);
+        let planned_end = opt(&f.planned_end);
+        let terms = f.terms.trim().to_string();
+        let remark = opt(&f.remark);
+        let activate = f.activate;
+        let atts: Vec<(AttachmentKind, String, Option<String>, Vec<u8>)> = f
+            .attachments
+            .iter()
+            .map(|a| (a.kind, a.file_name.clone(), a.mime.clone(), a.bytes.clone()))
+            .collect();
 
-        let activate = app.new_contract.activate;
         let created = app.exec(move |conn| {
-            service::create_contract(
+            let c = service::create_contract(
                 conn,
                 NewContract {
-                    project_id,
+                    project_id: String::new(),
+                    project_text: Some(project_text),
                     contract_name: name,
                     contract_type: ctype,
                     contract_category_code: cat_code,
-                    category_id: acc,
+                    // 会计分类字段已从界面移除，新建一律留空
+                    category_id: None,
                     party_a,
-                    contractor_id,
+                    contractor_id: String::new(),
+                    contractor_text: Some(contractor_text),
                     building_id: None,
                     sign_date,
                     original_amount: amount,
@@ -519,13 +845,25 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                     remark,
                 },
                 "界面用户",
-            )
+            )?;
+            for (kind, fname, mime, bytes) in &atts {
+                service::save_attachment(
+                    conn,
+                    &c.id,
+                    *kind,
+                    fname,
+                    mime.as_deref(),
+                    bytes,
+                    "界面用户",
+                )?;
+            }
+            Ok(c)
         });
+
         match created {
             Ok(c) => {
                 let cid = c.id.clone();
                 let cno = c.contract_no.clone();
-                // 勾选了「保存后立即生效」：紧接着做一次草稿 → 生效（本期无审批环节）
                 let act_err = if activate {
                     app.exec(|conn| service::activate_contract(conn, &cid, "界面用户"))
                         .err()
@@ -535,13 +873,14 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                 app.refresh();
                 app.select(&cid);
                 app.new_contract = ContractForm::default();
+                app.new_contract_flash = None;
                 app.dialog = Dialog::None;
                 match act_err {
                     None if activate => {
                         app.success(format!("合同 {cno} 已建立并生效，可直接登记拨款"))
                     }
                     None => app.success(format!(
-                        "合同 {cno} 已保存为草稿，在详情卡点「设为生效」后即可拨款"
+                        "合同 {cno} 已保存为草稿，补齐合同附件后可在详情卡设为生效"
                     )),
                     Some(e) => app.error(format!(
                         "合同 {cno} 已建立，但生效失败：{e}（当前为草稿，可在详情卡重试）"
@@ -552,7 +891,6 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         }
     }
 }
-
 // ---------------------------------------------------------------- 审计价
 
 fn audit_price(app: &mut App, ctx: &egui::Context) {
@@ -848,6 +1186,245 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
         app.dialog = Dialog::None;
         app.pay_detail = None;
         app.goto_contract(&pm.contract_id);
+    }
+}
+
+// ---------------------------------------------------------------- 合同附件
+
+/// 把字节落到临时目录后用系统默认程序打开。
+///
+/// 附件存在库里，没有「原文件路径」可复用，所以每次打开都先物化一份临时副本。
+fn open_external(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        // start 的第一个参数是窗口标题，必须显式给空串，否则带空格的路径会被当成标题
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开失败：{e}"))
+}
+
+fn attachments(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+    let Some(cid) = app.att_contract.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let cno = app
+        .summaries
+        .iter()
+        .find(|s| s.contract_id == cid)
+        .map(|s| s.contract_no.clone())
+        .unwrap_or_default();
+
+    let mut close = false;
+    let mut op_open: Option<Attachment> = None;
+    let mut op_save: Option<Attachment> = None;
+    let mut op_pick: Option<AttachmentKind> = None;
+    let mut op_del: Option<Attachment> = None;
+
+    let list = app.attachments.clone();
+    let items: Vec<(AttachmentKind, Option<Attachment>)> = AttachmentKind::ALL
+        .iter()
+        .map(|k| {
+            (
+                *k,
+                list.iter().find(|a| a.kind_code == k.code()).cloned(),
+            )
+        })
+        .collect();
+
+    modal(format!("合同附件 · {cno}"), &p)
+        .default_width(760.0)
+        .show(ctx, |ui| {
+            ui.set_width(720.0);
+            ui.label(
+                RichText::new("每类一份；「合同」为必传项，未齐备的合同不能设为生效。")
+                    .size(12.0)
+                    .color(p.text_muted),
+            );
+            ui.add_space(10.0);
+
+            for (kind, att) in &items {
+                egui::Frame::none()
+                    .fill(p.surface_alt)
+                    .rounding(egui::Rounding::same(9.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.set_width(690.0);
+                        ui.horizontal(|ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(158.0, 22.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(kind.label())
+                                            .size(13.0)
+                                            .strong()
+                                            .color(p.text),
+                                    );
+                                    if kind.is_required() {
+                                        widgets::badge(ui, &p, "必传", Tone::Danger);
+                                    }
+                                },
+                            );
+                            match att {
+                                Some(a) => {
+                                    let when = a
+                                        .created_at
+                                        .get(0..16)
+                                        .map(|s| s.replace('T', " "))
+                                        .unwrap_or_default();
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(&a.file_name)
+                                                .size(12.5)
+                                                .color(p.primary),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} · 更新于 {}",
+                                                a.size_label(),
+                                                when
+                                            ))
+                                            .size(11.0)
+                                            .color(p.text_muted),
+                                        );
+                                    });
+                                }
+                                None => {
+                                    ui.label(
+                                        RichText::new("未上传").size(12.0).color(p.text_muted),
+                                    );
+                                }
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    match att {
+                                        Some(a) => {
+                                            if widgets::ghost_button_sm(ui, &p, "删除").clicked() {
+                                                op_del = Some(a.clone());
+                                            }
+                                            if widgets::ghost_button_sm(ui, &p, "另存").clicked() {
+                                                op_save = Some(a.clone());
+                                            }
+                                            if widgets::ghost_button_sm(ui, &p, "打开").clicked() {
+                                                op_open = Some(a.clone());
+                                            }
+                                            if widgets::ghost_button_sm(ui, &p, "替换").clicked() {
+                                                op_pick = Some(*kind);
+                                            }
+                                        }
+                                        None => {
+                                            if widgets::ghost_button_sm(ui, &p, "上传").clicked()
+                                            {
+                                                op_pick = Some(*kind);
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(7.0);
+            }
+
+            ui.add_space(6.0);
+            widgets::divider(ui, &p);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+        app.att_contract = None;
+        app.attachments.clear();
+        return;
+    }
+
+    if let Some(a) = op_open {
+        let id = a.id.clone();
+        let name = a.file_name.clone();
+        match app.exec(move |conn| service::attachment_bytes(conn, &id)) {
+            Ok(bytes) => {
+                let dir = std::env::temp_dir().join("ctp-attachments");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(&name);
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    app.error(format!("写入临时文件失败：{e}"));
+                } else if let Err(e) = open_external(&path) {
+                    app.error(e);
+                }
+            }
+            Err(e) => app.error(format!("读取附件失败：{e}")),
+        }
+    }
+
+    if let Some(a) = op_save {
+        let id = a.id.clone();
+        let name = a.file_name.clone();
+        match app.exec(move |conn| service::attachment_bytes(conn, &id)) {
+            Ok(bytes) => {
+                if let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() {
+                    match std::fs::write(&path, &bytes) {
+                        Ok(()) => app.success(format!("已另存为 {}", path.display())),
+                        Err(e) => app.error(format!("另存失败：{e}")),
+                    }
+                }
+            }
+            Err(e) => app.error(format!("读取附件失败：{e}")),
+        }
+    }
+
+    if let Some(kind) = op_pick {
+        match pick_attachment(kind) {
+            Ok(att) => {
+                let cid2 = cid.clone();
+                let res = app.exec(move |conn| {
+                    service::save_attachment(
+                        conn,
+                        &cid2,
+                        kind,
+                        &att.file_name,
+                        att.mime.as_deref(),
+                        &att.bytes,
+                        "界面用户",
+                    )
+                });
+                match res {
+                    Ok(_) => {
+                        app.reload_attachments();
+                        app.success(format!("{} 已更新", kind.label()));
+                    }
+                    Err(e) => app.error(format!("{} 保存失败：{e}", kind.label())),
+                }
+            }
+            // 用户点「取消」不算错误
+            Err(e) if e == "已取消选择" => {}
+            Err(e) => app.error(e),
+        }
+    }
+
+    if let Some(a) = op_del {
+        let id = a.id.clone();
+        let name = a.file_name.clone();
+        match app.exec(move |conn| service::delete_attachment(conn, &id, "界面用户")) {
+            Ok(_) => {
+                app.reload_attachments();
+                app.success(format!("已删除 {name}"));
+            }
+            Err(e) => app.error(format!("删除失败：{e}")),
+        }
     }
 }
 

@@ -68,6 +68,7 @@ pub fn table_statements() -> Vec<(&'static str, &'static str)> {
         ("ct_category", CT_CATEGORY),
         ("ct_contract", CT_CONTRACT),
         ("ct_contract_item", CT_CONTRACT_ITEM),
+        ("ct_contract_attachment", CT_CONTRACT_ATTACHMENT),
         ("pay_payment", PAY_PAYMENT),
     ]
 }
@@ -85,6 +86,8 @@ pub fn index_statements() -> Vec<&'static str> {
         "CREATE INDEX IF NOT EXISTS ix_contract_org ON ct_contract(contractor_id)",
         "CREATE INDEX IF NOT EXISTS ix_ct_item_contract ON ct_contract_item(contract_id)",
         "CREATE INDEX IF NOT EXISTS ix_ct_item_category ON ct_contract_item(category_id)",
+        // 每类附件只允许一份：唯一索引兜底，界面替换时走 UPDATE 而非新增
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_attachment_kind ON ct_contract_attachment(contract_id, att_type)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_no ON pay_payment(payment_no) WHERE is_deleted = 0",
         "CREATE INDEX IF NOT EXISTS ix_payment_date ON pay_payment(pay_date, status)",
         "CREATE INDEX IF NOT EXISTS ix_payment_contract ON pay_payment(contract_id, pay_date)",
@@ -184,7 +187,7 @@ CREATE TABLE IF NOT EXISTS org_contractor (
     id              TEXT PRIMARY KEY,
     contractor_name TEXT NOT NULL,
     role_type       TEXT NOT NULL DEFAULT 'CONSTRUCT'
-                    CHECK (role_type IN ('CONSTRUCT','SUPERVISE','DESIGN','SURVEY','SUPPLIER','OTHER')),
+                    CHECK (role_type IN ('CONSTRUCT','SUPERVISE','DESIGN','SURVEY','SUPPLIER','OWNER','OTHER')),
     credit_code     TEXT,
     bank_name       TEXT,
     bank_account    TEXT,
@@ -292,6 +295,31 @@ CREATE TABLE IF NOT EXISTS ct_contract_item (
     updated_at      TEXT NOT NULL,
     updated_by      TEXT,
     version         INTEGER NOT NULL DEFAULT 1
+)
+"#;
+
+/// 合同附件（本期四类，每类一份，文件本体以 BLOB 入库）。
+///
+/// 选择 BLOB 而非「落盘 + 索引」的取舍：整套系统只有一个 `ctp.db`，
+/// 备份与迁移不会出现「库走了、附件没走」；代价是库随附件增长，
+/// 由应用层的 50 MB 单文件上限兜住。
+const CT_CONTRACT_ATTACHMENT: &str = r#"
+CREATE TABLE IF NOT EXISTS ct_contract_attachment (
+    id          TEXT PRIMARY KEY,
+    contract_id TEXT NOT NULL REFERENCES ct_contract(id) ON DELETE CASCADE,
+    att_type    TEXT NOT NULL
+                CHECK (att_type IN ('BID_NOTICE','CONTRACT','PROGRESS_SETTLEMENT','AUDIT_REPORT')),
+    file_name   TEXT NOT NULL,
+    mime_type   TEXT,
+    size_bytes  INTEGER NOT NULL CHECK (size_bytes > 0),
+    sha256      TEXT NOT NULL,
+    content     BLOB NOT NULL,
+    remark      TEXT,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT,
+    version     INTEGER NOT NULL DEFAULT 1
 )
 "#;
 

@@ -14,6 +14,7 @@ mod theme;
 mod widgets;
 
 use ctp_app::checks::CheckReport;
+use ctp_core::attachment::Attachment;
 use ctp_core::contract::{Contract, ContractStatus};
 use ctp_core::ledger::{CategoryRow, ContractSummary, PeriodRow};
 use ctp_core::payment::Payment;
@@ -121,6 +122,14 @@ pub struct App {
     pub summaries: Vec<ContractSummary>,
     pub projects: Vec<Project>,
     pub contractors: Vec<Contractor>,
+    /// 历史合同里出现过的甲方名称（甲方联想输入的兜底候选）
+    pub party_a_names: Vec<String>,
+    /// 当前查看的合同附件（`Dialog::Attachments`）
+    pub attachments: Vec<Attachment>,
+    /// 附件弹窗对应的合同
+    pub att_contract: Option<String>,
+    /// 当前选中合同的附件数量（详情卡「附件 n/4」）
+    pub att_count: i64,
     pub payments: Vec<Payment>,
     pub categories: Vec<CategoryRow>,
     pub periods: Vec<PeriodRow>,
@@ -137,6 +146,8 @@ pub struct App {
     pub pay_form: PayForm,
     /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
     pub pay_detail: Option<Payment>,
+    /// 新建合同表单里的一次性提示（附件选择失败等）
+    pub new_contract_flash: Option<String>,
     pub new_contract: ContractForm,
     pub audit_form: AuditForm,
     pub amount_form: AmountForm,
@@ -210,6 +221,10 @@ impl App {
             summaries: Vec::new(),
             projects: Vec::new(),
             contractors: Vec::new(),
+            party_a_names: Vec::new(),
+            attachments: Vec::new(),
+            att_contract: None,
+            att_count: 0,
             payments: Vec::new(),
             categories: Vec::new(),
             periods: Vec::new(),
@@ -224,6 +239,7 @@ impl App {
             pay_form: PayForm::default(),
             pay_detail: None,
             new_contract: ContractForm::default(),
+            new_contract_flash: None,
             audit_form: AuditForm::default(),
             amount_form: AmountForm::default(),
             tol_input: String::new(),
@@ -281,7 +297,20 @@ impl App {
             }
         }
         match std::env::var("CTP_DIALOG").unwrap_or_default().as_str() {
-            "new_contract" => self.dialog = Dialog::NewContract,
+            "new_contract" => {
+                self.dialog = Dialog::NewContract;
+                // `CTP_STEP=1` 直达第二步（附件），供截图核对
+                if std::env::var("CTP_STEP").unwrap_or_default() == "1" {
+                    self.new_contract.step = 1;
+                }
+            }
+            "attachments" => {
+                if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
+                    self.select(&id);
+                    self.screen = Screen::Contracts;
+                    self.open_attachments(&id);
+                }
+            }
             "audit_price" => {
                 if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
                     self.select(&id);
@@ -327,6 +356,9 @@ impl App {
         if let Ok(v) = repo::list_contractors(conn) {
             self.contractors = v;
         }
+        if let Ok(v) = repo::list_party_a_names(conn) {
+            self.party_a_names = v;
+        }
         if let Ok(v) = repo::list_payments(conn, None) {
             self.payments = v;
         }
@@ -366,12 +398,39 @@ impl App {
             .db
             .as_ref()
             .and_then(|c| repo::get_contract(c, id).ok());
+        self.att_count = self
+            .db
+            .as_ref()
+            .and_then(|c| repo::attachment_count(c, id).ok())
+            .unwrap_or(0);
     }
 
     /// 跳到合同台账并选中该合同（总览里点合同编号时用）。
     pub fn goto_contract(&mut self, id: &str) {
         self.select(id);
         self.screen = Screen::Contracts;
+    }
+
+    /// 打开附件管理弹窗，并加载该合同的附件清单。
+    pub fn open_attachments(&mut self, contract_id: &str) {
+        self.att_contract = Some(contract_id.to_string());
+        self.attachments = self
+            .db
+            .as_ref()
+            .and_then(|c| repo::list_attachments(c, contract_id).ok())
+            .unwrap_or_default();
+        self.dialog = Dialog::Attachments;
+    }
+
+    /// 替换 / 删除之后刷新附件清单与「n/4」计数。
+    pub fn reload_attachments(&mut self) {
+        let Some(id) = self.att_contract.clone() else {
+            return;
+        };
+        if let Some(conn) = self.db.as_ref() {
+            self.attachments = repo::list_attachments(conn, &id).unwrap_or_default();
+            self.att_count = repo::attachment_count(conn, &id).unwrap_or(0);
+        }
     }
 
     /// 打开拨款单详情弹窗（总览、拨款明细里点单号时用）。
@@ -678,10 +737,12 @@ impl eframe::App for App {
             if left == 0 {
                 self.smoke = None;
                 let body = format!(
-                    "ok\nscreen={}\ncontracts={}\npayments={}\n",
+                    "ok\nscreen={}\ncontracts={}\npayments={}\ndb={}\nerr={}\n",
                     self.screen.label(),
                     self.summaries.len(),
-                    self.payments.len()
+                    self.payments.len(),
+                    self.db_path,
+                    self.init_error.clone().unwrap_or_default()
                 );
                 let _ = std::fs::write(exe_dir().join("smoke.txt"), body);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

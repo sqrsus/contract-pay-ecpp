@@ -35,6 +35,9 @@ pub struct Building {
 }
 
 /// 参建单位角色（4.5.2：一行一角色）。
+///
+/// `Owner` 为发包人（甲方）保留位：甲方与承包单位共用一套单位档案，
+/// 靠角色区分，避免同名单位在两张表里各存一份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContractorRole {
     #[default]
@@ -43,6 +46,7 @@ pub enum ContractorRole {
     Design,
     Survey,
     Supplier,
+    Owner,
     Other,
 }
 
@@ -54,6 +58,7 @@ impl ContractorRole {
             ContractorRole::Design => "DESIGN",
             ContractorRole::Survey => "SURVEY",
             ContractorRole::Supplier => "SUPPLIER",
+            ContractorRole::Owner => "OWNER",
             ContractorRole::Other => "OTHER",
         }
     }
@@ -65,6 +70,7 @@ impl ContractorRole {
             ContractorRole::Design => "设计",
             ContractorRole::Survey => "勘察",
             ContractorRole::Supplier => "供应商",
+            ContractorRole::Owner => "业主",
             ContractorRole::Other => "其他",
         }
     }
@@ -76,6 +82,7 @@ impl ContractorRole {
             "DESIGN" => ContractorRole::Design,
             "SURVEY" => ContractorRole::Survey,
             "SUPPLIER" => ContractorRole::Supplier,
+            "OWNER" => ContractorRole::Owner,
             "OTHER" => ContractorRole::Other,
             _ => return None,
         })

@@ -328,6 +328,82 @@ fn link_colored(
     resp
 }
 
+/// 联想输入框：输入时在下方浮出候选，点选即回填，未点选则保留用户原文。
+///
+/// 匹配用「包含」而不是前缀——中文输入法下用户常从中间几个字开始回忆，
+/// 前缀匹配会漏掉大量正确结果。候选最多 8 条，避免浮层盖住整个表单。
+/// 返回 `Some(值)` 表示这一帧用户点选了某一项（调用方据此刷新联动字段）。
+pub fn autocomplete(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    candidates: &[String],
+    width: f32,
+    hint: &str,
+) -> Option<String> {
+    let resp = ui.add_sized(
+        [width, 26.0],
+        egui::TextEdit::singleline(text)
+            .hint_text(RichText::new(hint).size(12.0).color(p.text_muted))
+            .margin(Margin::symmetric(8.0, 4.0)),
+    );
+
+    // 只有「正在输入」才弹候选：失焦或空串时一律不打扰
+    if !resp.has_focus() {
+        return None;
+    }
+    let q = text.trim().to_lowercase();
+    if q.is_empty() {
+        return None;
+    }
+    let matched: Vec<String> = candidates
+        .iter()
+        .filter(|c| c.to_lowercase().contains(&q))
+        .take(8)
+        .cloned()
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    // 已经唯一命中且完全一致，就没有再选一次的必要
+    if matched.len() == 1 && matched[0].to_lowercase() == q {
+        return None;
+    }
+
+    let mut picked: Option<String> = None;
+    egui::Area::new(egui::Id::new((id, "ac")))
+        .order(egui::Order::Foreground)
+        .fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::symmetric(6.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width((width - 12.0).max(120.0));
+                    for c in &matched {
+                        if ui
+                            .selectable_label(
+                                false,
+                                RichText::new(c).size(12.5).color(p.text),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(c.clone());
+                        }
+                    }
+                });
+        });
+
+    if let Some(v) = &picked {
+        *text = v.clone();
+        ui.memory_mut(|m| m.surrender_focus(resp.id));
+    }
+    picked
+}
+
 /// 表格「合计行」上方的分隔线。须在表格绘制完成后调用，`(left, right)` 取表格横向范围。
 pub fn total_rule(ui: &Ui, p: &Palette, left: f32, right: f32, y: f32) {
     ui.painter().hline(
