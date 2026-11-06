@@ -814,3 +814,134 @@ fn 附件空文件与超限被拒() {
     assert!(err.to_string().contains("上限"));
 }
 
+/// R-32：四个汇总维度共用同一段过滤，切换维度后合计不变；
+/// 项目状态 / 合同类型 / 关键词 / 日期区间四个筛选按口径生效。
+#[test]
+fn 汇总统计_四维度合计一致_筛选生效() {
+    use ctp_core::ledger::{SummaryDim, SummaryFilter};
+
+    // 合同一：服务类 100 万，付 40 万 → 履行中
+    let (mut conn, c1) = fixture(1_000_000);
+    pay(&mut conn, &c1, 400_000).unwrap();
+
+    // 合同二：服务类 20 万，付清 → 归档关闭
+    let c2 = service::create_contract(
+        &mut conn,
+        NewContract {
+            project_id: "PJ-1".into(),
+            contract_name: "测试合同二".into(),
+            contract_type: ctp_core::contract::ContractType::Service,
+            contract_category_code: "GC".into(),
+            party_a: "某建设单位".into(),
+            contractor_id: "ORG-1".into(),
+            sign_date: "2026-01-15".into(),
+            original_amount: Money::from_cent(200_000 * 100),
+            delivery_date: Some("2020-01-01".into()),
+            payment_terms: "按月计量支付".into(),
+            ..Default::default()
+        },
+        "t",
+    )
+    .unwrap();
+    attach_contract(&conn, &c2.id);
+    service::activate_contract(&mut conn, &c2.id, "t").unwrap();
+    pay(&mut conn, &c2.id, 200_000).unwrap();
+
+    let all = SummaryFilter::default();
+    for dim in SummaryDim::all() {
+        let rows = repo::payment_summary(&conn, dim, &all).unwrap();
+        let amt: i64 = rows.iter().map(|r| r.amount.cent()).sum();
+        assert_eq!(amt, 600_000 * 100, "{dim:?} 全量合计应为 60 万");
+        let n: i64 = rows.iter().map(|r| r.payment_count).sum();
+        assert_eq!(n, 2, "{dim:?} 全量笔数应为 2");
+    }
+
+    // 按合同维度带承包单位列；报表层为 5 列
+    let rows = repo::payment_summary(&conn, SummaryDim::Contract, &all).unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.sub.as_deref() == Some("某施工单位")),
+        "按合同维度应带出承包单位"
+    );
+    let r5 = service::summary_of(&conn, SummaryDim::Contract, &all).unwrap();
+    assert_eq!(r5.columns.len(), 5);
+
+    // 按合同类型的行名翻成中文（SERVICE → 服务）
+    let rt = service::summary_of(&conn, SummaryDim::ContractType, &all).unwrap();
+    assert!(rt.rows.iter().all(|c| matches!(
+        &c[0],
+        ctp_app::report::Cell::Text(t) if t == "服务"
+    )));
+
+    let sum_cent = |f: &SummaryFilter| -> i64 {
+        let rows = repo::payment_summary(&conn, SummaryDim::Contract, f).unwrap();
+        rows.iter().map(|r| r.amount.cent()).sum()
+    };
+
+    // 状态筛选：归档口径 = 支付率 ≥ 100%（全周期，不受区间影响）
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            archived: Some(true),
+            ..Default::default()
+        }),
+        200_000 * 100
+    );
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            archived: Some(false),
+            ..Default::default()
+        }),
+        400_000 * 100
+    );
+
+    // 类型筛选：两份都是服务类；查「设计」应一无所获
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            contract_type: Some("SERVICE".into()),
+            ..Default::default()
+        }),
+        600_000 * 100
+    );
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            contract_type: Some("DESIGN".into()),
+            ..Default::default()
+        }),
+        0
+    );
+
+    // 关键词：项目名 / 合同名都能命中；完全不相关的词为空
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            keyword: "测试".into(),
+            ..Default::default()
+        }),
+        600_000 * 100
+    );
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            keyword: "毫不相干".into(),
+            ..Default::default()
+        }),
+        0
+    );
+
+    // 日期闭区间：拨款都记在 2026-03-31
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            from: "2026-04-01".into(),
+            to: "2026-12-31".into(),
+            ..Default::default()
+        }),
+        0
+    );
+    assert_eq!(
+        sum_cent(&SummaryFilter {
+            from: "2026-01-01".into(),
+            to: "2026-03-31".into(),
+            ..Default::default()
+        }),
+        600_000 * 100
+    );
+}
+

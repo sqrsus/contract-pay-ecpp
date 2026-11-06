@@ -161,7 +161,7 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             ui.label(RichText::new("汇总统计").size(19.0).strong().color(p.text));
             ui.label(
-                RichText::new("只统计已实付单据，作废单不计；三个维度的合计口径完全一致")
+                RichText::new("只统计已实付单据，作废单不计；四个维度的合计口径完全一致")
                     .size(12.0)
                     .color(p.text_muted),
             );
@@ -193,24 +193,24 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
         ui.add_sized(
             [104.0, 28.0],
             egui::TextEdit::singleline(&mut app.summary_from)
-                .hint_text("2026-01-01")
+                .hint_text("不限")
                 .margin(egui::Margin::symmetric(7.0, 4.0)),
         );
         ui.label(RichText::new("至").size(12.0).color(p.text_muted));
         ui.add_sized(
             [104.0, 28.0],
             egui::TextEdit::singleline(&mut app.summary_to)
-                .hint_text("2026-12-31")
+                .hint_text("不限")
                 .margin(egui::Margin::symmetric(7.0, 4.0)),
         );
 
-        // 三个常用区间，省得手打日期
+        // 三个常用区间，省得手打日期；「全部」清空两端
         let today = ctp_core::date::today_iso();
         let year = today.get(0..4).unwrap_or("2026").to_string();
         for (label, from, to) in [
-            ("本月", format!("{}-{}", &today[0..7], "01"), today.clone()),
+            ("本月", format!("{}-01", &today[0..7]), today.clone()),
             ("本年", format!("{year}-01-01"), today.clone()),
-            ("全部", "2000-01-01".to_string(), "2099-12-31".to_string()),
+            ("全部时间", String::new(), String::new()),
         ] {
             if widgets::link(ui, &p, label, 11.5).clicked() {
                 app.summary_from = from;
@@ -218,22 +218,95 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+
+    // 筛选行：项目状态 + 合同类型 + 关键词（R-32 口径 9b）
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("项目状态").size(12.0).color(p.text_muted));
+        let st_text = match app.summary_archived {
+            Some(false) => "履行中",
+            Some(true) => "归档关闭",
+            None => "全部",
+        };
+        egui::ComboBox::from_id_salt("sum_status")
+            .selected_text(st_text)
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut app.summary_archived, None, "全部");
+                ui.selectable_value(&mut app.summary_archived, Some(false), "履行中");
+                ui.selectable_value(&mut app.summary_archived, Some(true), "归档关闭");
+            });
+        ui.add_space(12.0);
+        ui.label(RichText::new("合同类型").size(12.0).color(p.text_muted));
+        let ty_text = app
+            .summary_type
+            .as_deref()
+            .and_then(ctp_core::contract::ContractType::from_code)
+            .map(|t| t.label())
+            .unwrap_or("全部");
+        egui::ComboBox::from_id_salt("sum_type")
+            .selected_text(ty_text)
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut app.summary_type, None, "全部");
+                for t in [
+                    ctp_core::contract::ContractType::Construct,
+                    ctp_core::contract::ContractType::Supervise,
+                    ctp_core::contract::ContractType::Design,
+                    ctp_core::contract::ContractType::Survey,
+                    ctp_core::contract::ContractType::Supply,
+                    ctp_core::contract::ContractType::Service,
+                ] {
+                    ui.selectable_value(
+                        &mut app.summary_type,
+                        Some(t.code().to_string()),
+                        t.label(),
+                    );
+                }
+            });
+        ui.add_space(12.0);
+        ui.label(RichText::new("关键词").size(12.0).color(p.text_muted));
+        ui.add_sized(
+            [170.0, 28.0],
+            egui::TextEdit::singleline(&mut app.summary_kw)
+                .hint_text("项目 / 承包单位 / 合同")
+                .margin(egui::Margin::symmetric(8.0, 4.0)),
+        );
+    });
     ui.add_space(12.0);
 
-    // ---------------- 取数（区间或维度变了才重查）
+    // ---------------- 取数（筛选或维度变了才重查）
     let key = (
         app.summary_dim,
-        app.summary_from.clone(),
-        app.summary_to.clone(),
+        app.summary_from.trim().to_string(),
+        app.summary_to.trim().to_string(),
+        app.summary_archived,
+        app.summary_type.clone(),
+        app.summary_kw.trim().to_string(),
     );
-    let range_ok = is_iso_date(&app.summary_from)
-        && is_iso_date(&app.summary_to)
-        && app.summary_from <= app.summary_to;
+    // 每端要么留空（不限）要么是合法日期；两端都给时起始不得晚于结束
+    let side_ok = |s: &str| s.is_empty() || is_iso_date(s);
+    let range_ok = side_ok(&key.1)
+        && side_ok(&key.2)
+        && (key.1.is_empty() || key.2.is_empty() || key.1 <= key.2);
     if app.summary_key.as_ref() != Some(&key) {
         if range_ok {
-            let (dim, from, to) = (key.0, key.1.clone(), key.2.clone());
+            let (dim, from, to, archived, ty, kw) = (
+                key.0,
+                key.1.clone(),
+                key.2.clone(),
+                key.3,
+                key.4.clone(),
+                key.5.clone(),
+            );
+            let filter = ctp_core::ledger::SummaryFilter {
+                from,
+                to,
+                archived,
+                contract_type: ty,
+                keyword: kw,
+            };
             app.summary = app
-                .read(|c| ctp_app::service::summary_of(c, dim, &from, &to))
+                .read(|c| ctp_app::service::summary_of(c, dim, &filter))
                 .ok();
         } else {
             app.summary = None;
@@ -245,7 +318,7 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
         widgets::card(&p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("统计区间日期格式不对：应为 YYYY-MM-DD，且起始不晚于结束")
+                RichText::new("统计区间日期格式不对：应为 YYYY-MM-DD，且起始不晚于结束（留空 = 不限）")
                     .size(13.0)
                     .color(p.danger),
             );
@@ -264,7 +337,7 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
                     widgets::empty_state(
                         ui,
                         &p,
-                        "该区间内没有已实付的拨款单，换个区间或先去「拨款管理」登记",
+                        "当前区间与筛选条件下没有已实付的拨款单，放宽条件或先去「拨款管理」登记",
                     );
                 });
             }
@@ -274,13 +347,26 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
                 // 剩余不足时先压图，低于 96 就干脆不画，保证「合计」行始终完整可见。
                 let rows_need = 26.0 + result.rows.len() as f32 * 29.0 + 30.0 + 90.0;
                 let chart_h = (ui.available_height() - rows_need - 24.0).clamp(0.0, 168.0);
+                // 「按合同」维度多一列承包单位：金额在 col 3，其余维度在 col 2
+                let amt_idx = if app.summary_dim == SummaryDim::Contract {
+                    3
+                } else {
+                    2
+                };
                 if result.rows.len() <= 31 && chart_h >= 96.0 {
                     let points: Vec<(String, i64)> = result
                         .rows
                         .iter()
                         .map(|r| {
                             let label = r.first().map(Cell::display).unwrap_or_default();
-                            let cent = match r.get(2) {
+                            // 合同名太长，图上只留前 9 个字
+                            let label = if label.chars().count() > 10 {
+                                let cut: String = label.chars().take(9).collect();
+                                format!("{cut}…")
+                            } else {
+                                label
+                            };
+                            let cent = match r.get(amt_idx) {
                                 Some(Cell::Money(v)) => v.cent(),
                                 _ => 0,
                             };
@@ -288,9 +374,10 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
                         })
                         .collect();
                     let title = match app.summary_dim {
-                        SummaryDim::Day => "每日支付金额",
                         SummaryDim::Project => "各项目支付金额",
                         SummaryDim::Contractor => "各承包单位支付金额",
+                        SummaryDim::Contract => "各合同支付金额",
+                        SummaryDim::ContractType => "各合同类型支付金额",
                     };
                     bar_chart(ui, &p, &points, title, chart_h);
                     ui.add_space(8.0);

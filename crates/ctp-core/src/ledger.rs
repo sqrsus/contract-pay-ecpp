@@ -155,53 +155,76 @@ pub struct PeriodRow {
     pub amount: Money,
 }
 
-/// 汇总统计的分组维度（R-29）。
+/// 汇总统计的分组维度（R-29 → R-32）。
 ///
-/// 三个维度都只统计**已实付且未作废**的拨款单，口径与已付净额一致。
+/// 四个维度都只统计**已实付且未作废**的拨款单，口径与已付净额一致；
+/// 按日维度已在 R-32 移除（时间粒度改由区间自选）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryDim {
-    /// 按开单日期逐日归集（时间区间由调用方给）
-    Day,
     /// 按所属项目归集
     Project,
     /// 按承包单位归集
     Contractor,
+    /// 按合同归集（只列出区间内有拨款的合同，R-32 确认口径）
+    Contract,
+    /// 按合同类型归集（施工 / 监理 / 设计 / 勘察 / 货物 / 服务）
+    ContractType,
 }
 
 impl SummaryDim {
     pub fn label(self) -> &'static str {
         match self {
-            SummaryDim::Day => "按日",
             SummaryDim::Project => "按项目",
             SummaryDim::Contractor => "按承包单位",
+            SummaryDim::Contract => "按合同",
+            SummaryDim::ContractType => "按合同类型",
         }
     }
 
     /// 分组列的标题（表格第一列表头）。
     pub fn key_title(self) -> &'static str {
         match self {
-            SummaryDim::Day => "开单日期",
             SummaryDim::Project => "所属项目",
             SummaryDim::Contractor => "承包单位",
+            SummaryDim::Contract => "合同",
+            SummaryDim::ContractType => "合同类型",
         }
     }
 
-    pub fn all() -> [SummaryDim; 3] {
+    pub fn all() -> [SummaryDim; 4] {
         [
-            SummaryDim::Day,
             SummaryDim::Project,
             SummaryDim::Contractor,
+            SummaryDim::Contract,
+            SummaryDim::ContractType,
         ]
     }
+}
+
+/// 汇总统计的筛选条件（R-32）。所有条件留空即「全量」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SummaryFilter {
+    /// 开单日期闭区间（`YYYY-MM-DD`，空串 = 不限）
+    pub from: String,
+    pub to: String,
+    /// 项目状态：`Some(true)` 只看归档关闭（支付率 ≥ 100%），
+    /// `Some(false)` 只看履行中；口径与 `ContractSummary::is_archived` 一致
+    pub archived: Option<bool>,
+    /// 合同类型代码（`CONSTRUCT` / `SUPERVISE` …）
+    pub contract_type: Option<String>,
+    /// 关键词：匹配项目名 / 承包单位 / 合同编号 / 合同名称
+    pub keyword: String,
 }
 
 /// 汇总统计的一行：一个分组键的笔数与金额。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryRow {
-    /// 分组键（日期 / 项目 id / 承包单位 id）
+    /// 分组键（项目 id / 承包单位 id / 合同 id / 类型代码）
     pub key: String,
-    /// 显示名（日期本身 / 项目名称 / 承包单位名称）
+    /// 显示名（项目名称 / 承包单位名称 / 合同编号·名称 / 类型中文名）
     pub label: String,
+    /// 第二显示列：仅「按合同」维度填承包单位，其余维度为 None
+    pub sub: Option<String>,
     pub payment_count: i64,
     pub amount: Money,
 }

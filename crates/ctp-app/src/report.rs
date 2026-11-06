@@ -19,12 +19,14 @@ pub enum ReportKind {
     CategorySummary,
     /// V4 `v_payment_period`
     PeriodSummary,
-    /// 汇总统计 · 按日
-    SummaryDaily,
     /// 汇总统计 · 按项目
     SummaryProject,
     /// 汇总统计 · 按承包单位
     SummaryContractor,
+    /// 汇总统计 · 按合同
+    SummaryContract,
+    /// 汇总统计 · 按合同类型
+    SummaryContractType,
 }
 
 impl ReportKind {
@@ -32,9 +34,10 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "CATEGORY_SUMMARY_V3",
             ReportKind::PeriodSummary => "PERIOD_SUMMARY_V4",
-            ReportKind::SummaryDaily => "SUMMARY_DAILY",
             ReportKind::SummaryProject => "SUMMARY_PROJECT",
             ReportKind::SummaryContractor => "SUMMARY_CONTRACTOR",
+            ReportKind::SummaryContract => "SUMMARY_CONTRACT",
+            ReportKind::SummaryContractType => "SUMMARY_CONTRACT_TYPE",
         }
     }
 
@@ -42,9 +45,10 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "会计分类汇总",
             ReportKind::PeriodSummary => "支付期间统计",
-            ReportKind::SummaryDaily => "拨款汇总 · 按日",
             ReportKind::SummaryProject => "拨款汇总 · 按项目",
             ReportKind::SummaryContractor => "拨款汇总 · 按承包单位",
+            ReportKind::SummaryContract => "拨款汇总 · 按合同",
+            ReportKind::SummaryContractType => "拨款汇总 · 按合同类型",
         }
     }
 
@@ -54,10 +58,15 @@ impl ReportKind {
                 "按会计分类（ct_category）汇总，V3 口径；合同类别（工程款/材料款）不参与此处统计"
             }
             ReportKind::PeriodSummary => "按开单月份归集（V4 口径），仅统计已实付单据",
-            ReportKind::SummaryDaily => "按开单日期逐日归集，仅统计已实付单据（作废单不计）",
             ReportKind::SummaryProject => "按所属项目归集，仅统计已实付单据（作废单不计）",
             ReportKind::SummaryContractor => {
                 "按合同承包单位归集，仅统计已实付单据（作废单不计）"
+            }
+            ReportKind::SummaryContract => {
+                "按合同归集（只列区间内有拨款的合同），仅统计已实付单据（作废单不计）"
+            }
+            ReportKind::SummaryContractType => {
+                "按合同类型归集（施工/监理/设计/勘察/货物/服务），仅统计已实付单据"
             }
         }
     }
@@ -66,9 +75,10 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "会计分类汇总",
             ReportKind::PeriodSummary => "支付期间统计",
-            ReportKind::SummaryDaily => "拨款汇总_按日",
             ReportKind::SummaryProject => "拨款汇总_按项目",
             ReportKind::SummaryContractor => "拨款汇总_按承包单位",
+            ReportKind::SummaryContract => "拨款汇总_按合同",
+            ReportKind::SummaryContractType => "拨款汇总_按合同类型",
         }
     }
 
@@ -76,9 +86,10 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "分类汇总",
             ReportKind::PeriodSummary => "期间统计",
-            ReportKind::SummaryDaily => "按日",
             ReportKind::SummaryProject => "按项目",
             ReportKind::SummaryContractor => "按承包单位",
+            ReportKind::SummaryContract => "按合同",
+            ReportKind::SummaryContractType => "按合同类型",
         }
     }
 }
@@ -288,46 +299,88 @@ impl ReportResult {
         dim: ctp_core::ledger::SummaryDim,
         from: &str,
         to: &str,
+        filter_note: &str,
     ) -> Self {
+        use ctp_core::contract::ContractType;
         use ctp_core::ledger::SummaryDim;
         let kind = match dim {
-            SummaryDim::Day => ReportKind::SummaryDaily,
             SummaryDim::Project => ReportKind::SummaryProject,
             SummaryDim::Contractor => ReportKind::SummaryContractor,
+            SummaryDim::Contract => ReportKind::SummaryContract,
+            SummaryDim::ContractType => ReportKind::SummaryContractType,
         };
-        let mut columns = vec![
-            ReportColumn::new("group_label", dim.key_title(), ColumnKind::Text, 30.0, 200.0),
-            ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 110.0),
-            ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 170.0),
-            ReportColumn::new("share", "占合计", ColumnKind::Rate, 18.0, 150.0),
-        ];
+        // 「按合同」多一列承包单位（R-32 确认口径：合同行信息量大，单独给 5 列）
+        let mut columns = if dim == SummaryDim::Contract {
+            vec![
+                ReportColumn::new("group_label", dim.key_title(), ColumnKind::Text, 30.0, 220.0),
+                ReportColumn::new(
+                    "sub",
+                    "承包单位",
+                    ColumnKind::Text,
+                    20.0,
+                    170.0,
+                ),
+                ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 110.0),
+                ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 170.0),
+                ReportColumn::new("share", "占合计", ColumnKind::Rate, 18.0, 150.0),
+            ]
+        } else {
+            vec![
+                ReportColumn::new("group_label", dim.key_title(), ColumnKind::Text, 30.0, 200.0),
+                ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 110.0),
+                ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 170.0),
+                ReportColumn::new("share", "占合计", ColumnKind::Rate, 18.0, 150.0),
+            ]
+        };
         columns[0].screen_remainder = true;
 
         let total: i64 = rows.iter().map(|r| r.amount.cent()).sum();
         let data: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
+                // 按合同类型的行名是代码（CONSTRUCT…），翻成中文给人看
+                let label = if dim == SummaryDim::ContractType {
+                    ContractType::from_code(&r.label)
+                        .map(|t| t.label().to_string())
+                        .unwrap_or_else(|| r.label.clone())
+                } else {
+                    r.label.clone()
+                };
                 let bp = ratio_bp(r.amount.cent(), total);
-                vec![
-                    Cell::Text(r.label.clone()),
-                    Cell::Integer(r.payment_count),
-                    Cell::Money(r.amount),
-                    Cell::Rate(percent_text(bp), bp),
-                ]
+                let mut cells = vec![Cell::Text(label)];
+                if dim == SummaryDim::Contract {
+                    cells.push(Cell::Text(r.sub.clone().unwrap_or_default()));
+                }
+                cells.push(Cell::Integer(r.payment_count));
+                cells.push(Cell::Money(r.amount));
+                cells.push(Cell::Rate(percent_text(bp), bp));
+                cells
             })
             .collect();
         let total_bp = if total > 0 { 10_000 } else { 0 };
-        let totals = vec![
-            Cell::Text("合计".to_string()),
-            Cell::Integer(rows.iter().map(|r| r.payment_count).sum()),
-            Cell::Money(Money::from_cent(total)),
-            Cell::Rate(percent_text(total_bp), total_bp),
-        ];
+        let mut totals = vec![Cell::Text("合计".to_string())];
+        if dim == SummaryDim::Contract {
+            totals.push(Cell::Text(String::new()));
+        }
+        totals.push(Cell::Integer(rows.iter().map(|r| r.payment_count).sum()));
+        totals.push(Cell::Money(Money::from_cent(total)));
+        totals.push(Cell::Rate(percent_text(total_bp), total_bp));
 
+        let filter_part = if filter_note.is_empty() {
+            String::new()
+        } else {
+            format!("；筛选：{filter_note}")
+        };
+        // 区间留空 = 不限；副标题里写明，避免出现「统计区间  ~ 」的空壳
+        let from_txt = if from.trim().is_empty() { "不限" } else { from };
+        let to_txt = if to.trim().is_empty() { "不限" } else { to };
         ReportResult {
             kind,
             title: kind.title(),
-            subtitle: format!("{}（统计区间 {from} ~ {to}）", kind.subtitle()),
+            subtitle: format!(
+                "{}（统计区间 {from_txt} ~ {to_txt}）{filter_part}",
+                kind.subtitle()
+            ),
             unit_note: "金额单位：元",
             columns,
             rows: data,

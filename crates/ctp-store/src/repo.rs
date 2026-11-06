@@ -2,7 +2,9 @@ use crate::error::{Result, StoreError};
 use crate::schema;
 use ctp_core::contract::{BidMethod, Contract, ContractStatus, ContractType, PricingMethod};
 use ctp_core::date::now_iso;
-use ctp_core::ledger::{CategoryRow, ContractSummary, LedgerRow, PeriodRow, SummaryDim, SummaryRow};
+use ctp_core::ledger::{
+    CategoryRow, ContractSummary, LedgerRow, PeriodRow, SummaryDim, SummaryFilter, SummaryRow,
+};
 use ctp_core::money::Money;
 use ctp_core::payment::{PayMethod, Payment, PaymentStatus};
 use ctp_core::project::{Contact, Contractor, Project};
@@ -728,53 +730,82 @@ pub fn period_summary(conn: &Connection) -> Result<Vec<PeriodRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// 汇总统计：按维度 + 日期区间归集已实付单据（作废单不计）。
+/// 汇总统计：按维度 + 筛选条件归集已实付单据（作废单不计，R-32）。
 ///
-/// 三个维度共用同一段过滤条件（`status='PAID' AND is_deleted=0` 且日期落在
-/// `[from, to]` 闭区间），只换分组键，保证切换维度后合计不会变。
+/// 四个维度共用同一段 FROM / WHERE（`status='PAID' AND is_deleted=0`、日期闭区间、
+/// 状态 / 类型 / 关键词筛选），只换分组键，保证切换维度后合计不会变。
 pub fn payment_summary(
     conn: &Connection,
     dim: SummaryDim,
-    from: &str,
-    to: &str,
+    f: &SummaryFilter,
 ) -> Result<Vec<SummaryRow>> {
     use SummaryDim as D;
-    let (key_expr, label_expr, join) = match dim {
-        D::Day => ("p.pay_date", "p.pay_date".to_string(), ""),
+    // 分组键 / 显示名；「按合同」额外带一列承包单位
+    let (key_expr, label_expr, sub_expr) = match dim {
         D::Project => (
             "p.project_id",
             "COALESCE(pj.project_name, p.project_id)".to_string(),
-            "LEFT JOIN prj_project pj ON pj.id = p.project_id",
+            "NULL",
         ),
         D::Contractor => (
             "c.contractor_id",
             "COALESCE(o.contractor_name, c.contractor_id)".to_string(),
-            "JOIN ct_contract c ON c.id = p.contract_id \
-             LEFT JOIN org_contractor o ON o.id = c.contractor_id",
+            "NULL",
         ),
+        D::Contract => (
+            "p.contract_id",
+            "c.contract_no || ' · ' || c.contract_name".to_string(),
+            "COALESCE(o.contractor_name, '')",
+        ),
+        D::ContractType => ("c.contract_type", "c.contract_type".to_string(), "NULL"),
+    };
+    // 归档口径 = 合同全周期支付率 ≥ 100%，与 ContractSummary::is_archived 同源
+    // （cs 是全周期视图，不受本查询的日期筛选影响）
+    let archived = match f.archived {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
     };
     let sql = format!(
-        "SELECT {key_expr} AS k, {label_expr} AS label, COUNT(*) AS n, \
-                COALESCE(SUM(p.amount_cent), 0) AS amt \
-         FROM pay_payment p {join} \
+        "SELECT {key_expr} AS k, {label_expr} AS label, {sub_expr} AS sub, \
+                COUNT(*) AS n, COALESCE(SUM(p.amount_cent), 0) AS amt \
+         FROM pay_payment p \
+         JOIN ct_contract c ON c.id = p.contract_id \
+         LEFT JOIN prj_project pj ON pj.id = p.project_id \
+         LEFT JOIN org_contractor o ON o.id = c.contractor_id \
+         LEFT JOIN v_contract_summary cs ON cs.contract_id = p.contract_id \
          WHERE p.status = 'PAID' AND p.is_deleted = 0 \
-           AND p.pay_date >= ?1 AND p.pay_date <= ?2 \
+           AND (?1 = '' OR p.pay_date >= ?1) \
+           AND (?2 = '' OR p.pay_date <= ?2) \
+           AND (?3 = -1 OR (CASE WHEN COALESCE(cs.pay_rate_bp, 0) >= 10000 THEN 1 ELSE 0 END) = ?3) \
+           AND (?4 = '' OR c.contract_type = ?4) \
+           AND (?5 = '' OR pj.project_name LIKE '%' || ?5 || '%' \
+                         OR o.contractor_name LIKE '%' || ?5 || '%' \
+                         OR c.contract_no LIKE '%' || ?5 || '%' \
+                         OR c.contract_name LIKE '%' || ?5 || '%') \
          GROUP BY {key_expr} \
-         ORDER BY {}",
-        match dim {
-            D::Day => "k",
-            _ => "amt DESC, label",
-        }
+         ORDER BY amt DESC, label"
     );
+    let kw = f.keyword.trim().to_string();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([from, to], |row| {
-        Ok(SummaryRow {
-            key: row.get(0)?,
-            label: row.get(1)?,
-            payment_count: row.get(2)?,
-            amount: money(row.get(3)?),
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            f.from.trim(),
+            f.to.trim(),
+            archived,
+            f.contract_type.clone().unwrap_or_default(),
+            kw
+        ],
+        |row| {
+            Ok(SummaryRow {
+                key: row.get(0)?,
+                label: row.get(1)?,
+                sub: row.get::<_, Option<String>>(2)?,
+                payment_count: row.get(3)?,
+                amount: money(row.get(4)?),
+            })
+        },
+    )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1004,9 +1035,22 @@ pub fn attachment_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
 }
 
 /// 删除一条附件；返回是否真的删掉了。
-pub fn delete_attachment(conn: &Connection, id: &str) -> Result<bool> {
+/// 删除附件；返回被删记录的 `(att_type, file_name)`，供审计日志记下对象名称。
+///
+/// 删完就查不到名字了，所以必须先取再删；没命中返回 `None`（调用方据此不写日志）。
+pub fn delete_attachment(conn: &Connection, id: &str) -> Result<Option<(String, String)>> {
+    let meta: Option<(String, String)> = conn
+        .query_row(
+            "SELECT att_type, file_name FROM ct_contract_attachment WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some(meta) = meta else {
+        return Ok(None);
+    };
     let n = conn.execute("DELETE FROM ct_contract_attachment WHERE id = ?1", [id])?;
-    Ok(n > 0)
+    Ok(if n > 0 { Some(meta) } else { None })
 }
 
 /// 该合同是否已上传某一类附件。

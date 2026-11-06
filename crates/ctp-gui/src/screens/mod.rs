@@ -4,6 +4,7 @@ pub mod checks;
 pub mod contracts;
 pub mod dashboard;
 pub mod login;
+pub mod logs;
 pub mod payments;
 pub mod reports;
 
@@ -17,6 +18,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         Screen::Contracts => contracts::draw(app, ui),
         Screen::Payments => payments::draw(app, ui),
         Screen::Summary => reports::summary(app, ui),
+        Screen::Logs => logs::draw(app, ui),
         Screen::Checks => checks::draw(app, ui),
     }
 }

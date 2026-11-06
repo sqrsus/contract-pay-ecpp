@@ -188,6 +188,7 @@ fn ensure_contractor(
         conn,
         "org_contractor",
         &c.id,
+        Some(&c.contractor_name),
         "CREATE",
         Some(&format!("{}（{}）", c.contractor_name, role.label())),
         operator,
@@ -241,6 +242,7 @@ fn resolve_project(
         conn,
         "prj_project",
         &p.id,
+        Some(&format!("{} {}", p.project_code, p.project_name)),
         "CREATE",
         Some(&format!("{} {}", p.project_code, p.project_name)),
         operator,
@@ -387,6 +389,7 @@ pub fn create_contract(
         &tx,
         "ct_contract",
         &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
         "CREATE",
         Some(&format!("{} {}", c.contract_no, c.contract_name)),
         operator,
@@ -409,7 +412,15 @@ pub fn activate_contract(conn: &mut Connection, contract_id: &str, operator: &st
     c.updated_at = now_iso();
     c.updated_by = Some(operator.to_string());
     repo::update_contract(&tx, &c)?;
-    db::insert_audit_log(&tx, "ct_contract", &c.id, "ACTIVATE", None, operator)?;
+    db::insert_audit_log(
+        &tx,
+        "ct_contract",
+        &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
+        "ACTIVATE",
+        None,
+        operator,
+    )?;
     tx.commit()?;
     Ok(c)
 }
@@ -469,6 +480,7 @@ pub fn save_attachment(
         conn,
         "ct_contract_attachment",
         &a.id,
+        Some(&name),
         "UPSERT",
         Some(&format!("{} · {}", kind.label(), name)),
         operator,
@@ -489,8 +501,16 @@ pub fn attachment_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
 }
 
 pub fn delete_attachment(conn: &Connection, id: &str, operator: &str) -> Result<()> {
-    if repo::delete_attachment(conn, id)? {
-        db::insert_audit_log(conn, "ct_contract_attachment", id, "DELETE", None, operator)?;
+    if let Some((kind, name)) = repo::delete_attachment(conn, id)? {
+        db::insert_audit_log(
+            conn,
+            "ct_contract_attachment",
+            id,
+            Some(&name),
+            "DELETE",
+            Some(&format!("删除附件：{name}（{kind}）")),
+            operator,
+        )?;
     }
     Ok(())
 }
@@ -506,7 +526,15 @@ pub fn void_contract(conn: &mut Connection, contract_id: &str, operator: &str) -
     c.updated_at = now_iso();
     c.updated_by = Some(operator.to_string());
     repo::update_contract(&tx, &c)?;
-    db::insert_audit_log(&tx, "ct_contract", &c.id, "VOID", None, operator)?;
+    db::insert_audit_log(
+        &tx,
+        "ct_contract",
+        &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
+        "VOID",
+        None,
+        operator,
+    )?;
     tx.commit()?;
     Ok(c)
 }
@@ -550,8 +578,13 @@ pub fn edit_contract_amount(
         &tx,
         "ct_contract",
         &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
         "EDIT_AMOUNT",
-        Some(&format!("{} -> {}：{reason}", old.format_yuan(), new_amount.format_yuan())),
+        Some(&format!(
+            "{} -> {}：{reason}",
+            old.format_yuan(),
+            new_amount.format_yuan()
+        )),
         operator,
     )?;
     tx.commit()?;
@@ -621,7 +654,15 @@ pub fn register_audit_price(
         ),
         None => format!("清空审计价，基准回退合同金额：{reason}"),
     };
-    db::insert_audit_log(&tx, "ct_contract", &c.id, "SET_AUDIT_PRICE", Some(&detail), operator)?;
+    db::insert_audit_log(
+        &tx,
+        "ct_contract",
+        &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
+        "SET_AUDIT_PRICE",
+        Some(&detail),
+        operator,
+    )?;
     tx.commit()?;
     Ok(c)
 }
@@ -653,6 +694,7 @@ pub fn set_delivery_date(
         &tx,
         "ct_contract",
         &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
         "SET_DELIVERY_DATE",
         Some(&detail),
         operator,
@@ -727,6 +769,7 @@ pub fn register_payment(
         &tx,
         "pay_payment",
         &p.id,
+        Some(&format!("{}（合同 {}）", p.payment_no, c.contract_no)),
         "REGISTER",
         Some(&format!(
             "{} {} 元（合同 {}，已付 {} / 基准 {}）",
@@ -762,6 +805,7 @@ pub fn void_payment(
         &tx,
         "pay_payment",
         &p.id,
+        Some(&p.payment_no),
         "VOID",
         Some(&format!("作废 {}：{reason}", p.payment_no)),
         operator,
@@ -813,21 +857,59 @@ pub fn set_tolerance(conn: &mut Connection, bp: Rate, operator: &str) -> Result<
     if !(0..=1_000).contains(&bp.bp()) {
         return Err(DomainError::Invariant(format!("容差率越界：{} bp（上限 1000）", bp.bp())).into());
     }
+    let old = db::tolerance(conn)?;
     db::set_meta(conn, "tol_bp", &bp.bp().to_string(), operator)?;
+    // R-31：容差直接决定拦截上限，改它必须留痕（旧值 → 新值）
+    db::insert_audit_log(
+        conn,
+        "sys_meta",
+        "tol_bp",
+        Some("超付容差"),
+        "SET_TOLERANCE",
+        Some(&format!("{} bp -> {} bp", old.bp(), bp.bp())),
+        operator,
+    )?;
     Ok(())
 }
 
 // ---------------------------------------------------------------- 报表导出
 
-/// 汇总统计：按维度 + 日期区间取数。
+/// 汇总统计：按维度 + 筛选条件取数（R-32）。
 pub fn summary_of(
     conn: &Connection,
     dim: ctp_core::ledger::SummaryDim,
-    from: &str,
-    to: &str,
+    filter: &ctp_core::ledger::SummaryFilter,
 ) -> Result<crate::report::ReportResult> {
-    let rows = repo::payment_summary(conn, dim, from, to)?;
-    Ok(crate::report::ReportResult::summary(&rows, dim, from, to))
+    let rows = repo::payment_summary(conn, dim, filter)?;
+    Ok(crate::report::ReportResult::summary(
+        &rows,
+        dim,
+        &filter.from,
+        &filter.to,
+        &filter_note(filter),
+    ))
+}
+
+/// 把筛选条件写成一句人话（报表副标题与界面提示共用）。
+/// 时间区间不进这句话——副标题里已有「统计区间」。
+pub fn filter_note(f: &ctp_core::ledger::SummaryFilter) -> String {
+    use ctp_core::contract::ContractType;
+    let mut parts: Vec<String> = Vec::new();
+    match f.archived {
+        Some(true) => parts.push("归档关闭".into()),
+        Some(false) => parts.push("履行中".into()),
+        None => {}
+    }
+    if let Some(code) = f.contract_type.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(t) = ContractType::from_code(code) {
+            parts.push(t.label().into());
+        }
+    }
+    let kw = f.keyword.trim();
+    if !kw.is_empty() {
+        parts.push(format!("「{kw}」"));
+    }
+    parts.join(" · ")
 }
 
 /// 从视图行构造报表结果（屏幕表格与导出共用这一份）。
@@ -837,20 +919,37 @@ pub fn report_of(conn: &Connection, kind: crate::report::ReportKind) -> Result<c
     match kind {
         ReportKind::CategorySummary => Ok(ReportResult::category(&repo::category_summary(conn)?)),
         ReportKind::PeriodSummary => Ok(ReportResult::period(&repo::period_summary(conn)?)),
-        // 三个汇总维度需要日期区间：CLI 走这里时用「本年年初 ~ 今天」，
-        // 界面自己带上用户选的区间，走 `summary_of`
-        ReportKind::SummaryDaily => {
-            let (from, to) = default_summary_range();
-            summary_of(conn, SummaryDim::Day, &from, &to)
-        }
-        ReportKind::SummaryProject => {
-            let (from, to) = default_summary_range();
-            summary_of(conn, SummaryDim::Project, &from, &to)
-        }
-        ReportKind::SummaryContractor => {
-            let (from, to) = default_summary_range();
-            summary_of(conn, SummaryDim::Contractor, &from, &to)
-        }
+        // 汇总维度需要日期区间：CLI 走这里时用「本年年初 ~ 今天」+ 全量筛选，
+        // 界面自己带上用户选的区间与筛选，走 `summary_of`
+        ReportKind::SummaryProject => summary_of(
+            conn,
+            SummaryDim::Project,
+            &range_filter(default_summary_range()),
+        ),
+        ReportKind::SummaryContractor => summary_of(
+            conn,
+            SummaryDim::Contractor,
+            &range_filter(default_summary_range()),
+        ),
+        ReportKind::SummaryContract => summary_of(
+            conn,
+            SummaryDim::Contract,
+            &range_filter(default_summary_range()),
+        ),
+        ReportKind::SummaryContractType => summary_of(
+            conn,
+            SummaryDim::ContractType,
+            &range_filter(default_summary_range()),
+        ),
+    }
+}
+
+/// 把 `(from, to)` 变成「只限区间、其余不限」的筛选条件。
+fn range_filter((from, to): (String, String)) -> ctp_core::ledger::SummaryFilter {
+    ctp_core::ledger::SummaryFilter {
+        from,
+        to,
+        ..Default::default()
     }
 }
 
@@ -879,7 +978,15 @@ pub fn export_report(
         "columns": cols,
     })
     .to_string();
-    db::insert_audit_log(conn, "report", kind.code(), "EXPORT", Some(&detail), operator)?;
+    db::insert_audit_log(
+        conn,
+        "report",
+        kind.code(),
+        Some(kind.title()),
+        "EXPORT",
+        Some(&detail),
+        operator,
+    )?;
     Ok((rows, cols))
 }
 
@@ -906,6 +1013,7 @@ pub fn export_result(
         conn,
         "report",
         result.kind.code(),
+        Some(result.kind.title()),
         "EXPORT",
         Some(&detail),
         operator,
