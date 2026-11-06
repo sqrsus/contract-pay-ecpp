@@ -1518,11 +1518,11 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
     let mut material: Option<AttachmentKind> = None;
 
     modal(format!("合同详情 · {}", c.contract_no), &p)
-        .default_width(1060.0)
-        .min_width(1060.0)
+        .default_width(960.0)
+        .min_width(960.0)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
         .show(ctx, |ui| {
-            ui.set_width(1020.0);
+            ui.set_width(920.0);
             ui.label(
                 RichText::new("只读视图；如需修改请关闭后从对应操作入口处理。")
                     .size(12.0)
@@ -1532,48 +1532,38 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
 
             // 顶部四项：合同金额 / 审计价 / 累计已付 / 支付率。
             // 支付率分母为有效计价基准（审计价 > 0 取审计价，否则合同金额）。
-            let (audit_text, audit_sub) = match summary.as_ref().and_then(|s| s.audit_price) {
-                Some(v) => (v.format_yuan(), "已审定".to_string()),
-                None => ("—".to_string(), "未审计，基准取合同金额".to_string()),
+            // R-30：四张卡只留标签与数值，不带任何说明性副标题——等高才整齐；
+            // 超付这类风险改由数值标红（Tone::Danger）表达，不靠文字解释。
+            let audit_text = match summary.as_ref().and_then(|s| s.audit_price) {
+                Some(v) => v.format_yuan(),
+                None => "—".to_string(),
             };
-            let (paid_text, paid_sub) = match &summary {
-                Some(s) => (
-                    s.paid_amount.format_yuan(),
-                    "已实付净额，作废单不计".to_string(),
-                ),
-                None => ("—".to_string(), "无汇总数据".to_string()),
+            let paid_text = match &summary {
+                Some(s) => s.paid_amount.format_yuan(),
+                None => "—".to_string(),
             };
-            let (rate_text, rate_sub, rate_tone) = match &summary {
-                Some(s) if s.is_inverted => (
-                    s.pay_rate.percent_string(),
-                    "基准低于已付，已超付".to_string(),
-                    Tone::Danger,
-                ),
-                Some(s) => (
-                    s.pay_rate.percent_string(),
-                    "已付 ÷ 有效计价基准".to_string(),
-                    Tone::Primary,
-                ),
-                None => ("—".to_string(), String::new(), Tone::Neutral),
+            let (rate_text, rate_tone) = match &summary {
+                Some(s) if s.is_inverted => (s.pay_rate.percent_string(), Tone::Danger),
+                Some(s) => (s.pay_rate.percent_string(), Tone::Primary),
+                None => ("—".to_string(), Tone::Neutral),
             };
             let cards = [
                 (
                     "合同金额",
                     c.original_amount_cent.format_yuan(),
-                    String::new(),
                     Tone::Neutral,
                 ),
-                ("审计价", audit_text, audit_sub, Tone::Neutral),
-                ("累计已付", paid_text, paid_sub, Tone::Primary),
-                ("支付率", rate_text, rate_sub, rate_tone),
+                ("审计价", audit_text, Tone::Neutral),
+                ("累计已付", paid_text, Tone::Primary),
+                ("支付率", rate_text, rate_tone),
             ];
             let gap = 12.0_f32;
-            let cw = (1020.0 - gap * 3.0) / 4.0;
+            let cw = (920.0 - gap * 3.0) / 4.0;
             ui.scope(|ui| {
                 ui.style_mut().spacing.item_spacing.x = gap;
                 ui.horizontal(|ui| {
-                    for (label, value, sub, tone) in cards {
-                        widgets::kpi(ui, &p, cw, label, value.as_str(), sub.as_str(), tone);
+                    for (label, value, tone) in cards {
+                        widgets::kpi(ui, &p, cw, label, value.as_str(), "", tone);
                     }
                 });
             });
@@ -1583,32 +1573,32 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
             // 两块之间用细分隔线区隔，不再画分栏标题。
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(486.0);
+                    ui.set_width(454.0);
                     form_card(&p).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         egui::Grid::new("ro_subject")
                             .num_columns(2)
                             .spacing([12.0, 4.0])
                             .show(ui, |ui| {
-                                ro_field(ui, &p, "合同名称", &c.contract_name, 218.0);
-                                ro_field(ui, &p, "所属项目", &project_text, 218.0);
+                                ro_field(ui, &p, "合同名称", &c.contract_name, 200.0);
+                                ro_field(ui, &p, "所属项目", &project_text, 200.0);
                                 ui.end_row();
-                                ro_field(ui, &p, "发包人（甲方）", &c.party_a, 218.0);
-                                ro_field(ui, &p, "承包单位", &contractor, 218.0);
+                                ro_field(ui, &p, "发包人（甲方）", &c.party_a, 200.0);
+                                ro_field(ui, &p, "承包单位", &contractor, 200.0);
                                 ui.end_row();
                                 ro_field(
                                     ui,
                                     &p,
                                     "项目负责人",
                                     c.project_leader.as_deref().unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ro_field(
                                     ui,
                                     &p,
                                     "联系方式",
                                     c.contact_info.as_deref().unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ui.end_row();
                             });
@@ -1624,23 +1614,23 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     &p,
                                     "招标方式",
                                     c.bid_method.map(|b| b.label()).unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ro_field(
                                     ui,
                                     &p,
                                     "开标时间",
                                     c.open_bid_date.as_deref().unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ui.end_row();
-                                ro_field(ui, &p, "招标代理", &agent, 218.0);
+                                ro_field(ui, &p, "招标代理", &agent, 200.0);
                                 ro_field(
                                     ui,
                                     &p,
                                     "工期（日历天）",
                                     &c.duration_days.to_string(),
-                                    218.0,
+                                    200.0,
                                 );
                                 ui.end_row();
                                 ro_field(
@@ -1648,14 +1638,14 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     &p,
                                     "计划开工",
                                     c.planned_start.as_deref().unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ro_field(
                                     ui,
                                     &p,
                                     "计划交工",
                                     c.planned_end.as_deref().unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ui.end_row();
                             });
@@ -1665,23 +1655,23 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(12.0);
 
                 ui.vertical(|ui| {
-                    ui.set_width(486.0);
+                    ui.set_width(454.0);
                     form_card(&p).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         egui::Grid::new("ro_price")
                             .num_columns(2)
                             .spacing([12.0, 4.0])
                             .show(ui, |ui| {
-                                ro_field(ui, &p, "合同类型", c.contract_type.label(), 218.0);
-                                ro_field(ui, &p, "合同类别", category, 218.0);
+                                ro_field(ui, &p, "合同类型", c.contract_type.label(), 200.0);
+                                ro_field(ui, &p, "合同类别", category, 200.0);
                                 ui.end_row();
-                                ro_field(ui, &p, "签订日期", &c.sign_date, 218.0);
+                                ro_field(ui, &p, "签订日期", &c.sign_date, 200.0);
                                 ro_field(
                                     ui,
                                     &p,
                                     "合同金额（元）",
                                     &c.original_amount_cent.format_yuan(),
-                                    218.0,
+                                    200.0,
                                 );
                                 ui.end_row();
                                 ro_field(
@@ -1692,14 +1682,14 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                         "{:.2}",
                                         c.retention_rate_bp as f32 / 100.0
                                     ),
-                                    218.0,
+                                    200.0,
                                 );
                                 ro_field(
                                     ui,
                                     &p,
                                     "交工日期",
                                     c.delivery_date.as_deref().unwrap_or("—"),
-                                    218.0,
+                                    200.0,
                                 );
                                 ui.end_row();
                             });
