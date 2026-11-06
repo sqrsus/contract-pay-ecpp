@@ -99,8 +99,8 @@ impl BreachLevel {
     pub fn label(self) -> &'static str {
         match self {
             BreachLevel::None => "正常",
-            BreachLevel::WithinTolerance => "已超有效计价基准（容差内）",
-            BreachLevel::OverTolerance => "超容差超付",
+            BreachLevel::WithinTolerance => "已超有效计价基准",
+            BreachLevel::OverTolerance => "超付拦截",
         }
     }
 

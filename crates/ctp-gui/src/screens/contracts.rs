@@ -4,6 +4,7 @@ use crate::screens::page_header;
 use crate::widgets::{self, Tone};
 use crate::App;
 use ctp_app::service;
+use ctp_app::{LedgerColumns, ReportResult};
 use ctp_core::contract::ContractStatus;
 use ctp_core::money::Money;
 use eframe::egui::{self, RichText};
@@ -51,6 +52,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     );
 
     let mut action: Option<Act> = None;
+    // R-33：合同台账导出（与屏幕表格同源的 ReportResult）
+    let mut export_ledger = false;
     // 展开面板里的打印入口：与拨款管理页「拨款明细」操作列一致
     let mut print_pay: Option<ctp_core::payment::Payment> = None;
     let mut print_material: Option<String> = None;
@@ -103,6 +106,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             if widgets::primary_button(ui, &p, "新建合同", true).clicked() {
                 action = Some(Act::New);
             }
+            if widgets::ghost_button(ui, &p, "导出 Excel").clicked() {
+                export_ledger = true;
+            }
         });
     });
 
@@ -124,23 +130,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 widgets::card(&p).show(ui, |ui| {
                     ui.set_width(table_w - 34.0);
                     let card_w = ui.available_width();
-                    let kw = app.search.trim().to_lowercase();
-                    let rows: Vec<&ctp_core::ledger::ContractSummary> = app
-                        .summaries
-                        .iter()
-                        .filter(|s| {
-                            let hit = kw.is_empty()
-                                || s.contract_no.to_lowercase().contains(&kw)
-                                || s.contract_name.to_lowercase().contains(&kw)
-                                || s.contractor_name.to_lowercase().contains(&kw);
-                            let st = match app.status_filter {
-                                Some(ContractStatus::Performing) => s.pay_rate.bp() < 10_000,
-                                Some(ContractStatus::Closed) => s.pay_rate.bp() >= 10_000,
-                                _ => true,
-                            };
-                            hit && st
-                        })
-                        .collect();
+                    let rows = filtered_summaries(app);
 
                     if rows.is_empty() {
                         widgets::empty_state(ui, &p, "没有符合条件的合同");
@@ -193,21 +183,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         + c_status;
                     let name_w = (card_w - fixed - cell_count * 4.0).max(name_min);
 
+                    // R-33：表头、单元格取值、合计行与 Excel 导出共用同一份 ReportResult。
+                    // 窄屏降列只改变结果里的可见列，页面交互一律不动。
+                    let visible = if tight_cols {
+                        LedgerColumns::TIGHT
+                    } else if compact {
+                        LedgerColumns::COMPACT
+                    } else {
+                        LedgerColumns::FULL
+                    };
+                    let result = ReportResult::contract_ledger(&rows, visible);
+
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        table_head(ui, &p, c_no, "合同编号", false);
-                        table_head(ui, &p, name_w, "合同名称", false);
-                        if !compact {
-                            table_head(ui, &p, c_contractor, "承包单位", false);
-                            table_head(ui, &p, c_amount, "合同金额", true);
+                        for c in &result.columns {
+                            let w = if c.key == "contract_name" {
+                                name_w
+                            } else {
+                                c.screen_width
+                            };
+                            table_head(ui, &p, w, c.title, c.right);
                         }
-                        if !tight_cols {
-                            table_head(ui, &p, c_audit, "审计价", true);
-                            table_head(ui, &p, c_delivery, "交工日期", false);
-                        }
-                        table_head(ui, &p, c_paid, "累计已付", true);
-                        table_head(ui, &p, c_rate, "支付率", false);
-                        table_head(ui, &p, c_status, "项目状态", false);
                     });
                     ui.add_space(2.0);
 
@@ -223,6 +219,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         .min_scrolled_height((page_h - 110.0).max(200.0))
                         .show(ui, |ui| {
                             for (idx, s) in rows.iter().enumerate() {
+                                // 本行所有显示文本来自 ReportResult；交互仍按列语义绘制
+                                let cells = &result.rows[idx];
+                                let text_of = |key: &str| -> String {
+                                    result
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.key == key)
+                                        .and_then(|i| cells.get(i))
+                                        .map(|c| c.display())
+                                        .unwrap_or_default()
+                                };
                                 let selected = app.selected.as_deref() == Some(&s.contract_id);
                                 let expanded =
                                     app.expanded_contract.as_deref() == Some(&s.contract_id);
@@ -239,7 +246,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 0.0;
                                             table_cell(ui, c_no, false, |ui| {
-                                                let mut txt = RichText::new(&s.contract_no)
+                                                let mut txt = RichText::new(text_of("contract_no"))
                                                     .size(12.5)
                                                     .color(p.primary);
                                                 if selected {
@@ -268,9 +275,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                     .size(11.0)
                                                     .color(p.text_muted),
                                                 );
+                                                let cname = text_of("contract_name");
                                                 let r = widgets::clipped_text(
                                                     ui,
-                                                    &s.contract_name,
+                                                    &cname,
                                                     (name_w - 22.0).max(20.0),
                                                     12.5,
                                                     if selected { p.primary } else { p.text },
@@ -291,10 +299,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             });
                                             if !compact {
                                                 table_cell(ui, c_contractor, false, |ui| {
-                                                    widgets::clipped_text(
-                                                        ui,
-                                                        &s.contractor_name,
-                                                        (c_contractor - 8.0).max(20.0),
+                                                    let contractor = text_of("contractor_name");
+                                                widgets::clipped_text(
+                                                    ui,
+                                                    &contractor,
+                                                    (c_contractor - 8.0).max(20.0),
                                                         12.0,
                                                         p.text_muted,
                                                         egui::Sense::hover(),
@@ -302,9 +311,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 });
                                                 table_cell(ui, c_amount, true, |ui| {
                                                     ui.label(
-                                                        RichText::new(
-                                                            s.total_amount.format_yuan(),
-                                                        )
+                                                    RichText::new(text_of("total_amount"))
                                                         .size(12.5)
                                                         .color(p.text),
                                                     );
@@ -313,11 +320,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             if !tight_cols {
                                                 table_cell(ui, c_audit, true, |ui| {
                                                     ui.label(
-                                                        RichText::new(
-                                                            s.audit_price
-                                                                .map(|m| m.format_yuan())
-                                                                .unwrap_or_else(|| "—".into()),
-                                                        )
+                                                    RichText::new(text_of("audit_price"))
                                                         .size(12.5)
                                                         .color(if s.is_audited {
                                                             p.text
@@ -328,9 +331,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 });
                                                 table_cell(ui, c_delivery, false, |ui| {
                                                     ui.label(
-                                                        RichText::new(
-                                                            s.delivery_date.as_deref().unwrap_or("—"),
-                                                        )
+                                                    RichText::new(text_of("delivery_date"))
                                                         .size(12.0)
                                                         .color(if s.delivery_date.is_some() {
                                                             p.text
@@ -342,7 +343,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             }
                                             table_cell(ui, c_paid, true, |ui| {
                                                 ui.label(
-                                                    RichText::new(s.paid_amount.format_yuan())
+                                                    RichText::new(text_of("paid_amount"))
                                                         .size(12.5)
                                                         .color(p.text),
                                                 );
@@ -358,14 +359,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 };
                                                 widgets::bar(ui, &p, frac, color, 82.0, 7.0);
                                                 ui.label(
-                                                    RichText::new(s.pay_rate.percent_string())
+                                                    RichText::new(text_of("pay_rate"))
                                                         .size(11.5)
                                                         .color(p.text_muted),
                                                 );
                                             });
                                             table_cell(ui, c_status, false, |ui| {
-                                                let (label, tone) = project_status(s);
-                                                widgets::badge(ui, &p, label, tone);
+                                                let (_, tone) = project_status(s);
+                                                let st = text_of("project_status");
+                                                widgets::badge(ui, &p, &st, tone);
                                             });
                                         });
                                     });
@@ -383,6 +385,28 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 }
                             }
                         });
+
+                    // R-33：合计行取自 result.totals，列宽与对齐跟表头同一套列配置
+                    widgets::divider(ui, &p);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (ci, cell) in result.totals.iter().enumerate() {
+                            let c = &result.columns[ci];
+                            let w = if c.key == "contract_name" {
+                                name_w
+                            } else {
+                                c.screen_width
+                            };
+                            table_cell(ui, w, c.right, |ui| {
+                                ui.label(
+                                    RichText::new(cell.display())
+                                        .size(12.5)
+                                        .strong()
+                                        .color(p.text),
+                                );
+                            });
+                        }
+                    });
 
                     ui.memory_mut(|m| m.data.insert_temp(keep_id, keep_rect));
 
@@ -418,6 +442,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             );
         }
     });
+
+    // R-33：导出与屏幕同源——按当前筛选构造完整 9 列结果（不受窄屏降列影响）
+    if export_ledger {
+        let rows = filtered_summaries(app);
+        let result = ReportResult::contract_ledger(&rows, LedgerColumns::FULL);
+        app.export_report_result(&result);
+    }
 
     // 浏览用户不许触发写类动作：不置灰，点了直接提示「无权限」
     let writes = matches!(
@@ -488,6 +519,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some(cid) = print_material {
         app.open_material_print(&cid);
     }
+}
+
+/// 当前搜索词 + 项目状态筛选后的合同行（屏幕表格与导出共用同一份筛选结果）。
+fn filtered_summaries(app: &App) -> Vec<ctp_core::ledger::ContractSummary> {
+    let kw = app.search.trim().to_lowercase();
+    app.summaries
+        .iter()
+        .filter(|s| {
+            let hit = kw.is_empty()
+                || s.contract_no.to_lowercase().contains(&kw)
+                || s.contract_name.to_lowercase().contains(&kw)
+                || s.contractor_name.to_lowercase().contains(&kw);
+            let st = match app.status_filter {
+                Some(ContractStatus::Performing) => s.pay_rate.bp() < 10_000,
+                Some(ContractStatus::Closed) => s.pay_rate.bp() >= 10_000,
+                _ => true,
+            };
+            hit && st
+        })
+        .cloned()
+        .collect()
 }
 
 /// 项目状态：支付率达 100% 自动「归档关闭」，否则「履行中」。
@@ -576,84 +628,98 @@ fn expand_panel(
                 return;
             }
 
-            // 列宽与拨款管理页保持同一套数值，读起来是同一张表
+            // R-33：与「拨款管理 · 拨款明细」同源，列与取值都来自 ReportResult；
+            // 操作列属于交互，仍留在页面侧绘制。
+            let owned: Vec<ctp_core::payment::Payment> =
+                mine.iter().take(8).map(|p| (*p).clone()).collect();
+            let result = ReportResult::payment_ledger(&owned, &s.contract_name);
             ui.spacing_mut().item_spacing.x = 12.0;
-            TableBuilder::new(ui)
+            let mut tb = TableBuilder::new(ui)
                 .striped(false)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::auto().at_least(104.0))
-                .column(Column::auto().at_least(80.0))
-                .column(Column::auto().at_least(92.0))
-                .column(Column::remainder().at_least(60.0))
-                .column(Column::auto().at_least(54.0))
-                .column(Column::auto().at_least(150.0))
-                .header(22.0, |mut h| {
-                    for t in ["拨款单号", "开单日期", "金额", "事由", "状态", "操作"] {
-                        h.col(|ui| {
-                            ui.label(RichText::new(t).size(11.5).color(p.text_muted));
-                        });
-                    }
-                })
-                .body(|mut body| {
-                    for pm in mine.iter().take(8) {
-                        body.row(28.0, |mut row| {
-                            row.col(|ui| {
-                                if widgets::link(ui, p, &pm.payment_no, 11.5)
-                                    .on_hover_text("查看拨款单详情")
-                                    .clicked()
-                                {
-                                    *open_pay = Some(pm.id.clone());
-                                }
-                            });
-                            row.col(|ui| {
-                                ui.label(
-                                    RichText::new(&pm.pay_date).size(11.5).color(p.text_muted),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(pm.amount_cent.format_yuan())
-                                                .size(12.0)
-                                                .color(p.text),
-                                        );
-                                    },
-                                );
-                            });
-                            row.col(|ui| {
-                                let w = ui.available_width().max(24.0);
-                                widgets::clipped_text(
-                                    ui,
-                                    pm.reason.as_deref().unwrap_or("—"),
-                                    w,
-                                    11.5,
-                                    p.text_muted,
-                                    egui::Sense::hover(),
-                                );
-                            });
-                            row.col(|ui| {
-                                widgets::badge(ui, p, "已付", Tone::Success);
-                            });
-                            row.col(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                if widgets::link(ui, p, "打印拨款单", 11.0)
-                                    .on_hover_text("预览付款打印模板的 9 个合并域取值")
-                                    .clicked()
-                                {
-                                    *print_pay = Some((*pm).clone());
-                                }
-                                if widgets::link(ui, p, "打印附件", 11.0)
-                                    .on_hover_text("中标通知书、审计报告等材料打印")
-                                    .clicked()
-                                {
-                                    *print_material = Some(pm.contract_id.clone());
-                                }
-                            });
-                        });
-                    }
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for c in &result.columns {
+                tb = tb.column(if c.screen_remainder {
+                    Column::remainder().at_least(c.screen_width)
+                } else {
+                    Column::auto().at_least(c.screen_width)
                 });
+            }
+            tb = tb.column(Column::auto().at_least(150.0));
+            tb.header(22.0, |mut h| {
+                for c in &result.columns {
+                    h.col(|ui| {
+                        ui.label(RichText::new(c.title).size(11.5).color(p.text_muted));
+                    });
+                }
+                h.col(|ui| {
+                    ui.label(RichText::new("操作").size(11.5).color(p.text_muted));
+                });
+            })
+            .body(|mut body| {
+                for (ri, pm) in mine.iter().take(8).enumerate() {
+                    let cells = &result.rows[ri];
+                    body.row(28.0, |mut row| {
+                        for (ci, cell) in cells.iter().enumerate() {
+                            let key = result.columns[ci].key;
+                            let text = cell.display();
+                            row.col(|ui| match key {
+                                "payment_no" => {
+                                    if widgets::link(ui, p, text.as_str(), 11.5)
+                                        .on_hover_text("查看拨款单详情")
+                                        .clicked()
+                                    {
+                                        *open_pay = Some(pm.id.clone());
+                                    }
+                                }
+                                "amount" => {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(text.as_str())
+                                                    .size(12.0)
+                                                    .color(p.text),
+                                            );
+                                        },
+                                    );
+                                }
+                                "reason" => {
+                                    let w = ui.available_width().max(24.0);
+                                    widgets::clipped_text(
+                                        ui,
+                                        text.as_str(),
+                                        w,
+                                        11.5,
+                                        p.text_muted,
+                                        egui::Sense::hover(),
+                                    );
+                                }
+                                "status" => {
+                                    widgets::badge(ui, p, text.as_str(), Tone::Success);
+                                }
+                                _ => {
+                                    ui.label(RichText::new(text.as_str()).size(11.5).color(p.text_muted));
+                                }
+                            });
+                        }
+                        row.col(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if widgets::link(ui, p, "打印拨款单", 11.0)
+                                .on_hover_text("预览付款打印模板的 9 个合并域取值")
+                                .clicked()
+                            {
+                                *print_pay = Some((*pm).clone());
+                            }
+                            if widgets::link(ui, p, "打印附件", 11.0)
+                                .on_hover_text("中标通知书、审计报告等材料打印")
+                                .clicked()
+                            {
+                                *print_material = Some(pm.contract_id.clone());
+                            }
+                        });
+                    });
+                }
+            });
 
             if mine.len() > 8 {
                 ui.add_space(2.0);
@@ -714,7 +780,7 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
         widgets::kv(ui, &p, "有效计价基准", &format!("{} 元", s.base_amount.format_yuan()));
         widgets::kv(ui, &p, "累计已付", &format!("{} 元", s.paid_amount.format_yuan()));
         // 可付额度按「付清条件」封顶后的口径，与拨款管理页一致
-        let quota_view = s.to_quota(ctp_core::rate::Rate::from_bp(app.tolerance_bp));
+        let quota_view = s.to_quota(ctp_core::rate::Rate::ZERO);
         let payable_now = Money::from_cent(quota_view.payable_amount.cent().max(0));
         widgets::kv(ui, &p, "可付额度", &format!("{} 元", payable_now.format_yuan()));
         // 支付率后带上封顶比例：80% 说明付清条件尚未满足（不额外占一行）

@@ -231,12 +231,12 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str, operator: &str) -> Re
     Ok(())
 }
 
-/// 容差率（BR-15 的 `tol_bp`），缺省 0。
-pub fn tolerance(conn: &Connection) -> Result<Rate> {
-    let bp = get_meta(conn, "tol_bp")?
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(0);
-    Ok(Rate::from_bp(bp))
+/// 超付容差（BR-15 的 `tol_bp`）：**业务口径固定为 0**。
+///
+/// R-33 起界面不再提供任何配置入口，`sys_meta.tol_bp` 仅为兼容旧库保留，
+/// 读取一律返回 0，避免旧库里曾保存过的非 0 值继续抬高拦截上限。
+pub fn tolerance(_conn: &Connection) -> Result<Rate> {
+    Ok(Rate::ZERO)
 }
 
 /// 业务流水号：唯一入口，事务内自增（4.2.4 目标态写法，本期即用）。

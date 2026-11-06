@@ -5,7 +5,7 @@
 //! | `比率口径_视图与应用层差异为零` | H1 / 5.5 约束第 5 条 |
 //! | `已付口径_作废单不计入净额` | H2 / H5 / R-20 |
 //! | `超付拦截_拒绝并给出差额` | BR-01 / E-02 |
-//! | `容差内放行_超容差拦截` | BR-15 三支处置 |
+//! | `容差固定为零_超基准即拦截` | BR-15 / R-33 |
 //! | `审计价切换_已付不变基准回溯` | BR-14 / E-00 |
 //! | `金额编辑留痕_已审定不改基准` | BR-22 |
 //! | `草稿合同不可拨款` | 4.2.2 is_payable |
@@ -190,23 +190,24 @@ fn 超付拦截_拒绝并给出差额() {
 }
 
 #[test]
-fn 容差内放行_超容差拦截() {
+fn 容差固定为零_超基准即拦截() {
     let (mut conn, cid) = fixture(1000);
-    service::set_tolerance(&mut conn, Rate::from_bp(100), "t").unwrap(); // 1%
+    // R-33：界面与命令行都不再能改容差；旧库里残留的非 0 值也必须被忽略
+    db::set_meta(&conn, "tol_bp", "100", "t").unwrap();
 
-    pay(&mut conn, &cid, 1005).unwrap(); // 超基准但在容差内
     let q = service::quota_of(&conn, &cid).unwrap();
-    assert_eq!(q.ceiling_amount.cent(), 101_000);
-    assert_eq!(q.available_amount.cent(), 500);
-    assert!(q.is_inverted, "超基准即标红，标记不含容差");
-    assert_eq!(q.breach_level(), BreachLevel::WithinTolerance);
+    assert_eq!(q.tolerance.bp(), 0);
+    assert_eq!(q.ceiling_amount.cent(), 100_000, "上限即有效计价基准");
 
-    // 再拨 6 元即超容差
-    let err = pay(&mut conn, &cid, 6).unwrap_err();
-    assert!(err.is_quota_exceeded());
-    // 容差内剩余 5 元可拨
-    pay(&mut conn, &cid, 5).unwrap();
-    assert_eq!(repo::paid_net(&conn, &cid).unwrap().cent(), 101_000);
+    pay(&mut conn, &cid, 1000).unwrap(); // 正好付清
+    let q = service::quota_of(&conn, &cid).unwrap();
+    assert_eq!(q.available_amount.cent(), 0);
+    assert!(!q.is_inverted, "已付等于基准不算倒挂");
+    assert_eq!(q.breach_level(), BreachLevel::None);
+
+    let err = pay(&mut conn, &cid, 1).unwrap_err();
+    assert!(err.is_quota_exceeded(), "固定 0 下不允许再超基准");
+    assert_eq!(repo::paid_net(&conn, &cid).unwrap().cent(), 100_000);
 }
 
 #[test]

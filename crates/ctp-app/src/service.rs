@@ -718,7 +718,8 @@ pub fn register_payment(
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, &input.contract_id)?;
     let paid = repo::paid_net(&tx, &c.id)?;
-    let tolerance = db::tolerance(&tx)?;
+    // 超付容差固定为 0（R-33）：不再读 sys_meta.tol_bp，也不提供任何写入口
+    let tolerance = Rate::ZERO;
     // 1) 合同须可拨款；2) 本次金额不得超过「付清条件」下的可付额度
     let quota = PaymentQuota::for_new_payment(&c, paid, tolerance, &input.pay_date)?;
     quota.check_new_payment(input.amount)?;
@@ -826,7 +827,7 @@ pub fn quota_of(conn: &Connection, contract_id: &str) -> Result<PaymentQuota> {
 pub fn quota_on(conn: &Connection, contract_id: &str, pay_date: &str) -> Result<PaymentQuota> {
     let c = repo::get_contract(conn, contract_id)?;
     let paid = repo::paid_net(conn, contract_id)?;
-    let tolerance = db::tolerance(conn)?;
+    let tolerance = Rate::ZERO;
     let today = ctp_core::date::today_iso();
     let date = if ctp_core::date::is_iso_date(pay_date) {
         pay_date
@@ -850,26 +851,6 @@ pub fn reconcile(conn: &Connection) -> Result<Vec<RateMismatch>> {
         }
     }
     Ok(out)
-}
-
-/// 容差率读写（`sys_meta.tol_bp`）。
-pub fn set_tolerance(conn: &mut Connection, bp: Rate, operator: &str) -> Result<()> {
-    if !(0..=1_000).contains(&bp.bp()) {
-        return Err(DomainError::Invariant(format!("容差率越界：{} bp（上限 1000）", bp.bp())).into());
-    }
-    let old = db::tolerance(conn)?;
-    db::set_meta(conn, "tol_bp", &bp.bp().to_string(), operator)?;
-    // R-31：容差直接决定拦截上限，改它必须留痕（旧值 → 新值）
-    db::insert_audit_log(
-        conn,
-        "sys_meta",
-        "tol_bp",
-        Some("超付容差"),
-        "SET_TOLERANCE",
-        Some(&format!("{} bp -> {} bp", old.bp(), bp.bp())),
-        operator,
-    )?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------- 报表导出
@@ -941,6 +922,15 @@ pub fn report_of(conn: &Connection, kind: crate::report::ReportKind) -> Result<c
             SummaryDim::ContractType,
             &range_filter(default_summary_range()),
         ),
+        // 台账 / 一览：命令行与默认导出口径取全量；界面按筛选与窄屏列自己构造结果
+        ReportKind::ContractLedger => Ok(crate::report::ReportResult::contract_ledger(
+            &repo::summaries(conn)?,
+            crate::report::LedgerColumns::FULL,
+        )),
+        ReportKind::PaymentLedger => Ok(crate::report::ReportResult::payment_ledger(
+            &repo::list_payments(conn, None)?,
+            "全部合同",
+        )),
     }
 }
 

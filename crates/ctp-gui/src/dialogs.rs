@@ -35,6 +35,68 @@ pub enum Dialog {
     MaterialPrint,
     /// 合同详情只读弹窗（点击合同编号）
     ContractDetail,
+    /// 批量拨款导入结果（R-33）：常驻、真模态，仅「关闭」可退出
+    ImportResult,
+}
+
+/// 导入结果弹窗的数据：只保留统计摘要与失败条目，不逐行列明细（R-33 确认口径）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportResultView {
+    pub imported: usize,
+    pub skipped: usize,
+    /// （Excel 可见行号，失败原因）
+    pub failures: Vec<(usize, String)>,
+    /// 整份拒绝的原因（文件打不开 / 缺校验表 / 标记不符 / 无权限等）
+    pub rejected: Option<String>,
+}
+
+impl ImportResultView {
+    pub fn from_report(r: &ctp_app::batch::ImportReport) -> Self {
+        ImportResultView {
+            imported: r.imported,
+            skipped: r.skipped,
+            failures: r
+                .failures
+                .iter()
+                .map(|f| (f.line, f.message.clone()))
+                .collect(),
+            rejected: None,
+        }
+    }
+
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        ImportResultView {
+            imported: 0,
+            skipped: 0,
+            failures: Vec::new(),
+            rejected: Some(reason.into()),
+        }
+    }
+
+    /// 三种场景共用的状态：整份拒绝 / 全部失败为红，部分失败为黄，全成功为绿。
+    fn tone(&self) -> Tone {
+        if self.rejected.is_some()
+            || (self.imported == 0 && !self.failures.is_empty())
+        {
+            Tone::Danger
+        } else if !self.failures.is_empty() {
+            Tone::Warn
+        } else {
+            Tone::Success
+        }
+    }
+
+    fn headline(&self) -> &'static str {
+        if self.rejected.is_some() {
+            "整份文件已拒绝"
+        } else if self.imported == 0 && !self.failures.is_empty() {
+            "全部失败"
+        } else if !self.failures.is_empty() {
+            "部分成功、部分失败"
+        } else {
+            "导入完成"
+        }
+    }
 }
 
 /// 新建时暂存于内存的附件。点「保存合同」才随合同一起落库，
@@ -276,6 +338,17 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                 egui::Color32::from_black_alpha(alpha),
             );
     }
+    // R-33：导入结果弹窗是真模态。全屏交互层吃掉所有点击，背后界面仍可见但不可操作；
+    // Esc、点弹窗外、刷新、切换主题都不会关闭它，只有弹窗内的「关闭」按钮能退出。
+    if app.dialog == Dialog::ImportResult {
+        let rect = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("import_result_blocker"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                let _ = ui.allocate_response(rect.size(), egui::Sense::click());
+            });
+    }
     match app.dialog {
         Dialog::None => {}
         Dialog::NewContract => new_contract(app, ctx),
@@ -287,9 +360,118 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::Attachments => attachments(app, ctx),
         Dialog::MaterialPrint => material_print(app, ctx),
         Dialog::ContractDetail => contract_detail(app, ctx),
+        Dialog::ImportResult => import_result(app, ctx),
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
+    }
+}
+
+/// 批量拨款导入结果：常驻真模态，只列统计摘要 + 失败条目，不列逐行明细。
+fn import_result(app: &mut App, ctx: &egui::Context) {
+    let Some(view) = app.import_result.clone() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+    let p = app.pal;
+    let mut close = false;
+    egui::Window::new("批量拨款导入结果")
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(egui::Stroke::new(1.0_f32, p.border))
+                .rounding(egui::Rounding::same(14.0))
+                .inner_margin(egui::Margin::same(20.0)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("批量拨款导入结果")
+                        .size(17.0)
+                        .strong()
+                        .color(p.text),
+                );
+                widgets::badge(ui, &p, view.headline(), view.tone());
+            });
+            ui.add_space(10.0);
+
+            ui.label(
+                RichText::new(format!(
+                    "成功导入 {} 笔 · 跳过 {} 行 · 失败 {} 行",
+                    view.imported,
+                    view.skipped,
+                    view.failures.len()
+                ))
+                .size(13.5)
+                .strong()
+                .color(p.text),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "本次金额留空或为 0 的行跳过；日期留空按当天、事由留空按「拨付进度款」、支付方式留空按转账。",
+                )
+                .size(11.5)
+                .color(p.text_muted),
+            );
+            ui.add_space(10.0);
+
+            if let Some(reason) = &view.rejected {
+                widgets::divider(ui, &p);
+                ui.add_space(6.0);
+                ui.label(RichText::new("拒绝原因").size(12.5).strong().color(p.danger));
+                ui.label(RichText::new(reason).size(12.0).color(p.text));
+                ui.add_space(8.0);
+            }
+
+            if !view.failures.is_empty() {
+                widgets::divider(ui, &p);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("失败明细（{} 行）", view.failures.len()))
+                        .size(12.5)
+                        .strong()
+                        .color(p.danger),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("import_failures_scroll")
+                    .max_height(220.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (line, msg) in &view.failures {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!("第 {line} 行"))
+                                        .size(12.0)
+                                        .strong()
+                                        .color(p.danger),
+                                );
+                                ui.label(RichText::new(msg).size(12.0).color(p.text));
+                            });
+                        }
+                    });
+                ui.add_space(8.0);
+            }
+
+            widgets::divider(ui, &p);
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        app.dialog = Dialog::None;
+        app.import_result = None;
     }
 }
 

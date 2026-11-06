@@ -21,7 +21,7 @@ pub mod gdi;
 
 pub use paper::Voucher;
 pub use print::{PaymentPrintData, Preview, PrintError, PAYMENT_TEMPLATE};
-pub use report::{Cell, ColumnKind, ReportColumn, ReportKind, ReportResult};
+pub use report::{Cell, ColumnKind, LedgerColumns, ReportColumn, ReportKind, ReportResult};
 pub use service::{
     create_contract, edit_contract_amount, export_report, payment_print_data, print_vouchers,
     quota_of, quota_on, reconcile, register_audit_price, register_payment, report_of,

@@ -141,6 +141,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut open_contract: Option<String> = None;
     let mut print_pay: Option<String> = None;
     let mut print_material: Option<String> = None;
+    // 批量打印：与拨款管理页共用 print_sel，遍历列表时先收集勾选变化
+    let mut batch_print = false;
+    let mut select_all = false;
+    let mut clear_sel = false;
+    let mut sel_toggle: Vec<(String, bool)> = Vec::new();
 
     // (单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额, 是否作废)
     let mut recent: Vec<(
@@ -179,6 +184,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         })
         .collect();
     recent.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    // 只勾最近 6 条里未作废的单据；顺序与列表一致，批量打印按此顺序成页
+    let payable_ids: Vec<String> = recent
+        .iter()
+        .take(6)
+        .filter(|r| !r.7)
+        .map(|r| r.0.clone())
+        .collect();
 
     widgets::card(&p).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -195,9 +207,37 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             return;
         }
 
+        // 与「拨款管理 · 拨款明细」完全一致的文字链，共用同一套勾选集合
+        let chosen = payable_ids
+            .iter()
+            .filter(|id| app.print_sel.contains(*id))
+            .count();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if widgets::link(ui, &p, &format!("批量打印所选（{chosen}）"), 11.0)
+                .on_hover_text("勾选的拨款单合并成一份 Word，每张一页")
+                .clicked()
+            {
+                batch_print = true;
+            }
+            if widgets::link(ui, &p, "全选", 11.0).clicked() {
+                select_all = true;
+            }
+            if chosen > 0 && widgets::link(ui, &p, "清空", 11.0).clicked() {
+                clear_sel = true;
+            }
+            ui.label(
+                RichText::new("作废单不参与勾选，也不可打印")
+                    .size(11.0)
+                    .color(p.text_muted),
+            );
+        });
+        ui.add_space(2.0);
+
         // 表头
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
+            head_cell(ui, &p, 24.0, "", false);
             head_cell(ui, &p, 86.0, "开单日期", false);
             head_cell(ui, &p, 104.0, "拨款单号", false);
             head_cell(ui, &p, 236.0, "合同名称", false);
@@ -223,6 +263,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
+                        cell(ui, 24.0, false, |ui| {
+                            let paid = !voided;
+                            let mut on = app.print_sel.contains(&pay_id);
+                            let cb = ui.add_enabled(paid, egui::Checkbox::new(&mut on, ""));
+                            if !paid {
+                                cb.on_hover_text("作废单不可打印");
+                            } else if cb.changed() {
+                                sel_toggle.push((pay_id.clone(), on));
+                            }
+                        });
                         cell(ui, 86.0, false, |ui| {
                             ui.label(RichText::new(date).size(12.0).color(p.text_muted));
                         });
@@ -293,6 +343,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     });
 
     // ---------------- 交互落地
+    for (id, on) in sel_toggle {
+        if on {
+            app.print_sel.insert(id);
+        } else {
+            app.print_sel.remove(&id);
+        }
+    }
+    if clear_sel {
+        app.print_sel.clear();
+    }
+    if select_all {
+        app.print_sel.extend(payable_ids.iter().cloned());
+    }
+    if batch_print {
+        let ids: Vec<String> = payable_ids
+            .iter()
+            .filter(|id| app.print_sel.contains(*id))
+            .cloned()
+            .collect();
+        app.open_batch_print(ids);
+    }
     if let Some(id) = open_pay {
         app.open_payment(&id);
     }

@@ -84,7 +84,7 @@ impl Screen {
             Screen::Payments => "登记拨款单并实时校验可付额度",
             Screen::Summary => "按日 / 项目 / 承包单位统计已付拨款",
             Screen::Logs => "写库操作留痕、按时间段或全部清理",
-            Screen::Checks => "口径自检、超付容差、管理密码",
+            Screen::Checks => "口径自检、管理密码",
         }
     }
 }
@@ -138,7 +138,6 @@ pub struct App {
     pub categories: Vec<CategoryRow>,
     pub periods: Vec<PeriodRow>,
     pub report: Option<CheckReport>,
-    pub tolerance_bp: i32,
     pub schema_version: String,
 
     pub search: String,
@@ -175,7 +174,6 @@ pub struct App {
     /// 项目交工弹窗的日期输入
     pub delivery_form: String,
     pub amount_form: AmountForm,
-    pub tol_input: String,
 
     // ---------------- 登录与权限（角色只在进程内有效，关掉程序即失效）
     /// 当前登录身份；`None` 表示停在登录页
@@ -237,6 +235,8 @@ pub struct App {
     pub log_clear: Option<(ctp_store::audit::LogFilter, String)>,
 
     pub dialog: Dialog,
+    /// 批量导入结果弹窗的数据（与 `Dialog::ImportResult` 配套，保持 Dialog 可 Copy）
+    pub import_result: Option<crate::dialogs::ImportResultView>,
     pub confirm: Option<Confirm>,
     pub confirm_reason: String,
     pub toast: Option<Toast>,
@@ -313,7 +313,6 @@ impl App {
             categories: Vec::new(),
             periods: Vec::new(),
             report: None,
-            tolerance_bp: 0,
             schema_version: String::new(),
             search: String::new(),
             status_filter: None,
@@ -336,7 +335,6 @@ impl App {
             audit_form: AuditForm::default(),
             delivery_form: String::new(),
             amount_form: AmountForm::default(),
-            tol_input: String::new(),
             role: None,
             login_pw: String::new(),
             login_err: None,
@@ -363,6 +361,7 @@ impl App {
             log_key: None,
             log_clear: None,
             dialog: Dialog::None,
+            import_result: None,
             confirm: None,
             confirm_reason: String::new(),
             toast: None,
@@ -568,10 +567,6 @@ impl App {
         if let Ok(v) = repo::period_summary(conn) {
             self.periods = v;
         }
-        if let Ok(bp) = db::tolerance(conn) {
-            self.tolerance_bp = bp.bp();
-            self.tol_input = bp.bp().to_string();
-        }
         if let Ok(Some(v)) = db::schema_version(conn) {
             self.schema_version = v;
         }
@@ -746,28 +741,23 @@ impl App {
         self.load_print_vouchers();
     }
 
-    /// 批量打印入口：拨款管理页勾选的若干张，按列表顺序成页（一张两页）。
-    pub fn open_batch_print(&mut self) {
+    /// 批量打印入口：按调用方给出的 id 列表（已按列表顺序）成页（一张两页）。
+    /// 总览「最近拨款」与拨款管理「拨款明细」共用同一套 `print_sel` 与打印逻辑。
+    pub fn open_batch_print(&mut self, ids: Vec<String>) {
         if self.print_sel.is_empty() {
             self.error("请先勾选要打印的拨款单");
             return;
         }
-        // 以列表顺序为准：勾选先后不影响成品里的顺序；只取当前合同下的单子
-        let cid = self.pay_contract.clone();
-        let ids: Vec<String> = self
-            .payments
-            .iter()
-            .filter(|p| {
-                Some(&p.contract_id) == cid.as_ref() && self.print_sel.contains(&p.id)
-            })
-            .map(|p| p.id.clone())
+        let chosen: Vec<String> = ids
+            .into_iter()
+            .filter(|id| self.print_sel.contains(id))
             .collect();
-        if ids.is_empty() {
+        if chosen.is_empty() {
             self.print_sel.clear();
             self.error("勾选的拨款单已不在当前列表中，请重新勾选");
             return;
         }
-        self.print_ids = ids;
+        self.print_ids = chosen;
         self.load_print_vouchers();
     }
 
@@ -851,6 +841,12 @@ impl App {
             self.error("还没有汇总结果，先选好区间");
             return;
         };
+        self.export_report_result(&result);
+    }
+
+    /// 导出任意一份已构造好的 `ReportResult`（汇总统计 / 合同台账 / 拨款一览通用）。
+    /// 屏幕与 Excel 读同一个结果对象，不重新查库、不重算合计。
+    pub fn export_report_result(&mut self, result: &ctp_app::report::ReportResult) {
         let outcome: Result<(usize, std::path::PathBuf), String> = (|| {
             let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
             let path = rfd::FileDialog::new()
@@ -858,9 +854,8 @@ impl App {
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .save_file()
                 .ok_or_else(String::new)?;
-            let (rows, _) =
-                ctp_app::service::export_result(conn, &result, &path, "界面用户")
-                    .map_err(|e| e.to_string())?;
+            let (rows, _) = ctp_app::service::export_result(conn, result, &path, "界面用户")
+                .map_err(|e| e.to_string())?;
             Ok((rows, path))
         })();
         match outcome {
@@ -873,6 +868,12 @@ impl App {
             Err(e) if e.is_empty() => {}
             Err(e) => self.error(format!("导出失败：{e}")),
         }
+    }
+
+    /// 打开常驻的导入结果弹窗（成功 / 部分失败 / 全部失败 / 整份拒绝都走这里）。
+    pub fn show_import_result(&mut self, view: crate::dialogs::ImportResultView) {
+        self.import_result = Some(view);
+        self.dialog = Dialog::ImportResult;
     }
 
     pub fn toast(&mut self, tone: Tone, text: impl Into<String>) {
@@ -1039,6 +1040,7 @@ impl App {
         if logout {
             self.role = None;
             self.dialog = Dialog::None;
+            self.import_result = None;
             self.confirm = None;
             self.modal_contract = None;
             self.screen = Screen::Dashboard;
@@ -1136,14 +1138,7 @@ impl App {
                     ui.label(RichText::new(text).size(12.5).color(p.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let role = self.role.map(|r| r.label()).unwrap_or("未登录");
-                        ui.label(
-                            RichText::new(format!(
-                                "{role} · 超付容差 {} bp",
-                                self.tolerance_bp
-                            ))
-                            .size(11.5)
-                            .color(p.text_muted),
-                        );
+                        ui.label(RichText::new(role).size(11.5).color(p.text_muted));
                     });
                 });
             });

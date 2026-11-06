@@ -27,6 +27,10 @@ pub enum ReportKind {
     SummaryContract,
     /// 汇总统计 · 按合同类型
     SummaryContractType,
+    /// 合同台账（数据源 V1 `v_contract_summary`）
+    ContractLedger,
+    /// 拨款一览（数据源 `pay_payment`）
+    PaymentLedger,
 }
 
 impl ReportKind {
@@ -38,6 +42,8 @@ impl ReportKind {
             ReportKind::SummaryContractor => "SUMMARY_CONTRACTOR",
             ReportKind::SummaryContract => "SUMMARY_CONTRACT",
             ReportKind::SummaryContractType => "SUMMARY_CONTRACT_TYPE",
+            ReportKind::ContractLedger => "CONTRACT_LEDGER_V1",
+            ReportKind::PaymentLedger => "PAYMENT_LEDGER_V1",
         }
     }
 
@@ -49,6 +55,8 @@ impl ReportKind {
             ReportKind::SummaryContractor => "拨款汇总 · 按承包单位",
             ReportKind::SummaryContract => "拨款汇总 · 按合同",
             ReportKind::SummaryContractType => "拨款汇总 · 按合同类型",
+            ReportKind::ContractLedger => "合同台账",
+            ReportKind::PaymentLedger => "拨款一览",
         }
     }
 
@@ -68,6 +76,8 @@ impl ReportKind {
             ReportKind::SummaryContractType => {
                 "按合同类型归集（施工/监理/设计/勘察/货物/服务），仅统计已实付单据"
             }
+            ReportKind::ContractLedger => "按合同汇总金额与支付进度（数据源 V1 视图）",
+            ReportKind::PaymentLedger => "按合同列出拨款单，作废单保留记录、不计入合计",
         }
     }
 
@@ -79,6 +89,8 @@ impl ReportKind {
             ReportKind::SummaryContractor => "拨款汇总_按承包单位",
             ReportKind::SummaryContract => "拨款汇总_按合同",
             ReportKind::SummaryContractType => "拨款汇总_按合同类型",
+            ReportKind::ContractLedger => "合同台账",
+            ReportKind::PaymentLedger => "拨款一览",
         }
     }
 
@@ -90,6 +102,8 @@ impl ReportKind {
             ReportKind::SummaryContractor => "按承包单位",
             ReportKind::SummaryContract => "按合同",
             ReportKind::SummaryContractType => "按合同类型",
+            ReportKind::ContractLedger => "合同台账",
+            ReportKind::PaymentLedger => "拨款一览",
         }
     }
 }
@@ -144,6 +158,21 @@ impl ReportColumn {
             screen_remainder: false,
         }
     }
+}
+
+/// 合同台账的可见列（R-33）：窄屏时按宽度逐级降列，与页面原有 9→7→5 列策略一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerColumns {
+    /// 承包单位 + 合同金额
+    pub wide: bool,
+    /// 审计价 + 交工日期
+    pub medium: bool,
+}
+
+impl LedgerColumns {
+    pub const FULL: Self = LedgerColumns { wide: true, medium: true };
+    pub const COMPACT: Self = LedgerColumns { wide: false, medium: true };
+    pub const TIGHT: Self = LedgerColumns { wide: false, medium: false };
 }
 
 /// 一个单元格。导出与屏幕显示都通过 `display()` / `yuan()` 取值，不各写一套。
@@ -380,6 +409,199 @@ impl ReportResult {
             subtitle: format!(
                 "{}（统计区间 {from_txt} ~ {to_txt}）{filter_part}",
                 kind.subtitle()
+            ),
+            unit_note: "金额单位：元",
+            columns,
+            rows: data,
+            totals,
+            generated_at: now_iso(),
+        }
+    }
+
+    /// 合同台账（R-33）：列配置与屏幕列一一对应，`visible` 控制窄屏降列。
+    /// 只有数据列进结果，点击 / 进度条 / 徽标等交互仍由页面按 `columns[i].key` 绘制。
+    pub fn contract_ledger(
+        rows: &[ctp_core::ledger::ContractSummary],
+        visible: LedgerColumns,
+    ) -> Self {
+        let kind = ReportKind::ContractLedger;
+        let mut columns = vec![
+            ReportColumn::new("contract_no", "合同编号", ColumnKind::Text, 14.0, 90.0),
+            ReportColumn::new("contract_name", "合同名称", ColumnKind::Text, 34.0, 120.0),
+        ];
+        if visible.wide {
+            columns.push(ReportColumn::new(
+                "contractor_name",
+                "承包单位",
+                ColumnKind::Text,
+                22.0,
+                165.0,
+            ));
+            columns.push(ReportColumn::new(
+                "total_amount",
+                "合同金额",
+                ColumnKind::Money,
+                18.0,
+                92.0,
+            ));
+        }
+        if visible.medium {
+            columns.push(ReportColumn::new(
+                "audit_price",
+                "审计价",
+                ColumnKind::Money,
+                18.0,
+                92.0,
+            ));
+            columns.push(ReportColumn::new(
+                "delivery_date",
+                "交工日期",
+                ColumnKind::Text,
+                14.0,
+                88.0,
+            ));
+        }
+        columns.push(ReportColumn::new(
+            "paid_amount",
+            "累计已付",
+            ColumnKind::Money,
+            18.0,
+            104.0,
+        ));
+        columns.push(ReportColumn::new(
+            "pay_rate",
+            "支付率",
+            ColumnKind::Rate,
+            14.0,
+            128.0,
+        ));
+        columns.push(ReportColumn::new(
+            "project_status",
+            "项目状态",
+            ColumnKind::Text,
+            12.0,
+            72.0,
+        ));
+        columns[1].screen_remainder = true;
+
+        let data: Vec<Vec<Cell>> = rows
+            .iter()
+            .map(|s| {
+                let mut cells = vec![
+                    Cell::Text(s.contract_no.clone()),
+                    Cell::Text(s.contract_name.clone()),
+                ];
+                if visible.wide {
+                    cells.push(Cell::Text(s.contractor_name.clone()));
+                    cells.push(Cell::Money(s.total_amount));
+                }
+                if visible.medium {
+                    cells.push(match s.audit_price {
+                        Some(m) => Cell::Money(m),
+                        None => Cell::Text("—".to_string()),
+                    });
+                    cells.push(Cell::Text(
+                        s.delivery_date.clone().unwrap_or_else(|| "—".into()),
+                    ));
+                }
+                cells.push(Cell::Money(s.paid_amount));
+                cells.push(Cell::Rate(s.pay_rate.percent_string(), s.pay_rate.bp()));
+                cells.push(Cell::Text(
+                    if s.is_archived() {
+                        "归档关闭"
+                    } else {
+                        "履行中"
+                    }
+                    .to_string(),
+                ));
+                cells
+            })
+            .collect();
+
+        let sum = |f: fn(&ctp_core::ledger::ContractSummary) -> i64| -> i64 {
+            rows.iter().map(f).sum()
+        };
+        let total_amount = sum(|s| s.total_amount.cent());
+        let audit = sum(|s| s.audit_price.map(|m| m.cent()).unwrap_or(0));
+        let paid = sum(|s| s.paid_amount.cent());
+        let base = sum(|s| s.base_amount.cent());
+        let total_bp = ratio_bp(paid, base);
+        let mut totals = vec![Cell::Text("合计".to_string()), Cell::Text(String::new())];
+        if visible.wide {
+            totals.push(Cell::Text(String::new()));
+            totals.push(Cell::Money(Money::from_cent(total_amount)));
+        }
+        if visible.medium {
+            totals.push(Cell::Money(Money::from_cent(audit)));
+            totals.push(Cell::Text(String::new()));
+        }
+        totals.push(Cell::Money(Money::from_cent(paid)));
+        totals.push(Cell::Rate(percent_text(total_bp), total_bp));
+        totals.push(Cell::Text(String::new()));
+
+        ReportResult {
+            kind,
+            title: kind.title(),
+            subtitle: format!("{}（共 {} 份合同）", kind.subtitle(), rows.len()),
+            unit_note: "金额单位：元",
+            columns,
+            rows: data,
+            totals,
+            generated_at: now_iso(),
+        }
+    }
+
+    /// 拨款一览（R-33）：按合同筛出的单据；勾选列与操作列属于交互，不进结果。
+    /// 合计只累加已实付单据，作废单保留行但不计入金额。
+    pub fn payment_ledger(
+        rows: &[ctp_core::payment::Payment],
+        contract_label: &str,
+    ) -> Self {
+        use ctp_core::payment::PaymentStatus;
+        let kind = ReportKind::PaymentLedger;
+        let mut columns = vec![
+            ReportColumn::new("payment_no", "拨款单号", ColumnKind::Text, 16.0, 104.0),
+            ReportColumn::new("pay_date", "开单日期", ColumnKind::Text, 13.0, 80.0),
+            ReportColumn::new("amount", "金额", ColumnKind::Money, 18.0, 92.0),
+            ReportColumn::new("reason", "事由", ColumnKind::Text, 26.0, 60.0),
+            ReportColumn::new("status", "状态", ColumnKind::Text, 10.0, 54.0),
+        ];
+        columns[3].screen_remainder = true;
+
+        let total: i64 = rows
+            .iter()
+            .filter(|p| p.status != PaymentStatus::Void)
+            .map(|p| p.amount_cent.cent())
+            .sum();
+        let data: Vec<Vec<Cell>> = rows
+            .iter()
+            .map(|p| {
+                let voided = p.status == PaymentStatus::Void;
+                vec![
+                    Cell::Text(p.payment_no.clone()),
+                    Cell::Text(p.pay_date.clone()),
+                    Cell::Money(p.amount_cent),
+                    Cell::Text(p.reason.clone().unwrap_or_else(|| "—".into())),
+                    Cell::Text(if voided { "作废" } else { "已付" }.to_string()),
+                ]
+            })
+            .collect();
+        let totals = vec![
+            Cell::Text("合计".to_string()),
+            Cell::Text(String::new()),
+            Cell::Money(Money::from_cent(total)),
+            Cell::Text(String::new()),
+            Cell::Text(String::new()),
+        ];
+
+        ReportResult {
+            kind,
+            title: kind.title(),
+            subtitle: format!(
+                "{}；合同：{}；共 {} 笔（作废单不计入合计）",
+                kind.subtitle(),
+                contract_label,
+                rows.len()
             ),
             unit_note: "金额单位：元",
             columns,

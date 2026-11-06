@@ -53,7 +53,7 @@ impl ContractSummary {
     }
 
     /// 视图口径的越界级别：V1 不输出容差上限，只区分「倒挂 / 正常」。
-    /// 需要区分容差内与超容差时用 `PaymentQuota::breach_level`（容差来自 `sys_meta.tol_bp`）。
+    /// 需要区分容差内与超付拦截时用 `PaymentQuota::breach_level`（业务容差固定为 0）。
     pub fn breach_level(&self) -> BreachLevel {
         if self.is_inverted {
             BreachLevel::OverTolerance

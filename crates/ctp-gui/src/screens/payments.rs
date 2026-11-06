@@ -3,6 +3,7 @@
 use crate::widgets::{self, Tone};
 use crate::{App, Confirm};
 use ctp_app::service;
+use ctp_app::ReportResult;
 use ctp_core::contract::ContractStatus;
 use ctp_core::date::is_iso_date;
 use ctp_core::money::Money;
@@ -20,6 +21,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
     let mut export_tpl = false;
     let mut import_tpl = false;
+    // R-33：拨款一览导出（与明细表同源的 ReportResult）
+    let mut export_list = false;
 
     // 页头：标题 + 右侧两个批量入口（导出模板 / 导入回传）
     ui.horizontal(|ui| {
@@ -45,6 +48,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 .clicked()
             {
                 export_tpl = true;
+            }
+            if widgets::ghost_button(ui, &p, "导出 Excel")
+                .on_hover_text("导出当前合同的拨款一览，与明细表同源")
+                .clicked()
+            {
+                export_list = true;
             }
         });
     });
@@ -145,18 +154,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         .db
         .as_ref()
         .and_then(|c| service::quota_on(c, &cid, &app.pay_form.date).ok());
-    let (base, paid, rate, tol_bp) = match &quota {
+    let (base, paid, rate) = match &quota {
         Some(q) => (
             q.base_amount.format_yuan(),
             q.paid_amount.format_yuan(),
             q.pay_rate.percent_string(),
-            q.tolerance.bp(),
         ),
         None => (
             s.base_amount.format_yuan(),
             s.paid_amount.format_yuan(),
             s.pay_rate.percent_string(),
-            app.tolerance_bp,
         ),
     };
     // 可付额度取「付清条件」封顶后的口径
@@ -239,7 +246,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         (
             "有效计价基准",
             base.clone(),
-            format!("元 · 容差 {tol_bp} bp"),
+            "元".to_string(),
             Tone::Neutral,
         ),
         (
@@ -427,12 +434,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         ui.set_width(list_w - 34.0);
                         widgets::section_title(ui, &p, "拨款明细", "作废单保留记录、不计入已付净额");
                         ui.add_space(6.0);
-                        let rows: Vec<_> = app
+                        let rows: Vec<ctp_core::payment::Payment> = app
                             .payments
                             .iter()
                             .filter(|pm| pm.contract_id == cid)
+                            .cloned()
                             .collect();
-                        if rows.is_empty() {
+                        // R-33：明细表、合计行与 Excel 导出共用同一份 ReportResult
+                        let contract_label = format!("{} {}", s.contract_no, s.contract_name);
+                        let result = ReportResult::payment_ledger(&rows, &contract_label);
+                        if result.is_empty() {
                             widgets::empty_state(ui, &p, "该合同还没有拨款记录");
                             return;
                         }
@@ -465,136 +476,166 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         });
                         ui.add_space(4.0);
                         ui.spacing_mut().item_spacing.x = 20.0;
-                        TableBuilder::new(ui)
+                        // R-33：列配置、单元格取值、合计行全部来自 ReportResult；
+                        // 勾选 / 打印 / 作废等交互列仍由页面按列语义附加绘制。
+                        let mut tb = TableBuilder::new(ui)
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .column(Column::auto().at_least(24.0))
-                            .column(Column::auto().at_least(104.0))
-                            .column(Column::auto().at_least(80.0))
-                            .column(Column::auto().at_least(92.0))
-                            .column(Column::remainder().at_least(60.0))
-                            .column(Column::auto().at_least(54.0))
-                            .column(Column::auto().at_least(160.0))
-                            .header(26.0, |mut h| {
-                                for t in ["", "拨款单号", "开单日期", "金额", "事由", "状态", "操作"] {
-                                    h.col(|ui| {
-                                        ui.label(RichText::new(t).size(12.0).color(p.text_muted));
+                            .column(Column::auto().at_least(24.0));
+                        for c in &result.columns {
+                            tb = tb.column(if c.screen_remainder {
+                                Column::remainder().at_least(c.screen_width)
+                            } else {
+                                Column::auto().at_least(c.screen_width)
+                            });
+                        }
+                        tb = tb.column(Column::auto().at_least(160.0));
+                        tb.header(26.0, |mut h| {
+                            h.col(|ui| {
+                                ui.label(RichText::new("").size(12.0).color(p.text_muted));
+                            });
+                            for c in &result.columns {
+                                h.col(|ui| widgets::th(ui, &p, c.title, c.right));
+                            }
+                            h.col(|ui| {
+                                ui.label(RichText::new("操作").size(12.0).color(p.text_muted));
+                            });
+                        })
+                        .body(|mut body| {
+                            for (ri, pm) in rows.iter().enumerate() {
+                                let cells = &result.rows[ri];
+                                body.row(30.0, |mut row| {
+                                    row.col(|ui| {
+                                        let paid = pm.status
+                                            == ctp_core::payment::PaymentStatus::Paid;
+                                        let mut on = app.print_sel.contains(&pm.id);
+                                        let cb = ui.add_enabled(
+                                            paid,
+                                            egui::Checkbox::new(&mut on, ""),
+                                        );
+                                        if !paid {
+                                            cb.on_hover_text("作废单不可打印");
+                                        } else if cb.changed() {
+                                            sel_toggle.push((pm.id.clone(), on));
+                                        }
                                     });
-                                }
-                            })
-                            .body(|mut body| {
-                                for pm in rows.iter().copied() {
-                                    body.row(30.0, |mut row| {
-                                        row.col(|ui| {
-                                            let paid = pm.status
-                                                == ctp_core::payment::PaymentStatus::Paid;
-                                            let mut on = app.print_sel.contains(&pm.id);
-                                            let cb = ui.add_enabled(
-                                                paid,
-                                                egui::Checkbox::new(&mut on, ""),
-                                            );
-                                            if !paid {
-                                                cb.on_hover_text("作废单不可打印");
-                                            } else if cb.changed() {
-                                                sel_toggle.push((pm.id.clone(), on));
+                                    for (ci, cell) in cells.iter().enumerate() {
+                                        let c = &result.columns[ci];
+                                        let text = cell.display();
+                                        row.col(|ui| match c.key {
+                                            "payment_no" => {
+                                                if widgets::link(ui, &p, text.as_str(), 12.0).clicked()
+                                                {
+                                                    open_pay = Some(pm.id.clone());
+                                                }
+                                            }
+                                            "amount" => {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(text.as_str())
+                                                                .size(12.5)
+                                                                .color(p.text),
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                            "status" => {
+                                                if pm.status
+                                                    == ctp_core::payment::PaymentStatus::Paid
+                                                {
+                                                    widgets::badge(ui, &p, text.as_str(), Tone::Success);
+                                                } else {
+                                                    widgets::badge(ui, &p, text.as_str(), Tone::Neutral);
+                                                }
+                                            }
+                                            _ => {
+                                                ui.label(
+                                                    RichText::new(text.as_str())
+                                                        .size(12.0)
+                                                        .color(p.text_muted),
+                                                );
                                             }
                                         });
-                                        row.col(|ui| {
-                                            if widgets::link(ui, &p, &pm.payment_no, 12.0).clicked()
+                                    }
+                                    row.col(|ui| {
+                                        ui.horizontal(|ui| {
+                                            // 表格列间距是 20px，操作列内要收紧，否则第三个操作会被挤出
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            if pm.status
+                                                == ctp_core::payment::PaymentStatus::Paid
                                             {
-                                                open_pay = Some(pm.id.clone());
+                                                if widgets::link(ui, &p, "打印拨款单", 11.0)
+                                                    .on_hover_text(
+                                                        "预览两页版面后直接送打印机（不经过 Word）",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    print_target = Some((*pm).clone());
+                                                }
+                                            } else {
+                                                ui.label(
+                                                    RichText::new("打印拨款单")
+                                                        .size(11.0)
+                                                        .color(p.text_muted),
+                                                )
+                                                .on_hover_text("作废单不允许打印");
+                                            }
+                                            if widgets::link(ui, &p, "打印附件", 11.0)
+                                                .on_hover_text("中标通知书、审计报告等材料打印")
+                                                .clicked()
+                                            {
+                                                material_target = Some(pm.contract_id.clone());
+                                            }
+                                            if pm.status
+                                                == ctp_core::payment::PaymentStatus::Paid
+                                                && ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("作废")
+                                                                .size(11.0)
+                                                                .color(p.danger),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text(
+                                                        "作废后不计入已付净额，可重新登记",
+                                                    )
+                                                    .clicked()
+                                            {
+                                                void_target = Some((*pm).clone());
                                             }
                                         });
-                                        row.col(|ui| {
-                                            ui.label(
-                                                RichText::new(&pm.pay_date)
-                                                    .size(12.0)
-                                                    .color(p.text_muted),
-                                            );
-                                        });
-                                        row.col(|ui| {
+                                    });
+                                });
+                            }
+                            // 合计行：金额只累加已实付单据，与 result.totals 同源
+                            body.row(30.0, |mut row| {
+                                row.col(|_ui| {});
+                                for (ci, cell) in result.totals.iter().enumerate() {
+                                    let c = &result.columns[ci];
+                                    let text = cell.display();
+                                    row.col(|ui| {
+                                        let label = RichText::new(text.as_str())
+                                            .size(12.5)
+                                            .strong()
+                                            .color(p.text);
+                                        if c.right {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    ui.label(
-                                                        RichText::new(
-                                                            pm.amount_cent.format_yuan(),
-                                                        )
-                                                        .size(12.5)
-                                                        .color(p.text),
-                                                    );
+                                                    ui.label(label);
                                                 },
                                             );
-                                        });
-                                        row.col(|ui| {
-                                            ui.label(
-                                                RichText::new(
-                                                    pm.reason.clone().unwrap_or_else(|| "—".into()),
-                                                )
-                                                .size(12.0)
-                                                .color(p.text_muted),
-                                            );
-                                        });
-                                        row.col(|ui| {
-                                            if pm.status == ctp_core::payment::PaymentStatus::Paid
-                                            {
-                                                widgets::badge(ui, &p, "已付", Tone::Success);
-                                            } else {
-                                                widgets::badge(ui, &p, "作废", Tone::Neutral);
-                                            }
-                                        });
-                                        row.col(|ui| {
-                                            ui.horizontal(|ui| {
-                                                // 表格列间距是 20px，操作列内要收紧，否则第三个操作会被挤出
-                                                ui.spacing_mut().item_spacing.x = 6.0;
-                                                if pm.status
-                                                    == ctp_core::payment::PaymentStatus::Paid
-                                                {
-                                                    if widgets::link(ui, &p, "打印拨款单", 11.0)
-                                                        .on_hover_text(
-                                                            "预览两页版面后直接送打印机（不经过 Word）",
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        print_target = Some((*pm).clone());
-                                                    }
-                                                } else {
-                                                    ui.label(
-                                                        RichText::new("打印拨款单")
-                                                            .size(11.0)
-                                                            .color(p.text_muted),
-                                                    )
-                                                    .on_hover_text("作废单不允许打印");
-                                                }
-                                                if widgets::link(ui, &p, "打印附件", 11.0)
-                                                    .on_hover_text("中标通知书、审计报告等材料打印")
-                                                    .clicked()
-                                                {
-                                                    material_target = Some(pm.contract_id.clone());
-                                                }
-                                                if pm.status
-                                                    == ctp_core::payment::PaymentStatus::Paid
-                                                    && ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("作废")
-                                                                    .size(11.0)
-                                                                    .color(p.danger),
-                                                            )
-                                                            .frame(false),
-                                                        )
-                                                        .on_hover_text(
-                                                            "作废后不计入已付净额，可重新登记",
-                                                        )
-                                                        .clicked()
-                                                {
-                                                    void_target = Some((*pm).clone());
-                                                }
-                                            });
-                                        });
+                                        } else {
+                                            ui.label(label);
+                                        }
                                     });
                                 }
+                                row.col(|_ui| {});
                             });
+                        });
                     });
                 },
             );
@@ -625,7 +666,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         app.print_sel.extend(ids);
     }
     if batch_print {
-        app.open_batch_print();
+        // 按列表顺序取当前合同下已勾选的单据；总览页走同一入口，只是传它自己的 6 条
+        let ids: Vec<String> = app
+            .payments
+            .iter()
+            .filter(|pm| pm.contract_id == cid && app.print_sel.contains(&pm.id))
+            .map(|pm| pm.id.clone())
+            .collect();
+        app.open_batch_print(ids);
     }
 
     if submit {
@@ -697,7 +745,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     }
-    if import_tpl {
+    if import_tpl && app.require_write() {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx"])
             .pick_file()
@@ -705,15 +753,35 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             match app.exec(move |c| ctp_app::batch::import(c, &path, "管理员")) {
                 Ok(report) => {
                     app.refresh();
-                    if report.has_failure() {
-                        app.error(report.summary());
-                    } else {
-                        app.success(report.summary());
-                    }
+                    app.show_import_result(
+                        crate::dialogs::ImportResultView::from_report(&report),
+                    );
                 }
-                Err(e) => app.error(format!("导入失败：{e}")),
+                // 整份拒绝（文件打不开 / 缺校验表 / 标记不符）也用同一个弹窗
+                Err(e) => app.show_import_result(crate::dialogs::ImportResultView::rejected(
+                    format!("导入失败：{e}"),
+                )),
             }
         }
+    }
+
+    // R-33：拨款一览导出（按当前合同重新构造一份完整结果，与明细表同源）
+    if export_list {
+        let cid = app.pay_contract.clone().unwrap_or_default();
+        let rows: Vec<ctp_core::payment::Payment> = app
+            .payments
+            .iter()
+            .filter(|pm| pm.contract_id == cid)
+            .cloned()
+            .collect();
+        let label = app
+            .summaries
+            .iter()
+            .find(|x| x.contract_id == cid)
+            .map(|x| format!("{} {}", x.contract_no, x.contract_name))
+            .unwrap_or(cid);
+        let result = ReportResult::payment_ledger(&rows, &label);
+        app.export_report_result(&result);
     }
 }
 

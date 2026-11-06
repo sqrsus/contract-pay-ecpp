@@ -12,7 +12,7 @@
 //! 失败的行跳过并记下行号，成功的行已经落库——按 2026-11-06 确认的口径。
 
 use crate::service::{self, NewPayment};
-use ctp_core::date::is_iso_date;
+use ctp_core::date::{is_iso_date, today_iso};
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
 use ctp_store::{repo, Result, StoreError};
@@ -128,8 +128,10 @@ pub fn write_template(
             1,
             last_col,
             &format!(
-                "只填后 4 列（本次金额 / 开单日期 / 事由 / 支付方式）；前 5 列是导出时点的系统快照，导入时不采信。\
-                 开单日期写 YYYY-MM-DD，支付方式填 转账/承兑/现金/其他（留空按转账）。导出时间 {generated_at}"
+                "只填后 4 列；前 5 列是导出时点的系统快照，导入时不采信。\
+                 本次金额为 0 或留空的行跳过；开单日期留空按当天（YYYY-MM-DD）；\
+                 事由留空按「拨付进度款」；支付方式留空按转账，也可填 转账/承兑/现金/其他。\
+                 导出时间 {generated_at}"
             ),
             &note_fmt,
         )
@@ -189,10 +191,12 @@ pub struct ImportFailure {
     pub message: String,
 }
 
-/// 导入结果：成功多少行、哪些行失败。
+/// 导入结果：成功多少行、跳过多少行、哪些行失败。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportReport {
     pub imported: usize,
+    /// 本次金额为 0 或留空而跳过的行数（不算失败）
+    pub skipped: usize,
     pub failures: Vec<ImportFailure>,
 }
 
@@ -201,21 +205,14 @@ impl ImportReport {
         !self.failures.is_empty()
     }
 
-    /// 给提示条用的摘要：成功数 + 前 10 条错误。
+    /// 统计摘要：结果弹窗顶部与提示条共用，不列逐行明细。
     pub fn summary(&self) -> String {
-        let mut s = format!("成功导入 {} 笔", self.imported);
-        if self.failures.is_empty() {
-            s.push_str("，无失败行");
-            return s;
-        }
-        s.push_str(&format!("，{} 行未导入：", self.failures.len()));
-        for f in self.failures.iter().take(10) {
-            s.push_str(&format!("第 {} 行 {}；", f.line, f.message));
-        }
-        if self.failures.len() > 10 {
-            s.push_str("（仅列前 10 条）");
-        }
-        s
+        format!(
+            "成功导入 {} 笔，跳过 {} 行，失败 {} 行",
+            self.imported,
+            self.skipped,
+            self.failures.len()
+        )
     }
 }
 
@@ -241,13 +238,10 @@ fn cell(row: &[calamine::Data], col: usize) -> String {
     row.get(col).map(cell_text).unwrap_or_default()
 }
 
-/// 单元格是否为空（Excel 空值或空串）。
-fn cell_blank(row: &[calamine::Data], col: usize) -> bool {
-    match row.get(col) {
-        None | Some(calamine::Data::Empty) => true,
-        Some(calamine::Data::String(s)) => s.trim().is_empty(),
-        _ => false,
-    }
+/// 本次金额留空或填 0：该行不导入，也不计入失败行（R-33 确认口径）。
+fn cell_amount_skipped(row: &[calamine::Data], col: usize) -> bool {
+    let t = cell(row, col);
+    t.is_empty() || t.parse::<f64>().map(|v| v.abs() < 1e-9).unwrap_or(false)
 }
 
 /// 金额列：既接受数值格，也接受文本（用户可能粘成文本）。
@@ -361,9 +355,10 @@ pub fn import(
             continue;
         }
         let line = abs + 1; // Excel 可见行号（从 1 起）
-        // 未填「本次金额」= 本行不导入。模板会把全部合同预填一遍，
-        // 用户只填其中几行是正常用法，不该把没填的行报成错误。
-        if cell_blank(row, 5) {
+        // 未填或填 0「本次金额」= 本行不导入、不算失败。模板会把全部合同预填一遍，
+        // 用户只填其中几行是正常用法。
+        if cell_amount_skipped(row, 5) {
+            report.skipped += 1;
             continue;
         }
         let name = cell(row, 0);
@@ -386,20 +381,27 @@ pub fn import(
                 ));
             }
             let amount = cell_money(row, 5)?;
-            let date = cell(row, 6);
+            let date_raw = cell(row, 6);
+            // 留空按当天（R-33）；其余仍必须是合法 ISO 日期
+            let date = if date_raw.is_empty() {
+                today_iso()
+            } else {
+                date_raw
+            };
             if !is_iso_date(&date) {
-                return Err(if date.is_empty() {
-                    "开单日期为空".to_string()
-                } else {
-                    format!("开单日期「{date}」格式不对，应为 YYYY-MM-DD")
-                });
+                return Err(format!("开单日期「{date}」格式不对，应为 YYYY-MM-DD"));
             }
             let method = cell_pay_method(row, 8)?;
             let reason = cell(row, 7);
+            let reason = if reason.is_empty() {
+                "拨付进度款".to_string()
+            } else {
+                reason
+            };
 
             let mut input = NewPayment::new(ids[0].to_string(), amount, date);
             input.pay_method = method;
-            input.reason = if reason.is_empty() { None } else { Some(reason) };
+            input.reason = Some(reason);
             service::register_payment(conn, input, operator).map_err(|e| e.to_string())?;
             Ok(())
         })();
@@ -508,7 +510,50 @@ mod tests {
         write_template(&rows, &path, "x").unwrap();
         let report = import(&mut conn, &path, "批量导入").unwrap();
         assert_eq!(report.imported, 0, "没填本次金额就不该写入");
+        assert!(report.skipped > 0, "空金额行应计入跳过");
         assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 金额为零跳过_留空字段按默认值写入() {
+        let mut conn = conn_with_demo();
+        let rows = demo_rows(&conn);
+        let path = temp_path("defaults");
+        let target = rows[0].contract_name.clone();
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            let r = FIRST_DATA_ROW as u32;
+            // 第一行只填金额，日期 / 事由 / 支付方式全留空
+            ws.write_string(r, 0, target.as_str()).unwrap();
+            ws.write_number(r, 5, 100.0).unwrap();
+            // 第二行金额填 0 → 跳过，不算失败
+            ws.write_string(r + 1, 0, target.as_str()).unwrap();
+            ws.write_number(r + 1, 5, 0.0).unwrap();
+            let chk = wb.add_worksheet();
+            chk.set_name(CHECK_SHEET).unwrap();
+            chk.write_string(0, 0, CHECK_MARK).unwrap();
+            wb.save(&path).unwrap();
+        }
+
+        let report = import(&mut conn, &path, "t").unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.skipped, 1, "金额为 0 的行跳过且不算失败");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+
+        let today = today_iso();
+        let p = repo::list_payments(&conn, None)
+            .unwrap()
+            .into_iter()
+            .find(|p| {
+                p.amount_cent.cent() == 10_000
+                    && p.reason.as_deref() == Some("拨付进度款")
+            })
+            .expect("应写入带默认事由的单据");
+        assert_eq!(p.pay_date, today, "开单日期留空按当天");
+        assert_eq!(p.pay_method, PayMethod::Transfer, "支付方式留空按转账");
         let _ = std::fs::remove_file(&path);
     }
 

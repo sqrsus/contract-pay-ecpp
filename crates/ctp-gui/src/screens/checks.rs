@@ -1,11 +1,11 @@
-//! 自检页：六项口径检查 + 超付容差设置。
+//! 自检页：六项口径检查 + 管理密码。
+//!
+//! R-33 起超付容差固定为 0，不再提供设置入口；右栏只保留两张卡。
 
 use crate::screens::page_header;
 use crate::widgets::{self, Tone};
 use crate::App;
 use ctp_app::auth;
-use ctp_app::service;
-use ctp_core::rate::Rate;
 use eframe::egui::{self, RichText};
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
@@ -18,7 +18,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     );
 
     let mut run = false;
-    let mut save_tol = false;
     let mut save_pw = false;
 
     ui.horizontal(|ui| {
@@ -105,40 +104,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 |ui| {
                     widgets::card(&p).show(ui, |ui| {
                         ui.set_width(266.0);
-                        widgets::section_title(ui, &p, "超付容差", "上限 = 基准 ×（1 + 容差）");
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(format!("当前 {} bp（{}%）", app.tolerance_bp, app.tolerance_bp as f64 / 100.0))
-                                .size(12.5)
-                                .color(p.text),
-                        );
-                        ui.add_space(8.0);
-                        widgets::field_label(ui, &p, "新的容差（万分比，0–1000）");
-                        ui.add_sized(
-                            [180.0, 30.0],
-                            egui::TextEdit::singleline(&mut app.tol_input)
-                                .margin(egui::Margin::symmetric(8.0, 4.0)),
-                        );
-                        ui.add_space(8.0);
-                        let bp = app.tol_input.trim().parse::<i32>().ok();
-                        let ok = bp.map(|v| (0..=1000).contains(&v)).unwrap_or(false);
-                        if widgets::primary_button(ui, &p, "保存容差", ok).clicked() && ok {
-                            save_tol = true;
-                        }
-                        ui.add_space(8.0);
-                        widgets::divider(ui, &p);
-                        ui.label(
-                            RichText::new(
-                                "容差只影响拦截上限，不改变已记录流水；建议保持 0–100 bp。",
-                            )
-                            .size(11.0)
-                            .color(p.text_muted),
-                        );
-                    });
-
-                    ui.add_space(12.0);
-                    widgets::card(&p).show(ui, |ui| {
-                        ui.set_width(266.0);
                         widgets::section_title(ui, &p, "管理密码", "修改后立即生效");
                         ui.add_space(6.0);
                         ui.label(
@@ -207,19 +172,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
             None => app.error("自检失败：数据库不可用"),
-        }
-    }
-
-    if save_tol {
-        if let Ok(bp) = app.tol_input.trim().parse::<i32>() {
-            let rate = Rate::from_bp(bp);
-            match app.exec(move |c| service::set_tolerance(c, rate, "界面用户")) {
-                Ok(()) => {
-                    app.refresh();
-                    app.success(format!("容差已设为 {bp} bp"));
-                }
-                Err(e) => app.error(format!("保存容差失败：{e}")),
-            }
         }
     }
 
