@@ -1,0 +1,590 @@
+//! 批量拨款：导出填表模板（xlsx）与导入回传。
+//!
+//! **校验标记**：模板里带一张隐藏工作表 `_CTP_CHECK`，A1 写死 `CHECK_MARK`。
+//! 导入时先比对这张表与标记，读不到或不一致就直接拒绝——避免用户拿别的表
+//! 改改列名就传上来，导致列错位写坏账。
+//!
+//! **前 5 列只作核对**：合同名称以外的名称/价/已付都是导出当时的快照，
+//! 导入时一律不采信（以库内为准），只有后 4 列（本次金额 / 开单日期 / 事由 /
+//! 支付方式）参与写入。这样即使用户在预填格里改数字也不会影响账。
+//!
+//! **逐行提交**：每一行单独走 `service::register_payment`（内部独立事务），
+//! 失败的行跳过并记下行号，成功的行已经落库——按 2026-11-06 确认的口径。
+
+use crate::service::{self, NewPayment};
+use ctp_core::date::is_iso_date;
+use ctp_core::money::Money;
+use ctp_core::payment::PayMethod;
+use ctp_store::{repo, Result, StoreError};
+use rusqlite::Connection;
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// 模板主工作表名。
+pub const TEMPLATE_SHEET: &str = "批量拨款";
+
+/// 校验标记所在的工作表（隐藏）。
+pub const CHECK_SHEET: &str = "_CTP_CHECK";
+
+/// 校验标记内容；改它等于让所有旧模板失效，不要动。
+pub const CHECK_MARK: &str = "CTP-BATCH-PAYMENT-V1";
+
+/// 模板列标题（9 列）。前 5 列预填，后 4 列由用户填写。
+pub const HEADERS: [&str; 9] = [
+    "合同名称",
+    "承包单位",
+    "合同价（元）",
+    "审计价（元）",
+    "累计已付（元）",
+    "本次金额（元）",
+    "开单日期",
+    "事由",
+    "支付方式",
+];
+
+/// 数据起始行（0-based）：第 1 行标题、第 2 行说明、第 3 行表头。
+const FIRST_DATA_ROW: usize = 3;
+
+/// 列宽（字符）。
+const COL_WIDTHS: [f64; 9] = [34.0, 22.0, 15.0, 15.0, 15.0, 15.0, 13.0, 26.0, 11.0];
+
+fn xerr(e: impl std::fmt::Display) -> StoreError {
+    StoreError::Export(e.to_string())
+}
+
+/// 模板里的一行（一份合同）。
+pub struct TemplateRow {
+    pub contract_name: String,
+    pub contractor: String,
+    pub contract_amount: String,
+    pub audit_amount: String,
+    pub paid_amount: String,
+}
+
+impl TemplateRow {
+    /// 从 V1 汇总行取数：合同价、审计价、累计已付都按系统口径，不让用户自己填。
+    pub fn from_summary(s: &ctp_core::ledger::ContractSummary) -> Self {
+        TemplateRow {
+            contract_name: s.contract_name.clone(),
+            contractor: s.contractor_name.clone(),
+            contract_amount: s.total_amount.fixed_yuan(),
+            audit_amount: s
+                .audit_price
+                .map(|m| m.fixed_yuan())
+                .unwrap_or_else(|| "0.00".into()),
+            paid_amount: s.paid_amount.fixed_yuan(),
+        }
+    }
+}
+
+/// 写出模板。返回（合同行数, 列数）。
+pub fn write_template(
+    rows: &[TemplateRow],
+    path: &Path,
+    generated_at: &str,
+) -> Result<(usize, usize)> {
+    let mut workbook = Workbook::new();
+
+    {
+        let ws = workbook.add_worksheet();
+        ws.set_name(TEMPLATE_SHEET).map_err(xerr)?;
+
+        let title_fmt = Format::new().set_bold().set_font_size(14.0);
+        let note_fmt = Format::new()
+            .set_font_color(Color::RGB(0x6B7280))
+            .set_font_size(10.0);
+        let header_fmt = Format::new()
+            .set_bold()
+            .set_font_color(Color::RGB(0xFFFFFF))
+            .set_background_color(Color::RGB(0x2F5597))
+            .set_align(FormatAlign::Center)
+            .set_text_wrap();
+        // 前 5 列是系统快照，灰底提示「别改也无效」
+        let prefill_fmt = Format::new()
+            .set_font_color(Color::RGB(0x6B7280))
+            .set_background_color(Color::RGB(0xF3F4F6));
+        let prefill_money_fmt = Format::new()
+            .set_font_color(Color::RGB(0x6B7280))
+            .set_background_color(Color::RGB(0xF3F4F6))
+            .set_num_format("#,##0.00")
+            .set_align(FormatAlign::Right);
+        // 后 4 列需要填写，留白 + 描边
+        let input_fmt = Format::new().set_border(FormatBorder::Thin);
+        let input_date_fmt = Format::new()
+            .set_border(FormatBorder::Thin)
+            .set_num_format("@");
+        let input_money_fmt = Format::new()
+            .set_border(FormatBorder::Thin)
+            .set_num_format("#,##0.00")
+            .set_align(FormatAlign::Right);
+
+        let last_col = (HEADERS.len() - 1) as u16;
+        ws.merge_range(0, 0, 0, last_col, "批量拨款导入模板", &title_fmt)
+            .map_err(xerr)?;
+        ws.merge_range(
+            1,
+            0,
+            1,
+            last_col,
+            &format!(
+                "只填后 4 列（本次金额 / 开单日期 / 事由 / 支付方式）；前 5 列是导出时点的系统快照，导入时不采信。\
+                 开单日期写 YYYY-MM-DD，支付方式填 转账/承兑/现金/其他（留空按转账）。导出时间 {generated_at}"
+            ),
+            &note_fmt,
+        )
+        .map_err(xerr)?;
+
+        for (ci, h) in HEADERS.iter().enumerate() {
+            ws.write_string_with_format(2, ci as u16, *h, &header_fmt)
+                .map_err(xerr)?;
+            ws.set_column_width(ci as u16, COL_WIDTHS[ci]).map_err(xerr)?;
+        }
+        ws.set_row_height(1, 32.0).map_err(xerr)?;
+
+        for (ri, r) in rows.iter().enumerate() {
+            let row = FIRST_DATA_ROW as u32 + ri as u32;
+            ws.write_string_with_format(row, 0, r.contract_name.as_str(), &prefill_fmt)
+                .map_err(xerr)?;
+            ws.write_string_with_format(row, 1, r.contractor.as_str(), &prefill_fmt)
+                .map_err(xerr)?;
+            // 3 个金额写成数值而不是文本：文本数字在 Excel 里会挂绿三角，也不便核对
+            for (col, text) in [
+                (2u16, &r.contract_amount),
+                (3, &r.audit_amount),
+                (4, &r.paid_amount),
+            ] {
+                let v = text.parse::<f64>().unwrap_or(0.0);
+                ws.write_number_with_format(row, col, v, &prefill_money_fmt)
+                    .map_err(xerr)?;
+            }
+            // 后 4 列只给格式，不写值
+            ws.write_blank(row, 5, &input_money_fmt).map_err(xerr)?;
+            ws.write_blank(row, 6, &input_date_fmt).map_err(xerr)?;
+            ws.write_blank(row, 7, &input_fmt).map_err(xerr)?;
+            ws.write_blank(row, 8, &input_fmt).map_err(xerr)?;
+        }
+
+        ws.set_freeze_panes(3, 0).map_err(xerr)?;
+    }
+
+    {
+        // 隐藏的校验表：只放一个标记串
+        let ws = workbook.add_worksheet();
+        ws.set_name(CHECK_SHEET).map_err(xerr)?;
+        ws.write_string(0, 0, CHECK_MARK).map_err(xerr)?;
+        ws.write_string(0, 1, "本表由系统生成，请勿删除或修改；导入时用于校验模板来源。")
+            .map_err(xerr)?;
+        ws.set_hidden(true);
+    }
+
+    workbook.save(path).map_err(xerr)?;
+    Ok((rows.len(), HEADERS.len()))
+}
+
+/// 导入时的一行失败记录（行号是 Excel 里的可见行号，从 1 起）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportFailure {
+    pub line: usize,
+    pub message: String,
+}
+
+/// 导入结果：成功多少行、哪些行失败。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    pub imported: usize,
+    pub failures: Vec<ImportFailure>,
+}
+
+impl ImportReport {
+    pub fn has_failure(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// 给提示条用的摘要：成功数 + 前 10 条错误。
+    pub fn summary(&self) -> String {
+        let mut s = format!("成功导入 {} 笔", self.imported);
+        if self.failures.is_empty() {
+            s.push_str("，无失败行");
+            return s;
+        }
+        s.push_str(&format!("，{} 行未导入：", self.failures.len()));
+        for f in self.failures.iter().take(10) {
+            s.push_str(&format!("第 {} 行 {}；", f.line, f.message));
+        }
+        if self.failures.len() > 10 {
+            s.push_str("（仅列前 10 条）");
+        }
+        s
+    }
+}
+
+fn cell_text(d: &calamine::Data) -> String {
+    match d {
+        calamine::Data::Empty => String::new(),
+        calamine::Data::String(s) => s.trim().to_string(),
+        calamine::Data::Float(f) => {
+            if f.fract().abs() < 1e-9 {
+                format!("{}", *f as i64)
+            } else {
+                format!("{f}")
+            }
+        }
+        calamine::Data::Int(i) => i.to_string(),
+        calamine::Data::Bool(b) => b.to_string(),
+        calamine::Data::DateTimeIso(s) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn cell(row: &[calamine::Data], col: usize) -> String {
+    row.get(col).map(cell_text).unwrap_or_default()
+}
+
+/// 单元格是否为空（Excel 空值或空串）。
+fn cell_blank(row: &[calamine::Data], col: usize) -> bool {
+    match row.get(col) {
+        None | Some(calamine::Data::Empty) => true,
+        Some(calamine::Data::String(s)) => s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// 金额列：既接受数值格，也接受文本（用户可能粘成文本）。
+fn cell_money(row: &[calamine::Data], col: usize) -> std::result::Result<Money, String> {
+    match row.get(col) {
+        Some(calamine::Data::Float(f)) => {
+            let cent = (*f * 100.0).round() as i64;
+            if cent <= 0 {
+                Err("本次金额必须大于 0".into())
+            } else {
+                Ok(Money::from_cent(cent))
+            }
+        }
+        Some(calamine::Data::Int(v)) => {
+            let cent = v
+                .checked_mul(100)
+                .ok_or_else(|| "本次金额过大".to_string())?;
+            if cent <= 0 {
+                Err("本次金额必须大于 0".into())
+            } else {
+                Ok(Money::from_cent(cent))
+            }
+        }
+        Some(calamine::Data::String(s)) => Money::parse_yuan(s).map_err(|e| e.to_string()),
+        _ => Err("本次金额为空".into()),
+    }
+}
+
+fn cell_pay_method(row: &[calamine::Data], col: usize) -> std::result::Result<PayMethod, String> {
+    let t = cell(row, col);
+    if t.is_empty() {
+        return Ok(PayMethod::Transfer);
+    }
+    for m in [
+        PayMethod::Transfer,
+        PayMethod::Acceptance,
+        PayMethod::Cash,
+        PayMethod::Other,
+    ] {
+        if t == m.label() || t.eq_ignore_ascii_case(m.code()) {
+            return Ok(m);
+        }
+    }
+    Err(format!(
+        "支付方式「{t}」无法识别，可填 转账/承兑/现金/其他"
+    ))
+}
+
+/// 读取并导入。整张表先过校验标记，再逐行写入。
+///
+/// 返回 `Err` 表示整份文件不可用（读不出、缺校验表、标记不符）；
+/// 行级问题放在 `ImportReport::failures` 里，不影响其他行。
+pub fn import(
+    conn: &mut Connection,
+    path: &Path,
+    operator: &str,
+) -> Result<ImportReport> {
+    use calamine::Reader;
+
+    let mut wb: calamine::Xlsx<_> = calamine::open_workbook(path).map_err(|e| {
+        xerr(format!(
+            "打不开这个文件（需要 .xlsx 格式，旧版 .xls 请另存为 .xlsx）：{e}"
+        ))
+    })?;
+
+    // 1) 校验标记
+    if !wb.sheet_names().iter().any(|n| n == CHECK_SHEET) {
+        return Err(xerr(
+            "缺少校验工作表：这不是本系统导出的模板，请用「导出批量拨款模板」重新导出",
+        ));
+    }
+    let check = wb
+        .worksheet_range(CHECK_SHEET)
+        .map_err(|e| xerr(format!("读取校验表失败：{e}")))?;
+    let mark = check
+        .get_value((0, 0))
+        .map(cell_text)
+        .unwrap_or_default();
+    if mark != CHECK_MARK {
+        return Err(xerr(format!(
+            "校验标记不一致（读到「{mark}」，应为「{CHECK_MARK}」），模板可能被改动，已拒绝导入"
+        )));
+    }
+
+    // 2) 主表
+    if !wb.sheet_names().iter().any(|n| n == TEMPLATE_SHEET) {
+        return Err(xerr(format!("缺少工作表「{TEMPLATE_SHEET}」")));
+    }
+    let range = wb
+        .worksheet_range(TEMPLATE_SHEET)
+        .map_err(|e| xerr(format!("读取「{TEMPLATE_SHEET}」失败：{e}")))?;
+
+    // 3) 合同名称 → 合同 id（同名多份时无法确定，报错而不是猜）
+    let summaries = repo::summaries(conn)?;
+    let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
+    for s in &summaries {
+        by_name
+            .entry(s.contract_name.as_str())
+            .or_default()
+            .push(s.contract_id.as_str());
+    }
+
+    let mut report = ImportReport::default();
+    // 用工作表里的**绝对行号**，不能按 range 的相对序号算：
+    // 若前几行是空的（用户把表头删了），calamine 的 Range 会从第一个有值的行开始，
+    // 相对序号就会把数据行当成表头跳掉。
+    let start_row = range.start().map(|(r, _)| r as usize).unwrap_or(0);
+    for (i, row) in range.rows().enumerate() {
+        let abs = start_row + i;
+        if abs < FIRST_DATA_ROW {
+            continue;
+        }
+        let line = abs + 1; // Excel 可见行号（从 1 起）
+        // 未填「本次金额」= 本行不导入。模板会把全部合同预填一遍，
+        // 用户只填其中几行是正常用法，不该把没填的行报成错误。
+        if cell_blank(row, 5) {
+            continue;
+        }
+        let name = cell(row, 0);
+        if name.is_empty() {
+            report.failures.push(ImportFailure {
+                line,
+                message: "合同名称为空，无法确定写到哪份合同".into(),
+            });
+            continue;
+        }
+
+        let outcome = (|| -> std::result::Result<(), String> {
+            let ids = by_name
+                .get(name.as_str())
+                .ok_or_else(|| format!("合同名称「{name}」在系统里没有，请核对全称"))?;
+            if ids.len() > 1 {
+                return Err(format!(
+                    "合同名称「{name}」对应 {} 份合同，无法确定是哪一份，请改名后重试",
+                    ids.len()
+                ));
+            }
+            let amount = cell_money(row, 5)?;
+            let date = cell(row, 6);
+            if !is_iso_date(&date) {
+                return Err(if date.is_empty() {
+                    "开单日期为空".to_string()
+                } else {
+                    format!("开单日期「{date}」格式不对，应为 YYYY-MM-DD")
+                });
+            }
+            let method = cell_pay_method(row, 8)?;
+            let reason = cell(row, 7);
+
+            let mut input = NewPayment::new(ids[0].to_string(), amount, date);
+            input.pay_method = method;
+            input.reason = if reason.is_empty() { None } else { Some(reason) };
+            service::register_payment(conn, input, operator).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => report.imported += 1,
+            Err(message) => report.failures.push(ImportFailure { line, message }),
+        }
+    }
+
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ctp_store::{db, seed};
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ctp_batch_{}_{}_{tag}.xlsx",
+            std::process::id(),
+            ctp_core::date::now_iso().replace([':', '-', 'T'], "")
+        ))
+    }
+
+    fn conn_with_demo() -> Connection {
+        let mut c = db::open_in_memory().unwrap();
+        db::migrate(&mut c).unwrap();
+        seed::seed_reference(&c, "t").unwrap();
+        crate::demo::seed_demo(&mut c, "t").unwrap();
+        c
+    }
+
+    fn demo_rows(conn: &Connection) -> Vec<TemplateRow> {
+        repo::summaries(conn)
+            .unwrap()
+            .iter()
+            .map(TemplateRow::from_summary)
+            .collect()
+    }
+
+    #[test]
+    fn 模板可写出并带校验标记() {
+        let conn = conn_with_demo();
+        let rows = demo_rows(&conn);
+        assert!(!rows.is_empty());
+        let path = temp_path("write");
+        let (n, cols) = write_template(&rows, &path, "2026-11-06T00:00:00Z").unwrap();
+        assert_eq!(n, rows.len());
+        assert_eq!(cols, 9);
+        assert!(std::fs::metadata(&path).unwrap().len() > 1_000);
+        // 用读取器回验：标记表 + 主表都在
+        use calamine::Reader;
+        let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+        let names = wb.sheet_names().to_vec();
+        assert!(names.contains(&TEMPLATE_SHEET.to_string()), "{names:?}");
+        assert!(names.contains(&CHECK_SHEET.to_string()), "{names:?}");
+        let check = wb.worksheet_range(CHECK_SHEET).unwrap();
+        assert_eq!(check.get_value((0, 0)).map(cell_text).unwrap(), CHECK_MARK);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 标记不符时整份拒绝() {
+        let mut conn = conn_with_demo();
+        let rows = demo_rows(&conn);
+        let path = temp_path("badmark");
+        write_template(&rows, &path, "x").unwrap();
+
+        // 把标记表首格改掉，再导
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            let bad = wb.add_worksheet();
+            bad.set_name(CHECK_SHEET).unwrap();
+            bad.write_string(0, 0, "SOMETHING-ELSE").unwrap();
+            wb.save(&path).unwrap();
+        }
+        let err = import(&mut conn, &path, "t").unwrap_err();
+        assert!(err.to_string().contains("校验标记不一致"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 缺校验表时拒绝() {
+        let mut conn = conn_with_demo();
+        let path = temp_path("nosheet");
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            wb.save(&path).unwrap();
+        }
+        let err = import(&mut conn, &path, "t").unwrap_err();
+        assert!(err.to_string().contains("缺少校验工作表"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 空行不算失败() {
+        let mut conn = conn_with_demo();
+        let rows = demo_rows(&conn);
+        let path = temp_path("blank");
+        write_template(&rows, &path, "x").unwrap();
+        let report = import(&mut conn, &path, "批量导入").unwrap();
+        assert_eq!(report.imported, 0, "没填本次金额就不该写入");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 填了金额的行会被写入且字段正确() {
+        let mut conn = conn_with_demo();
+        let rows = demo_rows(&conn);
+        let before = repo::list_payments(&conn, None).unwrap().len();
+        let target = rows[0].contract_name.clone();
+
+        let path = temp_path("fill");
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            let r = FIRST_DATA_ROW as u32;
+            ws.write_string(r, 0, target.as_str()).unwrap();
+            ws.write_number(r, 5, 1888.5).unwrap();
+            ws.write_string(r, 6, "2026-11-06").unwrap();
+            ws.write_string(r, 7, "批量导入测试事由").unwrap();
+            ws.write_string(r, 8, "现金").unwrap();
+            let chk = wb.add_worksheet();
+            chk.set_name(CHECK_SHEET).unwrap();
+            chk.write_string(0, 0, CHECK_MARK).unwrap();
+            wb.save(&path).unwrap();
+        }
+
+        let report = import(&mut conn, &path, "批量导入").unwrap();
+        assert_eq!(report.failures, vec![], "{}", report.summary());
+        assert_eq!(report.imported, 1);
+
+        let after = repo::list_payments(&conn, None).unwrap();
+        assert_eq!(after.len(), before + 1);
+        let p = after
+            .iter()
+            .find(|p| p.reason.as_deref() == Some("批量导入测试事由"))
+            .expect("应写入新单据");
+        assert_eq!(p.amount_cent.cent(), 188_850, "1888.5 元 = 188850 分");
+        assert_eq!(p.pay_method, PayMethod::Cash);
+        assert_eq!(p.pay_date, "2026-11-06");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 合同名对不上时只报该行() {
+        let mut conn = conn_with_demo();
+        let path = temp_path("badname");
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            let r = FIRST_DATA_ROW as u32;
+            ws.write_string(r, 0, "根本不存在的合同").unwrap();
+            ws.write_number(r, 5, 100.0).unwrap();
+            ws.write_string(r, 6, "2026-11-06").unwrap();
+            let chk = wb.add_worksheet();
+            chk.set_name(CHECK_SHEET).unwrap();
+            chk.write_string(0, 0, CHECK_MARK).unwrap();
+            wb.save(&path).unwrap();
+        }
+        let report = import(&mut conn, &path, "t").unwrap();
+        assert_eq!(report.imported, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].line, FIRST_DATA_ROW + 1);
+        assert!(report.failures[0].message.contains("没有"), "{:?}", report.failures);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 落一份真实模板到临时目录，供肉眼核对版式（默认忽略）。
+    #[test]
+    #[ignore = "需要人工看版式时手动执行"]
+    fn 落一份模板供肉眼核对() {
+        let conn = conn_with_demo();
+        let rows = demo_rows(&conn);
+        let path = std::env::temp_dir().join("ctp-批量拨款模板_核对用.xlsx");
+        let (n, _) = write_template(&rows, &path, &ctp_core::date::now_iso()).unwrap();
+        println!("已写出 {} 行 → {}", n, path.display());
+    }
+}

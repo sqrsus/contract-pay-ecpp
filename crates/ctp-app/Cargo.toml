@@ -13,6 +13,7 @@ serde_json.workspace = true
 # 报表导出：write-only（只能新建 xlsx，不能读取/修改已有模板）。
 # 打印不走模板填充，见 print.rs / paper.rs 与文档 ADR-06 / R-28。
 rust_xlsxwriter = "0.102"
+calamine = { version = "0.38.0", default-features = false }
 
 # 打印：只用 Windows 自带 GDI + 通用打印对话框，不依赖 Word / Edge。
 # StartDocW / StartPage / EndPage / EndDoc / DOCINFOW 在 Storage::Xps 下（gdi32 导出）。

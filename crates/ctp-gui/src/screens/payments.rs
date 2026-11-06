@@ -1,6 +1,5 @@
 //! 拨款管理页：合同可付额度、登记表单、拨款明细。
 
-use crate::screens::page_header;
 use crate::widgets::{self, Tone};
 use crate::{App, Confirm};
 use ctp_app::service;
@@ -19,12 +18,37 @@ fn status_label(status: &str) -> &str {
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
-    page_header(
-        ui,
-        &p,
-        "拨款管理",
-        "未交工合同累计付款不超过有效计价基准的 80%；施工合同须已审定、且交工满 2 年方可付清",
-    );
+    let mut export_tpl = false;
+    let mut import_tpl = false;
+
+    // 页头：标题 + 右侧两个批量入口（导出模板 / 导入回传）
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("拨款管理").size(19.0).strong().color(p.text));
+            ui.label(
+                RichText::new(
+                    "未交工合同累计付款不超过有效计价基准的 80%；施工合同须已审定、且交工满 2 年方可付清",
+                )
+                .size(12.0)
+                .color(p.text_muted),
+            );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::ghost_button(ui, &p, "导入批量拨款")
+                .on_hover_text("按模板填好后一次导入多笔，逐行校验、失败行单独提示")
+                .clicked()
+            {
+                import_tpl = true;
+            }
+            if widgets::ghost_button(ui, &p, "导出批量拨款模板")
+                .on_hover_text("导出含全部合同的 xlsx，只需填写后 4 列")
+                .clicked()
+            {
+                export_tpl = true;
+            }
+        });
+    });
+    ui.add_space(10.0);
 
     if app.summaries.is_empty() {
         widgets::card(&p).show(ui, |ui| {
@@ -646,6 +670,50 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
     if let Some(id) = open_pay {
         app.open_payment(&id);
+    }
+
+    // ---------------- 批量导入 / 导出模板
+    if export_tpl {
+        let rows: Vec<ctp_app::batch::TemplateRow> = app
+            .summaries
+            .iter()
+            .map(ctp_app::batch::TemplateRow::from_summary)
+            .collect();
+        if rows.is_empty() {
+            app.error("还没有合同，无法生成批量拨款模板");
+        } else {
+            let name = format!("批量拨款模板_{}.xlsx", ctp_core::date::today_iso());
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(&name)
+                .add_filter("Excel 工作簿", &["xlsx"])
+                .save_file()
+            {
+                match ctp_app::batch::write_template(&rows, &path, &ctp_core::date::now_iso()) {
+                    Ok((n, _)) => app.success(format!(
+                        "模板已导出（{n} 份合同）：请只填后 4 列，本次金额留空的行不会导入"
+                    )),
+                    Err(e) => app.error(format!("导出模板失败：{e}")),
+                }
+            }
+        }
+    }
+    if import_tpl {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel 工作簿", &["xlsx"])
+            .pick_file()
+        {
+            match app.exec(move |c| ctp_app::batch::import(c, &path, "管理员")) {
+                Ok(report) => {
+                    app.refresh();
+                    if report.has_failure() {
+                        app.error(report.summary());
+                    } else {
+                        app.success(report.summary());
+                    }
+                }
+                Err(e) => app.error(format!("导入失败：{e}")),
+            }
+        }
     }
 }
 
