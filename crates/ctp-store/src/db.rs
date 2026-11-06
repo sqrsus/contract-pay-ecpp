@@ -49,6 +49,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     }
     // 先补列、再建视图：视图会引用新增列，顺序反了存量库会报 no such column。
     migrate_contract_columns(conn)?;
+    migrate_audit_log_columns(conn)?;
     {
         let tx = conn.transaction()?;
         // `CREATE VIEW IF NOT EXISTS` 不会覆盖已有视图定义；视图列变化时
@@ -119,6 +120,22 @@ fn migrate_contract_columns(conn: &mut Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// 给存量 `sys_audit_log` 追加 `target_label`（R-31：操作对象的可读名称）。
+///
+/// 与 `migrate_contract_columns` 同法：`ALTER TABLE … ADD COLUMN` 没有
+/// `IF NOT EXISTS`，先探列再补。旧日志的该列为 NULL，页面上回退显示目标 id。
+fn migrate_audit_log_columns(conn: &mut Connection) -> Result<()> {
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(sys_audit_log)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if existing.iter().any(|c| c == "target_label") {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE sys_audit_log ADD COLUMN target_label TEXT")?;
     Ok(())
 }
 
@@ -238,26 +255,45 @@ pub fn next_sequence(conn: &Connection, scope_key: &str) -> Result<i64> {
     Ok(v)
 }
 
+/// 日志保留上限（R-31）：超过就静默裁掉最旧的若干条，防止库无限膨胀。
+///
+/// 5 万条按每天 50 次操作算约三年，日常使用不会触发；触发时用户仍可在
+/// 「操作日志」页看到最近的全部记录。
+pub const AUDIT_KEEP_MAX: i64 = 50_000;
+
 pub fn insert_audit_log(
     conn: &Connection,
     target_type: &str,
     target_id: &str,
+    target_label: Option<&str>,
     action: &str,
     detail: Option<&str>,
     operator_id: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO sys_audit_log(id, target_type, target_id, action, detail, operator_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO sys_audit_log(id, target_type, target_id, target_label, action, detail, operator_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             ctp_core::ids::new_id("LOG"),
             target_type,
             target_id,
+            target_label,
             action,
             detail,
             operator_id,
             now_iso()
         ],
     )?;
+    // 超上限才裁：先 count（走索引，毫秒级），避免每次写入都跑一条带 OFFSET 的删除。
+    // 裁剪本身不写日志，否则「写日志 → 裁剪 → 又写日志」会自我循环。
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM sys_audit_log", [], |r| r.get(0))?;
+    if n > AUDIT_KEEP_MAX {
+        conn.execute(
+            "DELETE FROM sys_audit_log WHERE id IN ( \
+                 SELECT id FROM sys_audit_log \
+                 ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?1)",
+            rusqlite::params![AUDIT_KEEP_MAX],
+        )?;
+    }
     Ok(())
 }

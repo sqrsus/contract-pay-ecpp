@@ -6,6 +6,7 @@
 //! * **本期裁剪**：只建本期真正使用的 12 张表，申请单/审批/分摊表不建（H3）；
 //! * **结构自检**：`repo::audit_column_violations` 把 DB-06 的「每表必备审计列」变成可执行断言（M4）。
 
+pub mod audit;
 pub mod db;
 pub mod error;
 pub mod repo;

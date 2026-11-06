@@ -9,6 +9,7 @@ pub mod batch;
 pub mod checks;
 pub mod demo;
 pub mod history;
+pub mod logs;
 pub mod paper;
 pub mod print;
 pub mod report;

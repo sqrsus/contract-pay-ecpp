@@ -39,15 +39,18 @@ pub enum Screen {
     Payments,
     /// 汇总统计：合并了原「分类汇总」与「期间统计」两个页面
     Summary,
+    /// 操作日志：所有写库操作的留痕与清理（仅管理员可见）
+    Logs,
     Checks,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 5] = [
+    pub const ALL: [Screen; 6] = [
         Screen::Dashboard,
         Screen::Contracts,
         Screen::Payments,
         Screen::Summary,
+        Screen::Logs,
         Screen::Checks,
     ];
 
@@ -57,6 +60,7 @@ impl Screen {
             Screen::Contracts => "合同台账",
             Screen::Payments => "拨款管理",
             Screen::Summary => "汇总统计",
+            Screen::Logs => "操作日志",
             Screen::Checks => "自检与设置",
         }
     }
@@ -68,6 +72,7 @@ impl Screen {
             Screen::Contracts => "合同",
             Screen::Payments => "拨款",
             Screen::Summary => "汇总",
+            Screen::Logs => "日志",
             Screen::Checks => "自检",
         }
     }
@@ -78,6 +83,7 @@ impl Screen {
             Screen::Contracts => "合同清单、审计价与金额维护",
             Screen::Payments => "登记拨款单并实时校验可付额度",
             Screen::Summary => "按日 / 项目 / 承包单位统计已付拨款",
+            Screen::Logs => "写库操作留痕、按时间段或全部清理",
             Screen::Checks => "口径自检、超付容差、管理密码",
         }
     }
@@ -186,14 +192,49 @@ pub struct App {
     pub pw_new2: String,
 
     // ---------------- 汇总统计
-    /// 当前维度（按日 / 按项目 / 按承包单位）
+    /// 当前维度（按项目 / 按承包单位 / 按合同 / 按合同类型）
     pub summary_dim: ctp_core::ledger::SummaryDim,
+    /// 统计区间（本地日期闭区间，空串 = 不限）
     pub summary_from: String,
     pub summary_to: String,
+    /// 筛选：项目状态（None = 全部；true = 归档关闭，false = 履行中）
+    pub summary_archived: Option<bool>,
+    /// 筛选：合同类型代码（None = 全部）
+    pub summary_type: Option<String>,
+    /// 筛选：关键词（项目名 / 承包单位 / 合同编号 / 合同名称）
+    pub summary_kw: String,
     /// 当前结果（屏幕与导出同源）
     pub summary: Option<ctp_app::report::ReportResult>,
-    /// 上次查询用的（维度, 起, 止）；与当前值不同就重算
-    pub summary_key: Option<(ctp_core::ledger::SummaryDim, String, String)>,
+    /// 上次查询用的筛选快照；与当前值不同就重算
+    pub summary_key: Option<(
+        ctp_core::ledger::SummaryDim,
+        String,
+        String,
+        Option<bool>,
+        Option<String>,
+        String,
+    )>,
+
+    // ---------------- 操作日志（仅管理员可见）
+    /// 筛选：起 / 止（本地日期闭区间，空串 = 不限）
+    pub log_from: String,
+    pub log_to: String,
+    /// 筛选：操作类型（None = 全部）
+    pub log_action: Option<String>,
+    /// 筛选：关键词（匹配对象名称 / 内容 / 目标 id）
+    pub log_kw: String,
+    /// 当前页数据与计数
+    pub log_rows: Vec<ctp_store::audit::AuditLogRow>,
+    /// 当前筛选命中的条数
+    pub log_count: i64,
+    /// 全库条数（显示容量占用）
+    pub log_total: i64,
+    /// 出现过的操作类型（筛选项，动态取自库）
+    pub log_actions: Vec<String>,
+    /// 上次查询用的筛选快照；与当前值不同就重查
+    pub log_key: Option<(String, String, Option<String>, String)>,
+    /// 待确认的清理动作（筛选条件 + 一句人话描述）
+    pub log_clear: Option<(ctp_store::audit::LogFilter, String)>,
 
     pub dialog: Dialog,
     pub confirm: Option<Confirm>,
@@ -237,6 +278,7 @@ fn initial_screen() -> Screen {
         "payments" => Screen::Payments,
         // 旧的 reports / periods 两个入口统一落到「汇总统计」，避免脚本调用失效
         "reports" | "summary" | "periods" => Screen::Summary,
+        "logs" => Screen::Logs,
         "checks" => Screen::Checks,
         _ => Screen::Dashboard,
     }
@@ -302,11 +344,24 @@ impl App {
             pw_old: String::new(),
             pw_new: String::new(),
             pw_new2: String::new(),
-            summary_dim: ctp_core::ledger::SummaryDim::Day,
+            summary_dim: ctp_core::ledger::SummaryDim::Project,
             summary_from: ctp_app::service::default_summary_range().0,
             summary_to: ctp_app::service::default_summary_range().1,
+            summary_archived: None,
+            summary_type: None,
+            summary_kw: String::new(),
             summary: None,
             summary_key: None,
+            log_from: String::new(),
+            log_to: String::new(),
+            log_action: None,
+            log_kw: String::new(),
+            log_rows: Vec::new(),
+            log_count: 0,
+            log_total: 0,
+            log_actions: Vec::new(),
+            log_key: None,
+            log_clear: None,
             dialog: Dialog::None,
             confirm: None,
             confirm_reason: String::new(),
@@ -520,6 +575,8 @@ impl App {
         if let Ok(Some(v)) = db::schema_version(conn) {
             self.schema_version = v;
         }
+        // 写操作之后日志一定有新条目：置空快照让操作日志页下一帧重查
+        self.log_key = None;
 
         // 选中项跟随数据刷新：合同不在了就清空
         if let Some(id) = self.selected.clone() {
@@ -839,6 +896,12 @@ impl App {
         self.role.map(|r| r.can_write()).unwrap_or(false)
     }
 
+    /// 当前身份能否查看操作日志。现阶段与写权限一致（管理员）；
+    /// 将来加「授权角色」时只需改这一处。
+    pub fn can_view_logs(&self) -> bool {
+        self.can_write()
+    }
+
     /// 权限不足的统一提示文案。
     pub const NO_PERMISSION: &'static str = "无权限：浏览模式仅可查看，请用「管理登录」进入后再操作";
 
@@ -1009,8 +1072,8 @@ impl App {
                     ui.add_space(6.0);
                 }
                 for s in Screen::ALL {
-                    // 浏览用户看不到「自检与设置」：容差与密码都在那里
-                    if s == Screen::Checks && !self.can_write() {
+                    // 浏览用户看不到「操作日志」与「自检与设置」：清理与设置都是管理员的事
+                    if (s == Screen::Checks || s == Screen::Logs) && !self.can_write() {
                         continue;
                     }
                     let selected = self.screen == s;
@@ -1227,8 +1290,8 @@ impl eframe::App for App {
             crate::screens::login::draw(self, ctx);
             return;
         }
-        // 浏览用户不得停留在「自检与设置」（含 CTP_SCREEN 直接启动到该页的情况）
-        if self.screen == Screen::Checks && !self.can_write() {
+        // 浏览用户不得停留在「操作日志」与「自检与设置」（含 CTP_SCREEN 直接启动到该页的情况）
+        if (self.screen == Screen::Checks || self.screen == Screen::Logs) && !self.can_write() {
             self.screen = Screen::Dashboard;
         }
 

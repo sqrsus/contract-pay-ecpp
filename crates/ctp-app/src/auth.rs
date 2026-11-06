@@ -84,8 +84,42 @@ pub fn is_initial(conn: &Connection) -> Result<bool, StoreError> {
 }
 
 /// 改密码。调用方必须先 `verify` 旧密码，这里只负责写入。
+///
+/// R-31：同时写一条操作日志。日志里只记「已修改」，**不记任何密码痕迹**
+/// （明文、摘要都不写）。
 pub fn change(conn: &Connection, new_password: &str, operator: &str) -> Result<(), StoreError> {
-    db::set_meta(conn, PASSWORD_META_KEY, &digest(new_password), operator)
+    db::set_meta(conn, PASSWORD_META_KEY, &digest(new_password), operator)?;
+    db::insert_audit_log(
+        conn,
+        "sys_meta",
+        PASSWORD_META_KEY,
+        Some("管理密码"),
+        "CHANGE_PASSWORD",
+        Some("管理密码已修改"),
+        operator,
+    )?;
+    Ok(())
+}
+
+/// 记录一次管理登录尝试（成功 / 失败）。
+///
+/// 登录本身不写业务数据，但它是审计价值最高的一类事件，所以单独开这个入口。
+/// 由界面层在密码校验后直接调用：此时角色尚未落定，不能走「写权限」那条门面。
+pub fn log_login(conn: &Connection, ok: bool, operator: &str) -> Result<(), StoreError> {
+    let (action, detail) = if ok {
+        ("LOGIN_OK", "管理登录成功")
+    } else {
+        ("LOGIN_FAIL", "管理登录失败：密码错误")
+    };
+    db::insert_audit_log(
+        conn,
+        "session",
+        "login",
+        Some("管理登录"),
+        action,
+        Some(detail),
+        operator,
+    )
 }
 
 /// 新密码的格式校验：长度 4–20 位，不能含首尾空白，不能全是空白。

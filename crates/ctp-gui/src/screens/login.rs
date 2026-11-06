@@ -164,6 +164,23 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
             .as_ref()
             .and_then(|c| auth::verify(c, &app.login_pw).ok())
             .unwrap_or(false);
+        // 登录成败都留痕（R-31）：这是审计价值最高的动作之一
+        if let Some(conn) = app.db.as_ref() {
+            let (action, detail) = if ok {
+                ("LOGIN_OK", "管理登录成功")
+            } else {
+                ("LOGIN_FAIL", "管理登录失败：密码错误")
+            };
+            let _ = ctp_store::db::insert_audit_log(
+                conn,
+                "session",
+                "login",
+                Some("登录"),
+                action,
+                Some(detail),
+                "管理员",
+            );
+        }
         if ok {
             app.role = Some(Role::Admin);
             app.login_pw.clear();

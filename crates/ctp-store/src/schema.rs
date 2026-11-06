@@ -15,7 +15,7 @@
 //! 本期建表 13 张 + 视图 4 个；文档目标态为 21 张，其余随移出模块或二期补建。
 
 /// 结构版本，写入 `PRAGMA user_version` 的伴生元数据键 `schema_version`。
-pub const SCHEMA_VERSION: &str = "1.6.0-rv24";
+pub const SCHEMA_VERSION: &str = "1.6.0-rv25";
 
 /// 计入「已付净额」的单据状态（**唯一口径**，视图与仓储共用）。
 pub const PAID_STATUS_SQL: &str = "'PAID'";
@@ -138,11 +138,16 @@ CREATE TABLE IF NOT EXISTS sys_meta (
 "#;
 
 /// 追加型日志表：DB-06 的显式豁免项（评审 M4）。
+///
+/// R-31：补 `target_label`（操作对象的可读名称）。原本只有 `target_id`，
+/// 页面直接显示 UUID 没法看；回查业务表又会在对象被作废/删除后查不到，
+/// 所以写入时就把名称快照下来。
 const SYS_AUDIT_LOG: &str = r#"
 CREATE TABLE IF NOT EXISTS sys_audit_log (
     id           TEXT PRIMARY KEY,
     target_type  TEXT NOT NULL,
     target_id    TEXT NOT NULL,
+    target_label TEXT,
     action       TEXT NOT NULL,
     detail       TEXT,
     operator_id  TEXT,
