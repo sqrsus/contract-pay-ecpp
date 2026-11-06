@@ -4,6 +4,7 @@
 //! 所有写操作都在 `BEGIN IMMEDIATE` 事务内完成，额度校验与流水号自增同事务，
 //! 避免「先查后写」的并发超付（BR-01 的落点在保存拨款单，见 6.2.4）。
 
+pub mod auth;
 pub mod checks;
 pub mod demo;
 pub mod history;

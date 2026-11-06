@@ -153,8 +153,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let c_paid = 104.0;
                     let c_rate = 128.0;
                     let c_status = 72.0;
-                    // 8 列（含承包单位/金额）836 / 7 列 714 / 5 列 514
-                    const NEED_8: f32 = 684.0 + 120.0 + 8.0 * 4.0;
+                    // 8 列（含承包单位/金额）891 / 7 列 714 / 5 列 514
+                    // 承包单位列按需求加宽到 1.5 倍（110 → 165），8 列阈值同步上调 55
+                    const NEED_8: f32 = 739.0 + 120.0 + 8.0 * 4.0;
                     const NEED_7: f32 = 574.0 + 112.0 + 7.0 * 4.0;
                     let (compact, tight_cols) = if card_w >= NEED_8 {
                         (false, false)
@@ -163,7 +164,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     } else {
                         (true, true)
                     };
-                    let c_contractor = if compact { 0.0 } else { 110.0 };
+                    // 承包单位加宽 1.5 倍：110 → 165，多出的 55 由余量列「合同名称」让位
+                    let c_contractor = if compact { 0.0 } else { 165.0 };
                     let c_amount = if compact { 0.0 } else { 92.0 };
                     let c_audit = if tight_cols { 0.0 } else { 92.0 };
                     let c_delivery = if tight_cols { 0.0 } else { 88.0 };
@@ -416,6 +418,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             );
         }
     });
+
+    // 浏览用户不许触发写类动作：不置灰，点了直接提示「无权限」
+    let writes = matches!(
+        action,
+        Some(Act::New) | Some(Act::Activate) | Some(Act::Audit) | Some(Act::Delivery)
+    );
+    if writes && !app.require_write() {
+        return;
+    }
 
     match action {
         Some(Act::DetailModal(id)) => app.open_contract_detail(&id),

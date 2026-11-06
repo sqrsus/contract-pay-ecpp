@@ -3,6 +3,7 @@
 use crate::screens::page_header;
 use crate::widgets::{self, Tone};
 use crate::App;
+use ctp_app::auth;
 use ctp_app::service;
 use ctp_core::rate::Rate;
 use eframe::egui::{self, RichText};
@@ -18,6 +19,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     let mut run = false;
     let mut save_tol = false;
+    let mut save_pw = false;
 
     ui.horizontal(|ui| {
         if widgets::primary_button(ui, &p, "运行自检", true).clicked() {
@@ -137,6 +139,42 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     ui.add_space(12.0);
                     widgets::card(&p).show(ui, |ui| {
                         ui.set_width(266.0);
+                        widgets::section_title(ui, &p, "管理密码", "修改后立即生效");
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("浏览用户没有此页；忘记密码无法找回，只能删库重建。")
+                                .size(11.0)
+                                .color(p.text_muted),
+                        );
+                        ui.add_space(8.0);
+                        for (label, buf) in [
+                            ("旧密码", &mut app.pw_old),
+                            ("新密码（4–20 位）", &mut app.pw_new),
+                            ("确认新密码", &mut app.pw_new2),
+                        ] {
+                            widgets::field_label(ui, &p, label);
+                            ui.add_sized(
+                                [180.0, 30.0],
+                                egui::TextEdit::singleline(buf)
+                                    .password(true)
+                                    .margin(egui::Margin::symmetric(8.0, 4.0)),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        let all_filled = !app.pw_old.is_empty()
+                            && !app.pw_new.is_empty()
+                            && !app.pw_new2.is_empty();
+                        ui.add_space(4.0);
+                        if widgets::primary_button(ui, &p, "修改密码", all_filled).clicked()
+                            && all_filled
+                        {
+                            save_pw = true;
+                        }
+                    });
+
+                    ui.add_space(12.0);
+                    widgets::card(&p).show(ui, |ui| {
+                        ui.set_width(266.0);
                         widgets::section_title(ui, &p, "数据源", "");
                         ui.add_space(6.0);
                         ui.label(
@@ -181,6 +219,31 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     app.success(format!("容差已设为 {bp} bp"));
                 }
                 Err(e) => app.error(format!("保存容差失败：{e}")),
+            }
+        }
+    }
+
+    if save_pw {
+        let old = app.pw_old.clone();
+        let new = app.pw_new.clone();
+        let new2 = app.pw_new2.clone();
+        // 先验旧密码：输错旧密码不该先被新密码的格式问题挡回来
+        let old_ok = app.read(|c| auth::verify(c, &old)).unwrap_or(false);
+        if !old_ok {
+            app.error("旧密码不正确");
+        } else if let Err(msg) = auth::validate_new_password(&new) {
+            app.error(msg);
+        } else if new != new2 {
+            app.error("两次输入的新密码不一致");
+        } else {
+            match app.exec(|c| auth::change(c, &new, "管理员")) {
+                Ok(()) => {
+                    app.pw_old.clear();
+                    app.pw_new.clear();
+                    app.pw_new2.clear();
+                    app.success("管理密码已修改，下次登录请用新密码");
+                }
+                Err(e) => app.error(format!("修改密码失败：{e}")),
             }
         }
     }

@@ -37,18 +37,17 @@ pub enum Screen {
     Dashboard,
     Contracts,
     Payments,
-    Reports,
-    Periods,
+    /// 汇总统计：合并了原「分类汇总」与「期间统计」两个页面
+    Summary,
     Checks,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 6] = [
+    pub const ALL: [Screen; 5] = [
         Screen::Dashboard,
         Screen::Contracts,
         Screen::Payments,
-        Screen::Reports,
-        Screen::Periods,
+        Screen::Summary,
         Screen::Checks,
     ];
 
@@ -57,8 +56,7 @@ impl Screen {
             Screen::Dashboard => "总览",
             Screen::Contracts => "合同台账",
             Screen::Payments => "拨款管理",
-            Screen::Reports => "分类汇总",
-            Screen::Periods => "期间统计",
+            Screen::Summary => "汇总统计",
             Screen::Checks => "自检与设置",
         }
     }
@@ -69,8 +67,7 @@ impl Screen {
             Screen::Dashboard => "总览",
             Screen::Contracts => "合同",
             Screen::Payments => "拨款",
-            Screen::Reports => "汇总",
-            Screen::Periods => "期间",
+            Screen::Summary => "汇总",
             Screen::Checks => "自检",
         }
     }
@@ -80,9 +77,8 @@ impl Screen {
             Screen::Dashboard => "关键指标与最近动态",
             Screen::Contracts => "合同清单、审计价与金额维护",
             Screen::Payments => "登记拨款单并实时校验可付额度",
-            Screen::Reports => "按会计分类汇总（V3 口径）",
-            Screen::Periods => "按支付月份统计（V4 口径）",
-            Screen::Checks => "口径自检、超付容差",
+            Screen::Summary => "按日 / 项目 / 承包单位统计已付拨款",
+            Screen::Checks => "口径自检、超付容差、管理密码",
         }
     }
 }
@@ -175,6 +171,30 @@ pub struct App {
     pub amount_form: AmountForm,
     pub tol_input: String,
 
+    // ---------------- 登录与权限（角色只在进程内有效，关掉程序即失效）
+    /// 当前登录身份；`None` 表示停在登录页
+    pub role: Option<ctp_app::auth::Role>,
+    /// 登录页的密码输入框
+    pub login_pw: String,
+    /// 登录页的即时错误提示
+    pub login_err: Option<String>,
+    /// 「管理登录」是否已展开密码框
+    pub login_admin: bool,
+    /// 设置页修改密码表单：旧密码 / 新密码 / 确认
+    pub pw_old: String,
+    pub pw_new: String,
+    pub pw_new2: String,
+
+    // ---------------- 汇总统计
+    /// 当前维度（按日 / 按项目 / 按承包单位）
+    pub summary_dim: ctp_core::ledger::SummaryDim,
+    pub summary_from: String,
+    pub summary_to: String,
+    /// 当前结果（屏幕与导出同源）
+    pub summary: Option<ctp_app::report::ReportResult>,
+    /// 上次查询用的（维度, 起, 止）；与当前值不同就重算
+    pub summary_key: Option<(ctp_core::ledger::SummaryDim, String, String)>,
+
     pub dialog: Dialog,
     pub confirm: Option<Confirm>,
     pub confirm_reason: String,
@@ -215,8 +235,8 @@ fn initial_screen() -> Screen {
     match std::env::var("CTP_SCREEN").unwrap_or_default().as_str() {
         "contracts" => Screen::Contracts,
         "payments" => Screen::Payments,
-        "reports" => Screen::Reports,
-        "periods" => Screen::Periods,
+        // 旧的 reports / periods 两个入口统一落到「汇总统计」，避免脚本调用失效
+        "reports" | "summary" | "periods" => Screen::Summary,
         "checks" => Screen::Checks,
         _ => Screen::Dashboard,
     }
@@ -275,6 +295,18 @@ impl App {
             delivery_form: String::new(),
             amount_form: AmountForm::default(),
             tol_input: String::new(),
+            role: None,
+            login_pw: String::new(),
+            login_err: None,
+            login_admin: false,
+            pw_old: String::new(),
+            pw_new: String::new(),
+            pw_new2: String::new(),
+            summary_dim: ctp_core::ledger::SummaryDim::Day,
+            summary_from: ctp_app::service::default_summary_range().0,
+            summary_to: ctp_app::service::default_summary_range().1,
+            summary: None,
+            summary_key: None,
             dialog: Dialog::None,
             confirm: None,
             confirm_reason: String::new(),
@@ -308,6 +340,11 @@ impl App {
                     app.init_error = Some(format!("写入基础字典失败：{e}"));
                     return app;
                 }
+                // 首次打开写入初始管理密码（0001）；已有密码时原样保留，不动任何业务数据
+                if let Err(e) = ctp_app::auth::ensure_initial(&conn) {
+                    app.init_error = Some(format!("初始化管理密码失败：{e}"));
+                    return app;
+                }
                 app.db = Some(conn);
                 app.refresh();
             }
@@ -321,6 +358,16 @@ impl App {
     ///
     /// 供自动化截图与问题复现使用；正常启动不受影响。
     fn open_initial_dialog(&mut self) {
+        // `CTP_LOGIN=admin` 让登录页直接展开密码框（截图核对用）
+        if std::env::var("CTP_LOGIN").as_deref() == Ok("admin") {
+            self.login_admin = true;
+        }
+        // `CTP_ROLE=browse|admin` 跳过登录直达主界面（截图与回归核对用，正常启动不设置）
+        match std::env::var("CTP_ROLE").unwrap_or_default().as_str() {
+            "browse" => self.role = Some(ctp_app::auth::Role::Browse),
+            "admin" => self.role = Some(ctp_app::auth::Role::Admin),
+            _ => {}
+        }
         // `CTP_SELECT=1` 仅选中第一份合同，用于核对选中态布局
         if std::env::var("CTP_SELECT").unwrap_or_default() == "1" {
             if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
@@ -741,6 +788,36 @@ impl App {
         }
     }
 
+    /// 导出当前汇总结果（区间由界面决定，不能走 `report_of` 的默认区间）。
+    pub fn export_summary(&mut self) {
+        let Some(result) = self.summary.clone() else {
+            self.error("还没有汇总结果，先选好区间");
+            return;
+        };
+        let outcome: Result<(usize, std::path::PathBuf), String> = (|| {
+            let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
+            let path = rfd::FileDialog::new()
+                .set_file_name(&result.default_file_name())
+                .add_filter("Excel 工作簿", &["xlsx"])
+                .save_file()
+                .ok_or_else(String::new)?;
+            let (rows, _) =
+                ctp_app::service::export_result(conn, &result, &path, "界面用户")
+                    .map_err(|e| e.to_string())?;
+            Ok((rows, path))
+        })();
+        match outcome {
+            Ok((rows, path)) => self.success(format!(
+                "已导出「{}」{} 行 → {}",
+                result.title,
+                rows,
+                path.display()
+            )),
+            Err(e) if e.is_empty() => {}
+            Err(e) => self.error(format!("导出失败：{e}")),
+        }
+    }
+
     pub fn toast(&mut self, tone: Tone, text: impl Into<String>) {
         self.toast = Some(Toast {
             text: text.into(),
@@ -757,14 +834,49 @@ impl App {
         self.toast(Tone::Danger, text);
     }
 
+    /// 当前身份能否写库（浏览用户一律 false）。
+    pub fn can_write(&self) -> bool {
+        self.role.map(|r| r.can_write()).unwrap_or(false)
+    }
+
+    /// 权限不足的统一提示文案。
+    pub const NO_PERMISSION: &'static str = "无权限：浏览模式仅可查看，请用「管理登录」进入后再操作";
+
+    /// 写操作入口的守卫：浏览用户直接提示「无权限」并返回 false。
+    ///
+    /// 按钮不置灰（按确认口径：点了才提示），这里把入口挡住，
+    /// 避免让浏览用户填完一整张表单才发现存不进去。
+    pub fn require_write(&mut self) -> bool {
+        if self.can_write() {
+            return true;
+        }
+        self.error(Self::NO_PERMISSION);
+        false
+    }
+
     /// 在数据库上执行一次写操作，随后刷新缓存。
+    ///
+    /// 写入口统一从这里过，所以「浏览用户不得改数据」只需在这一处拦截；
+    /// 只读操作（如读取附件字节）走 `db.as_ref()`，不受影响。
     pub fn exec<T>(
         &mut self,
         f: impl FnOnce(&mut Connection) -> Result<T, ctp_store::StoreError>,
     ) -> Result<T, String> {
+        if !self.can_write() {
+            return Err(Self::NO_PERMISSION.to_string());
+        }
         let conn = self.db.as_mut().ok_or_else(|| "数据库未打开".to_string())?;
         let out = f(conn).map_err(|e| e.to_string())?;
         Ok(out)
+    }
+
+    /// 只读访问数据库：浏览用户同样可用，不经过写权限检查。
+    pub fn read<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, ctp_store::StoreError>,
+    ) -> Result<T, String> {
+        let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
+        f(conn).map_err(|e| e.to_string())
     }
 
     pub fn selected_summary(&self) -> Option<&ContractSummary> {
@@ -783,6 +895,7 @@ impl App {
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         let p = self.pal;
+        let mut logout = false;
         egui::TopBottomPanel::top("top_bar")
             .exact_height(62.0)
             .frame(
@@ -815,6 +928,21 @@ impl App {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 退出登录：回到登录页，角色清空（不存在任何持久化）
+                        if widgets::ghost_button(ui, &p, "退出")
+                            .on_hover_text("退出当前身份，回到登录页")
+                            .clicked()
+                        {
+                            logout = true;
+                        }
+                        ui.add_space(6.0);
+                        let (role_text, role_tone) = match self.role {
+                            Some(r) if r.can_write() => (r.label(), Tone::Primary),
+                            Some(r) => (r.label(), Tone::Neutral),
+                            None => ("未登录", Tone::Neutral),
+                        };
+                        widgets::badge(ui, &p, role_text, role_tone);
+                        ui.add_space(8.0);
                         let theme_text = if self.mode.is_dark() { "浅色" } else { "深色" };
                         if widgets::ghost_button(ui, &p, &format!("切换{theme_text}")).clicked() {
                             self.mode.toggle();
@@ -844,6 +972,18 @@ impl App {
             egui::Id::new("top_bar_line"),
         ))
         .rect_filled(rect, Rounding::same(0.0), p.border);
+
+        if logout {
+            self.role = None;
+            self.dialog = Dialog::None;
+            self.confirm = None;
+            self.modal_contract = None;
+            self.screen = Screen::Dashboard;
+            self.login_pw.clear();
+            self.login_err = None;
+            self.login_admin = false;
+            self.toast(Tone::Neutral, "已退出登录");
+        }
     }
 
     // ---------------------------------------------------------------- 导航
@@ -869,6 +1009,10 @@ impl App {
                     ui.add_space(6.0);
                 }
                 for s in Screen::ALL {
+                    // 浏览用户看不到「自检与设置」：容差与密码都在那里
+                    if s == Screen::Checks && !self.can_write() {
+                        continue;
+                    }
                     let selected = self.screen == s;
                     let text = if self.narrow { s.short() } else { s.label() };
                     let resp = nav_item(ui, &p, text, selected, self.narrow);
@@ -928,10 +1072,14 @@ impl App {
                     ui.label(RichText::new("●").size(12.0).color(fg));
                     ui.label(RichText::new(text).size(12.5).color(p.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let role = self.role.map(|r| r.label()).unwrap_or("未登录");
                         ui.label(
-                            RichText::new(format!("超付容差 {} bp", self.tolerance_bp))
-                                .size(11.5)
-                                .color(p.text_muted),
+                            RichText::new(format!(
+                                "{role} · 超付容差 {} bp",
+                                self.tolerance_bp
+                            ))
+                            .size(11.5)
+                            .color(p.text_muted),
                         );
                     });
                 });
@@ -1073,6 +1221,16 @@ impl eframe::App for App {
             }
         }
         self.narrow = ctx.screen_rect().width() < 1100.0;
+
+        // 未登录：只画登录页，不进入主界面（连顶栏导航都不出现）
+        if self.role.is_none() {
+            crate::screens::login::draw(self, ctx);
+            return;
+        }
+        // 浏览用户不得停留在「自检与设置」（含 CTP_SCREEN 直接启动到该页的情况）
+        if self.screen == Screen::Checks && !self.can_write() {
+            self.screen = Screen::Dashboard;
+        }
 
         self.top_bar(ctx);
         self.status_bar(ctx);

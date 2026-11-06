@@ -154,6 +154,64 @@ pub fn ghost_button(ui: &mut Ui, p: &Palette, text: &str) -> Response {
     )
 }
 
+/// 指定尺寸的次要按钮：登录页这类需要两个入口等宽并排的场景用。
+pub fn ghost_button_sized(
+    ui: &mut Ui,
+    p: &Palette,
+    text: &str,
+    width: f32,
+    height: f32,
+) -> Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).size(13.5).color(p.text))
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .rounding(Rounding::same(8.0))
+            .min_size(Vec2::new(width, height)),
+    )
+}
+
+/// 指定尺寸的主按钮（外观与 `primary_button` 一致，仅换成固定宽高）。
+pub fn primary_button_sized(
+    ui: &mut Ui,
+    p: &Palette,
+    text: &str,
+    width: f32,
+    height: f32,
+    enabled: bool,
+) -> Response {
+    if !enabled {
+        return ui.add(
+            egui::Button::new(RichText::new(text).size(14.0).color(p.text_muted))
+                .fill(p.surface_alt)
+                .stroke(Stroke::new(1.0_f32, p.border))
+                .rounding(Rounding::same(8.0))
+                .min_size(Vec2::new(width, height)),
+        );
+    }
+    ui.scope(|ui| {
+        let w = &mut ui.style_mut().visuals.widgets;
+        w.inactive.weak_bg_fill = p.primary;
+        w.inactive.bg_fill = p.primary;
+        w.inactive.bg_stroke = Stroke::NONE;
+        w.inactive.fg_stroke = Stroke::new(1.0_f32, p.on_primary);
+        w.hovered.weak_bg_fill = p.primary_hover;
+        w.hovered.bg_fill = p.primary_hover;
+        w.hovered.bg_stroke = Stroke::NONE;
+        w.hovered.fg_stroke = Stroke::new(1.0_f32, p.on_primary);
+        w.active.weak_bg_fill = p.primary_active;
+        w.active.bg_fill = p.primary_active;
+        w.active.bg_stroke = Stroke::NONE;
+        w.active.fg_stroke = Stroke::new(1.0_f32, p.on_primary);
+        ui.add(
+            egui::Button::new(RichText::new(text).size(14.0).color(p.on_primary))
+                .rounding(Rounding::same(8.0))
+                .min_size(Vec2::new(width, height)),
+        )
+    })
+    .inner
+}
+
 /// 危险主按钮：实心红底，悬停加深、按下更深、禁用置灰。
 /// 用于「确认作废」这类不可逆操作，禁用时必须明显不像可点。
 pub fn danger_solid_button(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> Response {

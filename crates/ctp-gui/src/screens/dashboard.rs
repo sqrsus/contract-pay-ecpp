@@ -58,15 +58,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         Err(e) => app.error(format!("载入演示数据失败：{e}")),
                     }
                 }
-                if widgets::ghost_button(ui, &p, "新建合同").clicked() {
+                if widgets::ghost_button(ui, &p, "新建合同").clicked()
+                    && app.require_write()
+                {
                     app.dialog = crate::dialogs::Dialog::NewContract;
                 }
             });
         });
-        if new_contract {
+        if new_contract && app.require_write() {
             app.dialog = crate::dialogs::Dialog::NewContract;
         }
-        if new_payment {
+        if new_payment && app.require_write() {
             app.start_payment();
         }
         return;
@@ -136,7 +138,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     // ---------------- 最近拨款（整宽、带表头）
     let mut open_pay: Option<String> = None;
-    let mut goto_contract: Option<String> = None;
+    let mut open_contract: Option<String> = None;
     let mut print_pay: Option<String> = None;
     let mut print_material: Option<String> = None;
 
@@ -184,7 +186,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &p,
             "最近拨款",
-            "点单号看详情，点合同名称跳到台账",
+            "点单号看拨款详情，点合同名称看合同详情",
         );
         ui.add_space(2.0);
 
@@ -230,7 +232,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             }
                         });
                         cell(ui, 236.0, false, |ui| {
-                            // 合同名称即跳转入口：悬停滚动查看全名，点击跳到台账
+                            // 合同名称即详情入口：悬停滚动查看全名，点击弹出该合同的详情弹窗
                             let r = widgets::marquee_sense(
                                 ui,
                                 &cname,
@@ -240,9 +242,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 egui::Sense::click(),
                             )
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text("点击跳到合同台账");
+                            .on_hover_text("点击查看合同详情");
                             if r.clicked() {
-                                goto_contract = Some(contract_id.clone());
+                                open_contract = Some(contract_id.clone());
                             }
                         });
                         cell(ui, 130.0, false, |ui| {
@@ -294,8 +296,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some(id) = open_pay {
         app.open_payment(&id);
     }
-    if let Some(id) = goto_contract {
-        app.goto_contract(&id);
+    if let Some(id) = open_contract {
+        app.open_contract_detail(&id);
     }
     if let Some(id) = print_pay {
         if let Some(pm) = app.payments.iter().find(|x| x.id == id).cloned() {
@@ -305,10 +307,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some(cid) = print_material {
         app.open_material_print(&cid);
     }
-    if new_contract {
+    if new_contract && app.require_write() {
         app.dialog = crate::dialogs::Dialog::NewContract;
     }
-    if new_payment {
+    if new_payment && app.require_write() {
         app.start_payment();
     }
 }

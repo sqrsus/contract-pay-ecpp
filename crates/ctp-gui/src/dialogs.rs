@@ -1507,7 +1507,12 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
         .map(|x| x.contractor_name.clone())
         .unwrap_or_else(|| "—".into());
     let category = dict::contract_category_name(&c.contract_category_code).unwrap_or("—");
-    let pricing = c.pricing_method.map(|x| x.label()).unwrap_or("—");
+    // 金额与支付率一律取 V1 汇总行（与总览、台账、打印同源），此处不另算一套
+    let summary = app
+        .summaries
+        .iter()
+        .find(|s| s.contract_id == c.id)
+        .cloned();
 
     let mut close = false;
     let mut material: Option<AttachmentKind> = None;
@@ -1525,20 +1530,70 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
             );
             ui.add_space(8.0);
 
+            // 顶部四项：合同金额 / 审计价 / 累计已付 / 支付率。
+            // 支付率分母为有效计价基准（审计价 > 0 取审计价，否则合同金额）。
+            let (audit_text, audit_sub) = match summary.as_ref().and_then(|s| s.audit_price) {
+                Some(v) => (v.format_yuan(), "已审定".to_string()),
+                None => ("—".to_string(), "未审计，基准取合同金额".to_string()),
+            };
+            let (paid_text, paid_sub) = match &summary {
+                Some(s) => (
+                    s.paid_amount.format_yuan(),
+                    "已实付净额，作废单不计".to_string(),
+                ),
+                None => ("—".to_string(), "无汇总数据".to_string()),
+            };
+            let (rate_text, rate_sub, rate_tone) = match &summary {
+                Some(s) if s.is_inverted => (
+                    s.pay_rate.percent_string(),
+                    "基准低于已付，已超付".to_string(),
+                    Tone::Danger,
+                ),
+                Some(s) => (
+                    s.pay_rate.percent_string(),
+                    "已付 ÷ 有效计价基准".to_string(),
+                    Tone::Primary,
+                ),
+                None => ("—".to_string(), String::new(), Tone::Neutral),
+            };
+            let cards = [
+                (
+                    "合同金额",
+                    c.original_amount_cent.format_yuan(),
+                    String::new(),
+                    Tone::Neutral,
+                ),
+                ("审计价", audit_text, audit_sub, Tone::Neutral),
+                ("累计已付", paid_text, paid_sub, Tone::Primary),
+                ("支付率", rate_text, rate_sub, rate_tone),
+            ];
+            let gap = 12.0_f32;
+            let cw = (1020.0 - gap * 3.0) / 4.0;
+            ui.scope(|ui| {
+                ui.style_mut().spacing.item_spacing.x = gap;
+                ui.horizontal(|ui| {
+                    for (label, value, sub, tone) in cards {
+                        widgets::kpi(ui, &p, cw, label, value.as_str(), sub.as_str(), tone);
+                    }
+                });
+            });
+            ui.add_space(10.0);
+
+            // 左卡：合同双方 + 招标与工期；右卡：合同属性 + 条款备注。
+            // 两块之间用细分隔线区隔，不再画分栏标题。
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(486.0);
                     form_card(&p).show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        widgets::section_title(ui, &p, "合同主体", "");
                         egui::Grid::new("ro_subject")
                             .num_columns(2)
                             .spacing([12.0, 4.0])
                             .show(ui, |ui| {
                                 ro_field(ui, &p, "合同名称", &c.contract_name, 218.0);
-                                ro_field(ui, &p, "发包人（甲方）", &c.party_a, 218.0);
-                                ui.end_row();
                                 ro_field(ui, &p, "所属项目", &project_text, 218.0);
+                                ui.end_row();
+                                ro_field(ui, &p, "发包人（甲方）", &c.party_a, 218.0);
                                 ro_field(ui, &p, "承包单位", &contractor, 218.0);
                                 ui.end_row();
                                 ro_field(
@@ -1557,11 +1612,9 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                 );
                                 ui.end_row();
                             });
-                    });
-                    ui.add_space(10.0);
-                    form_card(&p).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        widgets::section_title(ui, &p, "招标与工期", "");
+                        ui.add_space(10.0);
+                        widgets::divider(ui, &p);
+                        ui.add_space(10.0);
                         egui::Grid::new("ro_bid")
                             .num_columns(2)
                             .spacing([12.0, 4.0])
@@ -1615,7 +1668,6 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                     ui.set_width(486.0);
                     form_card(&p).show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        widgets::section_title(ui, &p, "价款与条款", "");
                         egui::Grid::new("ro_price")
                             .num_columns(2)
                             .spacing([12.0, 4.0])
@@ -1632,7 +1684,6 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     218.0,
                                 );
                                 ui.end_row();
-                                ro_field(ui, &p, "计价方式", pricing, 218.0);
                                 ro_field(
                                     ui,
                                     &p,
@@ -1643,7 +1694,6 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     ),
                                     218.0,
                                 );
-                                ui.end_row();
                                 ro_field(
                                     ui,
                                     &p,
@@ -1651,10 +1701,11 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     c.delivery_date.as_deref().unwrap_or("—"),
                                     218.0,
                                 );
-                                ui.label("");
                                 ui.end_row();
                             });
-                        ui.add_space(6.0);
+                        ui.add_space(10.0);
+                        widgets::divider(ui, &p);
+                        ui.add_space(10.0);
                         widgets::field_label(ui, &p, "付款条款");
                         ro_text(ui, &p, &c.payment_terms);
                         ui.add_space(6.0);
@@ -1961,7 +2012,7 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
     if let Some(a) = op_open {
         let id = a.id.clone();
         let name = a.file_name.clone();
-        match app.exec(move |conn| service::attachment_bytes(conn, &id)) {
+        match app.read(move |conn| service::attachment_bytes(conn, &id)) {
             Ok(bytes) => {
                 let dir = std::env::temp_dir().join("ctp-attachments");
                 let _ = std::fs::create_dir_all(&dir);
@@ -1979,7 +2030,7 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
     if let Some(a) = op_save {
         let id = a.id.clone();
         let name = a.file_name.clone();
-        match app.exec(move |conn| service::attachment_bytes(conn, &id)) {
+        match app.read(move |conn| service::attachment_bytes(conn, &id)) {
             Ok(bytes) => {
                 if let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() {
                     match std::fs::write(&path, &bytes) {
