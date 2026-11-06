@@ -172,8 +172,9 @@ pub fn write_report(
     ws.set_freeze_panes(HEADER_ROWS, 0).map_err(xerr)?;
     ws.set_landscape();
     let footer = format!(
-        "&L导出人：{operator} &C导出时间：{} &R系统版本：0.1.0",
-        result.generated_at
+        "&L导出人：{operator} &C导出时间：{} &R系统版本：{}",
+        result.generated_at,
+        env!("CARGO_PKG_VERSION"),
     );
     ws.set_footer(footer.as_str());
 
