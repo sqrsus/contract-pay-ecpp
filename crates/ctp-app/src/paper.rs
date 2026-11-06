@@ -29,6 +29,25 @@ pub enum Align {
     Right,
 }
 
+/// 字体族。模板两页用的不是同一种字：第 1 页是「新宋体」，
+/// 第 2 页继承主题字体「宋体」（R-29 按模板实测对齐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Face {
+    /// 宋体
+    Song,
+    /// 新宋体
+    NSong,
+}
+
+impl Face {
+    pub fn name(self) -> &'static str {
+        match self {
+            Face::Song => "宋体",
+            Face::NSong => "新宋体",
+        }
+    }
+}
+
 /// 文字样式。字号单位 pt（与 Word 一致），后端换算成设备像素。
 #[derive(Debug, Clone, Copy)]
 pub struct TextStyle {
@@ -37,6 +56,7 @@ pub struct TextStyle {
     pub align: Align,
     /// 在给定矩形内垂直居中（多行也能居中：先测量高度再偏移）。
     pub vcenter: bool,
+    pub face: Face,
 }
 
 impl TextStyle {
@@ -46,7 +66,14 @@ impl TextStyle {
             bold,
             align,
             vcenter,
+            face: Face::Song,
         }
+    }
+
+    /// 指定字体族（第 1 页用新宋体）。
+    pub const fn face(mut self, face: Face) -> Self {
+        self.face = face;
+        self
     }
 
     pub const fn plain(size_pt: f32) -> Self {
@@ -128,8 +155,24 @@ const S2_COLS: [f32; 10] = [
 /// 单元格内文字与边框的留白（mm）。
 const PAD: f32 = 1.6;
 
-/// 表 1 正文字号（模板实测 14.5pt）。
+/// 表 1 正文字号（模板 rPr sz=29 即 14.5pt）。
 const S1_PT: f32 = 14.5;
+
+/// 两页标题共用「标题 1」样式：新宋体 **21.5pt 加粗**（模板 styles.xml `w:styleId="1"`
+/// 的 rPr 为 `sz=43` + 新宋体，段内 run 再加 `<w:b/>`）。注意样式的 rFonts 明确指定
+/// 新宋体，因此连第 2 页标题也不跟主题走。
+const TITLE_PT: f32 = 21.5;
+const FACE_TITLE: Face = Face::NSong;
+
+/// 第 1 页正文字体族：模板各格 rPr 均写死「新宋体」。
+const FACE_S1: Face = Face::NSong;
+/// 第 2 页正文字体族：模板未单设 rFonts，继承主题字体「宋体」。
+const FACE_S2: Face = Face::Song;
+
+/// 第 2 页表头与正文基准字号（模板 docDefaults `sz=22` 即 11pt，
+/// 只有「审计价（如已审计填报）」与「合同履行情况」两格降到 10pt）。
+const S2_PT: f32 = 11.0;
+const S2_PT_DENSE: f32 = 10.0;
 
 // ---------------------------------------------------------------- 入口
 
@@ -145,24 +188,27 @@ pub fn paint(c: &mut dyn Canvas, v: &Voucher, page: usize) {
 // ---------------------------------------------------------------- 第 1 页
 
 fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
-    // 标题（模板 16pt 加粗、居中于表格中线）
+    // 模板全页正文为「新宋体 14.5pt」（R-29 按模板 rPr 实测）
+    const F: Face = FACE_S1;
+
+    // 标题（模板「标题 1」：新宋体 21.5pt 加粗、居中于表格中线）
     c.text(
         S1_LEFT,
-        23.2,
+        21.2,
         S1_RIGHT - S1_LEFT,
-        10.0,
+        14.0,
         "财务支出审核监督表",
-        TextStyle::new(16.0, true, Align::Center, true),
+        TextStyle::new(TITLE_PT, true, Align::Center, true).face(FACE_TITLE),
     );
 
-    // 部门行：「部门: 区交通运输局」左、「年 月 日」右（日期留空待手填）
+    // 部门行：「部门: 区交通运输局」16.5pt 左、「年 月 日」14.5pt 右（日期留空待手填）
     c.text(
         S1_LEFT,
         40.6,
         140.0,
         8.0,
         "部门: 区交通运输局",
-        TextStyle::new(16.0, false, Align::Left, true),
+        TextStyle::new(16.5, false, Align::Left, true).face(F),
     );
     c.text(
         163.0,
@@ -170,7 +216,7 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         90.0,
         8.0,
         "年　　　月　　　日",
-        TextStyle::new(14.5, false, Align::Right, true),
+        TextStyle::new(S1_PT, false, Align::Right, true).face(F),
     );
 
     // ---- 表格：6 行，每行分格数不同（按模板合并关系逐行定义）
@@ -206,7 +252,7 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         10.0,
         r[3] - r[2],
         "张",
-        TextStyle::new(S1_PT, false, Align::Left, true),
+        TextStyle::new(S1_PT, false, Align::Left, true).face(F),
     );
     cell(c, 135.7, r[2], S1_RIGHT - 135.7, r[3] - r[2], "附件:", Align::Left);
     c.text(
@@ -215,7 +261,7 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         10.0,
         r[3] - r[2],
         "张",
-        TextStyle::new(S1_PT, false, Align::Left, true),
+        TextStyle::new(S1_PT, false, Align::Left, true).face(F),
     );
     // 行 4：经办人签名（33.35..110.15）/ 支付用途说明（110.15..274.65）
     cell(c, S1_LEFT, r[3], 110.15 - S1_LEFT, r[4] - r[3], "经办人签名:", Align::Left);
@@ -268,13 +314,17 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
     let left = S2_COLS[0];
     let right = S2_COLS[9];
 
+    // 模板此页正文未单设 rFonts，整页继承主题字体「宋体」（R-29 按模板实测）；
+    // 唯有标题走「标题 1」样式，样式里的 rFonts 写死了新宋体。
+    const F: Face = FACE_S2;
+
     c.text(
         left,
-        23.2,
+        21.2,
         right - left,
-        10.0,
+        14.0,
         "工程项目进度款支付申请表",
-        TextStyle::new(16.0, true, Align::Center, true),
+        TextStyle::new(TITLE_PT, true, Align::Center, true).face(FACE_TITLE),
     );
     // 「年 月 日」在左、「单位：元」在右，二者同一行
     c.text(
@@ -283,7 +333,7 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         60.0,
         7.0,
         "年　　　月　　　日",
-        TextStyle::new(11.0, false, Align::Left, true),
+        TextStyle::new(S2_PT, false, Align::Left, true).face(F),
     );
     c.text(
         right - 70.0,
@@ -291,22 +341,22 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         70.0,
         7.0,
         "单位：元",
-        TextStyle::new(11.0, false, Align::Right, true),
+        TextStyle::new(S2_PT, false, Align::Right, true).face(F),
     );
 
     let r = S2_ROWS;
-    // 断行位置手工给定，避免自动折行把双字词拆开、末行只剩一个字。
-    // 长条款列另给较小基准字号，使整格保持在四行以内。
+    // 断行位置照模板给定，避免自动折行把双字词拆开、末行只剩一个字。
+    // 基准字号按模板取值，长条款列再靠自动降字号兜住，保证不溢出格线。
     let headers: [(&str, f32); 9] = [
-        ("项目名称", 9.0),
-        ("施工单位", 9.0),
-        ("合同价", 9.0),
-        ("审计价\n（如已审计填报）", 8.0),
-        ("合同履行情况\n(已完成工程量*%/\n已交工验收/\n已交工验收满*年)", 7.5),
-        ("目前已累计\n支付金额", 9.0),
-        ("本期申请\n支付金额", 9.0),
-        ("本期末累计\n支付金额", 9.0),
-        ("备注", 9.0),
+        ("项目名称", S2_PT),
+        ("施工单位", S2_PT),
+        ("合同价", S2_PT),
+        ("审计价\n（如已审计填报）", S2_PT_DENSE),
+        ("合同履行情况\n(已完成工程量*%/\n已交工验收/\n已交工验收满*年)", S2_PT_DENSE),
+        ("目前已累计\n支付金额", S2_PT),
+        ("本期申请\n支付金额", S2_PT),
+        ("本期末累计\n支付金额", S2_PT),
+        ("备注", S2_PT),
     ];
     let values = [
         v.project_name.clone(),
@@ -325,7 +375,7 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         let (x, w) = (S2_COLS[i], S2_COLS[i + 1] - S2_COLS[i]);
         fit_in(c, x, r[0], w, r[1] - r[0], headers[i].0, headers[i].1, 6.0, Align::Center);
         if !values[i].is_empty() {
-            fit_in(c, x, r[1], w, r[2] - r[1], &values[i], 10.5, 5.5, Align::Center);
+            fit_in(c, x, r[1], w, r[2] - r[1], &values[i], S2_PT, 5.5, Align::Center);
         }
     }
 
@@ -336,7 +386,7 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         (S2_COLS[4], S2_COLS[6], "项目牵头部门\n分管领导意见："),
     ];
     for (a, b, txt) in sign {
-        fit_in(c, a, r[2], b - a, r[3] - r[2], txt, 9.0, 7.0, Align::Center);
+        fit_in(c, a, r[2], b - a, r[3] - r[2], txt, S2_PT, 7.0, Align::Center);
     }
 
     // 网格线：表头/取值行保持全列，签字行按合并后的分格
@@ -361,7 +411,7 @@ fn cell(c: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, text: &str, align: A
         w - PAD * 2.0,
         h,
         text,
-        TextStyle::new(S1_PT, false, align, true),
+        TextStyle::new(S1_PT, false, align, true).face(FACE_S1),
     );
 }
 
@@ -369,7 +419,7 @@ fn cell(c: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, text: &str, align: A
 fn cell_fit(c: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, text: &str, align: Align) {
     let mut size = S1_PT;
     while size > 8.0 {
-        let st = TextStyle::new(size, false, align, true);
+        let st = TextStyle::new(size, false, align, true).face(FACE_S1);
         if c.measure_text(text, st, w - PAD * 2.0) <= h - 1.0 {
             break;
         }
@@ -381,7 +431,7 @@ fn cell_fit(c: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, text: &str, alig
         w - PAD * 2.0,
         h,
         text,
-        TextStyle::new(size, false, align, true),
+        TextStyle::new(size, false, align, true).face(FACE_S1),
     );
 }
 
@@ -399,7 +449,7 @@ fn fit_in(
 ) {
     let mut size = base_pt;
     while size > min_pt {
-        let st = TextStyle::new(size, false, align, true);
+        let st = TextStyle::new(size, false, align, true).face(FACE_S2);
         if c.measure_text(text, st, w - PAD * 2.0) <= h - 2.0 {
             break;
         }
@@ -411,7 +461,7 @@ fn fit_in(
         w - PAD * 2.0,
         h,
         text,
-        TextStyle::new(size, false, align, true),
+        TextStyle::new(size, false, align, true).face(FACE_S2),
     );
 }
 
@@ -426,6 +476,8 @@ mod tests {
     struct Rec {
         lines: usize,
         texts: Vec<String>,
+        /// （文字, 样式），用于断言字体族 / 字号 / 加粗。
+        styles: Vec<(String, TextStyle)>,
     }
 
     impl Canvas for Rec {
@@ -435,13 +487,24 @@ mod tests {
         fn rect(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) {
             self.lines += 4;
         }
-        fn draw_text(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, s: &str, _st: TextStyle) {
+        fn draw_text(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, s: &str, st: TextStyle) {
             self.texts.push(s.to_string());
+            self.styles.push((s.to_string(), st));
         }
         fn measure_text(&mut self, text: &str, _st: TextStyle, _w: f32) -> f32 {
             // 每 20 字一行，行高按字号估算（足够驱动降字号逻辑）
             let lines = (text.chars().count() as f32 / 20.0).ceil().max(1.0);
             lines * 4.0
+        }
+    }
+
+    impl Rec {
+        fn style_of(&self, text: &str) -> TextStyle {
+            self.styles
+                .iter()
+                .find(|(t, _)| t == text)
+                .unwrap_or_else(|| panic!("版面上没有这段文字：{text}"))
+                .1
         }
     }
 
@@ -508,5 +571,56 @@ mod tests {
         let mut rec = Rec::default();
         paint(&mut rec, &sample(), 2);
         assert!(rec.texts.iter().any(|t| t == "财务支出审核监督表"));
+    }
+
+    /// R-29 字体族：第 1 页整页新宋体；第 2 页正文宋体，只有标题跟「标题 1」样式走新宋体。
+    #[test]
+    fn 两页字体族与模板一致() {
+        let mut first = Rec::default();
+        paint(&mut first, &sample(), 0);
+        assert!(!first.styles.is_empty());
+        for (t, st) in &first.styles {
+            assert_eq!(st.face, Face::NSong, "第 1 页应为新宋体，但「{t}」不是");
+        }
+
+        let mut second = Rec::default();
+        paint(&mut second, &sample(), 1);
+        assert!(!second.styles.is_empty());
+        for (t, st) in &second.styles {
+            if t == "工程项目进度款支付申请表" {
+                assert_eq!(st.face, Face::NSong, "标题走「标题 1」样式，应为新宋体");
+            } else {
+                assert_eq!(st.face, Face::Song, "第 2 页正文应为宋体，但「{t}」不是");
+            }
+        }
+    }
+
+    /// R-29 字号 / 加粗：按模板 rPr 与 styles.xml 实测点取值，别在改版式时被顺手改掉。
+    #[test]
+    fn 关键元素的字号与加粗按模板取值() {
+        let mut first = Rec::default();
+        paint(&mut first, &sample(), 0);
+        // 标题 1：sz=43（21.5pt）+ 段内 <w:b/>，字体族被样式写死新宋体
+        let title = first.style_of("财务支出审核监督表");
+        assert_eq!(title.size_pt, 21.5);
+        assert!(title.bold, "两页标题模板均为加粗");
+        assert_eq!(title.face, Face::NSong);
+        // 正文 14.5pt 不加粗（模板 rPr sz=29 半磅）
+        assert_eq!(first.style_of("支付金额：").size_pt, 14.5);
+        assert!(!first.style_of("支付金额：").bold);
+        // 部门行 16.5pt（sz=33）、年月日 14.5pt（sz=29）
+        assert_eq!(first.style_of("部门: 区交通运输局").size_pt, 16.5);
+        assert_eq!(first.style_of("年　　　月　　　日").size_pt, 14.5);
+
+        let mut second = Rec::default();
+        paint(&mut second, &sample(), 1);
+        let title2 = second.style_of("工程项目进度款支付申请表");
+        assert_eq!(title2.size_pt, 21.5);
+        assert!(title2.bold);
+        assert_eq!(title2.face, Face::NSong);
+        // 正文继承 docDefaults sz=22 即 11pt
+        assert_eq!(second.style_of("单位：元").size_pt, 11.0);
+        assert_eq!(second.style_of("项目名称").size_pt, 11.0);
+        assert!(!second.style_of("项目名称").bold);
     }
 }

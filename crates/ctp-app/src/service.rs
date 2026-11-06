@@ -819,13 +819,46 @@ pub fn set_tolerance(conn: &mut Connection, bp: Rate, operator: &str) -> Result<
 
 // ---------------------------------------------------------------- 报表导出
 
+/// 汇总统计：按维度 + 日期区间取数。
+pub fn summary_of(
+    conn: &Connection,
+    dim: ctp_core::ledger::SummaryDim,
+    from: &str,
+    to: &str,
+) -> Result<crate::report::ReportResult> {
+    let rows = repo::payment_summary(conn, dim, from, to)?;
+    Ok(crate::report::ReportResult::summary(&rows, dim, from, to))
+}
+
 /// 从视图行构造报表结果（屏幕表格与导出共用这一份）。
 pub fn report_of(conn: &Connection, kind: crate::report::ReportKind) -> Result<crate::report::ReportResult> {
     use crate::report::{ReportKind, ReportResult};
-    Ok(match kind {
-        ReportKind::CategorySummary => ReportResult::category(&repo::category_summary(conn)?),
-        ReportKind::PeriodSummary => ReportResult::period(&repo::period_summary(conn)?),
-    })
+    use ctp_core::ledger::SummaryDim;
+    match kind {
+        ReportKind::CategorySummary => Ok(ReportResult::category(&repo::category_summary(conn)?)),
+        ReportKind::PeriodSummary => Ok(ReportResult::period(&repo::period_summary(conn)?)),
+        // 三个汇总维度需要日期区间：CLI 走这里时用「本年年初 ~ 今天」，
+        // 界面自己带上用户选的区间，走 `summary_of`
+        ReportKind::SummaryDaily => {
+            let (from, to) = default_summary_range();
+            summary_of(conn, SummaryDim::Day, &from, &to)
+        }
+        ReportKind::SummaryProject => {
+            let (from, to) = default_summary_range();
+            summary_of(conn, SummaryDim::Project, &from, &to)
+        }
+        ReportKind::SummaryContractor => {
+            let (from, to) = default_summary_range();
+            summary_of(conn, SummaryDim::Contractor, &from, &to)
+        }
+    }
+}
+
+/// 汇总统计的默认区间：本年 1 月 1 日 ~ 今天。
+pub fn default_summary_range() -> (String, String) {
+    let today = ctp_core::date::today_iso();
+    let year = today.get(0..4).unwrap_or("2026");
+    (format!("{year}-01-01"), today)
 }
 
 /// 导出一张报表到 .xlsx，并写一条 `EXPORT` 审计日志（FR-SYS-07）。
@@ -847,6 +880,36 @@ pub fn export_report(
     })
     .to_string();
     db::insert_audit_log(conn, "report", kind.code(), "EXPORT", Some(&detail), operator)?;
+    Ok((rows, cols))
+}
+
+/// 导出**已经算好**的报表结果。
+///
+/// 汇总统计的区间由界面决定，不能走 `report_of` 的默认区间，所以单独开这个入口；
+/// 写出的文件内容与屏幕表格同源（同一个 `ReportResult`）。
+pub fn export_result(
+    conn: &Connection,
+    result: &crate::report::ReportResult,
+    path: &std::path::Path,
+    operator: &str,
+) -> Result<(usize, usize)> {
+    let (rows, cols) = crate::xlsx::write_report(result, path, operator)?;
+    let detail = serde_json::json!({
+        "report": result.kind.code(),
+        "file": path.to_string_lossy(),
+        "rows": rows,
+        "columns": cols,
+        "subtitle": result.subtitle,
+    })
+    .to_string();
+    db::insert_audit_log(
+        conn,
+        "report",
+        result.kind.code(),
+        "EXPORT",
+        Some(&detail),
+        operator,
+    )?;
     Ok((rows, cols))
 }
 

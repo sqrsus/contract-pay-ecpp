@@ -2,7 +2,7 @@ use crate::error::{Result, StoreError};
 use crate::schema;
 use ctp_core::contract::{BidMethod, Contract, ContractStatus, ContractType, PricingMethod};
 use ctp_core::date::now_iso;
-use ctp_core::ledger::{CategoryRow, ContractSummary, LedgerRow, PeriodRow};
+use ctp_core::ledger::{CategoryRow, ContractSummary, LedgerRow, PeriodRow, SummaryDim, SummaryRow};
 use ctp_core::money::Money;
 use ctp_core::payment::{PayMethod, Payment, PaymentStatus};
 use ctp_core::project::{Contact, Contractor, Project};
@@ -721,6 +721,56 @@ pub fn period_summary(conn: &Connection) -> Result<Vec<PeriodRow>> {
         Ok(PeriodRow {
             project_id: row.get(0)?,
             period_month: row.get(1)?,
+            payment_count: row.get(2)?,
+            amount: money(row.get(3)?),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// 汇总统计：按维度 + 日期区间归集已实付单据（作废单不计）。
+///
+/// 三个维度共用同一段过滤条件（`status='PAID' AND is_deleted=0` 且日期落在
+/// `[from, to]` 闭区间），只换分组键，保证切换维度后合计不会变。
+pub fn payment_summary(
+    conn: &Connection,
+    dim: SummaryDim,
+    from: &str,
+    to: &str,
+) -> Result<Vec<SummaryRow>> {
+    use SummaryDim as D;
+    let (key_expr, label_expr, join) = match dim {
+        D::Day => ("p.pay_date", "p.pay_date".to_string(), ""),
+        D::Project => (
+            "p.project_id",
+            "COALESCE(pj.project_name, p.project_id)".to_string(),
+            "LEFT JOIN prj_project pj ON pj.id = p.project_id",
+        ),
+        D::Contractor => (
+            "c.contractor_id",
+            "COALESCE(o.contractor_name, c.contractor_id)".to_string(),
+            "JOIN ct_contract c ON c.id = p.contract_id \
+             LEFT JOIN org_contractor o ON o.id = c.contractor_id",
+        ),
+    };
+    let sql = format!(
+        "SELECT {key_expr} AS k, {label_expr} AS label, COUNT(*) AS n, \
+                COALESCE(SUM(p.amount_cent), 0) AS amt \
+         FROM pay_payment p {join} \
+         WHERE p.status = 'PAID' AND p.is_deleted = 0 \
+           AND p.pay_date >= ?1 AND p.pay_date <= ?2 \
+         GROUP BY {key_expr} \
+         ORDER BY {}",
+        match dim {
+            D::Day => "k",
+            _ => "amt DESC, label",
+        }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([from, to], |row| {
+        Ok(SummaryRow {
+            key: row.get(0)?,
+            label: row.get(1)?,
             payment_count: row.get(2)?,
             amount: money(row.get(3)?),
         })

@@ -12,13 +12,19 @@ use ctp_core::ledger::{CategoryRow, PeriodRow};
 use ctp_core::money::Money;
 use std::fmt;
 
-/// 本期已接入导出的两张报表。
+/// 已接入导出的报表。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportKind {
-    /// V3 `v_category_summary`
+    /// V3 `v_category_summary`（页面已下线，数据层保留）
     CategorySummary,
     /// V4 `v_payment_period`
     PeriodSummary,
+    /// 汇总统计 · 按日
+    SummaryDaily,
+    /// 汇总统计 · 按项目
+    SummaryProject,
+    /// 汇总统计 · 按承包单位
+    SummaryContractor,
 }
 
 impl ReportKind {
@@ -26,6 +32,9 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "CATEGORY_SUMMARY_V3",
             ReportKind::PeriodSummary => "PERIOD_SUMMARY_V4",
+            ReportKind::SummaryDaily => "SUMMARY_DAILY",
+            ReportKind::SummaryProject => "SUMMARY_PROJECT",
+            ReportKind::SummaryContractor => "SUMMARY_CONTRACTOR",
         }
     }
 
@@ -33,6 +42,9 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "会计分类汇总",
             ReportKind::PeriodSummary => "支付期间统计",
+            ReportKind::SummaryDaily => "拨款汇总 · 按日",
+            ReportKind::SummaryProject => "拨款汇总 · 按项目",
+            ReportKind::SummaryContractor => "拨款汇总 · 按承包单位",
         }
     }
 
@@ -42,6 +54,11 @@ impl ReportKind {
                 "按会计分类（ct_category）汇总，V3 口径；合同类别（工程款/材料款）不参与此处统计"
             }
             ReportKind::PeriodSummary => "按开单月份归集（V4 口径），仅统计已实付单据",
+            ReportKind::SummaryDaily => "按开单日期逐日归集，仅统计已实付单据（作废单不计）",
+            ReportKind::SummaryProject => "按所属项目归集，仅统计已实付单据（作废单不计）",
+            ReportKind::SummaryContractor => {
+                "按合同承包单位归集，仅统计已实付单据（作废单不计）"
+            }
         }
     }
 
@@ -49,6 +66,9 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "会计分类汇总",
             ReportKind::PeriodSummary => "支付期间统计",
+            ReportKind::SummaryDaily => "拨款汇总_按日",
+            ReportKind::SummaryProject => "拨款汇总_按项目",
+            ReportKind::SummaryContractor => "拨款汇总_按承包单位",
         }
     }
 
@@ -56,6 +76,9 @@ impl ReportKind {
         match self {
             ReportKind::CategorySummary => "分类汇总",
             ReportKind::PeriodSummary => "期间统计",
+            ReportKind::SummaryDaily => "按日",
+            ReportKind::SummaryProject => "按项目",
+            ReportKind::SummaryContractor => "按承包单位",
         }
     }
 }
@@ -160,7 +183,8 @@ impl Cell {
 pub struct ReportResult {
     pub kind: ReportKind,
     pub title: &'static str,
-    pub subtitle: &'static str,
+    /// 口径说明；汇总统计会把统计区间拼进去，所以是 String 不是 &'static str
+    pub subtitle: String,
     pub unit_note: &'static str,
     pub columns: Vec<ReportColumn>,
     pub rows: Vec<Vec<Cell>>,
@@ -255,6 +279,63 @@ impl ReportResult {
         self.rows.is_empty()
     }
 
+    /// 汇总统计：按维度 + 日期区间归集（R-29）。
+    ///
+    /// 列固定为「分组名 / 单据笔数 / 支付金额 / 占合计」，三个维度共用同一套列，
+    /// 只是第一列标题与数据来源不同——切换维度时合计与占比口径完全一致。
+    pub fn summary(
+        rows: &[ctp_core::ledger::SummaryRow],
+        dim: ctp_core::ledger::SummaryDim,
+        from: &str,
+        to: &str,
+    ) -> Self {
+        use ctp_core::ledger::SummaryDim;
+        let kind = match dim {
+            SummaryDim::Day => ReportKind::SummaryDaily,
+            SummaryDim::Project => ReportKind::SummaryProject,
+            SummaryDim::Contractor => ReportKind::SummaryContractor,
+        };
+        let mut columns = vec![
+            ReportColumn::new("group_label", dim.key_title(), ColumnKind::Text, 30.0, 200.0),
+            ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 110.0),
+            ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 170.0),
+            ReportColumn::new("share", "占合计", ColumnKind::Rate, 18.0, 150.0),
+        ];
+        columns[0].screen_remainder = true;
+
+        let total: i64 = rows.iter().map(|r| r.amount.cent()).sum();
+        let data: Vec<Vec<Cell>> = rows
+            .iter()
+            .map(|r| {
+                let bp = ratio_bp(r.amount.cent(), total);
+                vec![
+                    Cell::Text(r.label.clone()),
+                    Cell::Integer(r.payment_count),
+                    Cell::Money(r.amount),
+                    Cell::Rate(percent_text(bp), bp),
+                ]
+            })
+            .collect();
+        let total_bp = if total > 0 { 10_000 } else { 0 };
+        let totals = vec![
+            Cell::Text("合计".to_string()),
+            Cell::Integer(rows.iter().map(|r| r.payment_count).sum()),
+            Cell::Money(Money::from_cent(total)),
+            Cell::Rate(percent_text(total_bp), total_bp),
+        ];
+
+        ReportResult {
+            kind,
+            title: kind.title(),
+            subtitle: format!("{}（统计区间 {from} ~ {to}）", kind.subtitle()),
+            unit_note: "金额单位：元",
+            columns,
+            rows: data,
+            totals,
+            generated_at: now_iso(),
+        }
+    }
+
     /// 导出保存框的默认文件名：`{报表名}_{yyyyMMdd_HHmm}.xlsx`（UTC 时间戳）。
     pub fn default_file_name(&self) -> String {
         let s = &self.generated_at;
@@ -280,7 +361,7 @@ fn report(
     ReportResult {
         kind,
         title: kind.title(),
-        subtitle: kind.subtitle(),
+        subtitle: kind.subtitle().to_string(),
         unit_note: "金额单位：元",
         columns,
         rows,

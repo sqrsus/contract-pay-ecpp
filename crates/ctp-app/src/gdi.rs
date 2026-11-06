@@ -10,7 +10,7 @@
 //!
 //! 已确认的异常口径：**一律报错中止**，不降级、不输出半成品（含纸型不是横向时的拦截）。
 
-use crate::paper::{self, Align, Canvas, TextStyle, Voucher, PAGE_H_MM, PAGE_W_MM};
+use crate::paper::{self, Align, Canvas, Face, TextStyle, Voucher, PAGE_H_MM, PAGE_W_MM};
 use crate::print::{Preview, PrintError};
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::RECT;
@@ -20,9 +20,6 @@ use windows_sys::Win32::UI::Controls::Dialogs as dlg;
 
 /// 细线宽度（pt），与模板 0.5pt 边框一致。
 const LINE_PT: f32 = 0.5;
-
-/// 中文字体：宋体是 Windows 自带，无需随程序分发。
-const FONT_FACE: &str = "宋体";
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -39,7 +36,8 @@ struct GdiCanvas {
     pt_px: f32,
     ox: f32,
     oy: f32,
-    fonts: Vec<((i32, bool), gdi::HFONT)>,
+    /// 字体对象缓存，键为（像素高、是否加粗、字体族）——两页字体族不同，必须分开缓存。
+    fonts: Vec<((i32, bool, Face), gdi::HFONT)>,
 }
 
 impl GdiCanvas {
@@ -64,13 +62,17 @@ impl GdiCanvas {
     }
 
     /// 取（并按需创建）一个字体对象。
-    fn font(&mut self, size_pt: f32, bold: bool) -> gdi::HFONT {
+    ///
+    /// 「宋体」「新宋体」都是 Windows 自带字体，无需随程序分发；字体族由版面
+    /// 层按页指定（R-29 按模板实测：第 1 页新宋体、第 2 页宋体）。
+    fn font(&mut self, size_pt: f32, bold: bool, face: Face) -> gdi::HFONT {
         // 负高度 = 字符高度（em box 高度），pt → px 换算就是 字号 × dpi / 72
         let height = -((size_pt * self.pt_px).round() as i32).max(8);
-        if let Some((_, f)) = self.fonts.iter().find(|((h, b), _)| *h == height && *b == bold) {
+        let key = (height, bold, face);
+        if let Some((_, f)) = self.fonts.iter().find(|(k, _)| *k == key) {
             return *f;
         }
-        let face = wide(FONT_FACE);
+        let name = wide(face.name());
         let weight = if bold { 700 } else { 400 };
         let font = unsafe {
             gdi::CreateFontW(
@@ -87,10 +89,10 @@ impl GdiCanvas {
                 0,
                 0,
                 0,
-                face.as_ptr(),
+                name.as_ptr(),
             )
         };
-        self.fonts.push(((height, bold), font));
+        self.fonts.push((key, font));
         font
     }
 
@@ -140,7 +142,7 @@ impl Canvas for GdiCanvas {
         if text.is_empty() {
             return;
         }
-        let font = self.font(style.size_pt, style.bold);
+        let font = self.font(style.size_pt, style.bold, style.face);
         let mut unit: Vec<u16> = text.encode_utf16().collect();
         let mut rc = RECT {
             left: self.x(x),
@@ -167,7 +169,7 @@ impl Canvas for GdiCanvas {
         if text.is_empty() {
             return 0.0;
         }
-        let font = self.font(style.size_pt, style.bold);
+        let font = self.font(style.size_pt, style.bold, style.face);
         let mut unit: Vec<u16> = text.encode_utf16().collect();
         let mut rc = RECT {
             left: 0,

@@ -155,6 +155,57 @@ pub struct PeriodRow {
     pub amount: Money,
 }
 
+/// 汇总统计的分组维度（R-29）。
+///
+/// 三个维度都只统计**已实付且未作废**的拨款单，口径与已付净额一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryDim {
+    /// 按开单日期逐日归集（时间区间由调用方给）
+    Day,
+    /// 按所属项目归集
+    Project,
+    /// 按承包单位归集
+    Contractor,
+}
+
+impl SummaryDim {
+    pub fn label(self) -> &'static str {
+        match self {
+            SummaryDim::Day => "按日",
+            SummaryDim::Project => "按项目",
+            SummaryDim::Contractor => "按承包单位",
+        }
+    }
+
+    /// 分组列的标题（表格第一列表头）。
+    pub fn key_title(self) -> &'static str {
+        match self {
+            SummaryDim::Day => "开单日期",
+            SummaryDim::Project => "所属项目",
+            SummaryDim::Contractor => "承包单位",
+        }
+    }
+
+    pub fn all() -> [SummaryDim; 3] {
+        [
+            SummaryDim::Day,
+            SummaryDim::Project,
+            SummaryDim::Contractor,
+        ]
+    }
+}
+
+/// 汇总统计的一行：一个分组键的笔数与金额。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryRow {
+    /// 分组键（日期 / 项目 id / 承包单位 id）
+    pub key: String,
+    /// 显示名（日期本身 / 项目名称 / 承包单位名称）
+    pub label: String,
+    pub payment_count: i64,
+    pub amount: Money,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
