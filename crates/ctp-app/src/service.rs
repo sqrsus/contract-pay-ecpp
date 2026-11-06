@@ -267,13 +267,17 @@ fn resolve_contractor(
     ensure_contractor(conn, text, role_for_type(ctype), operator)
 }
 
-/// 发包人：并入单位库，角色固定为业主。
+/// 发包人：并入单位库，角色固定为业主；合同 `party_a` 存名称，不存档案 id。
+///
+/// `ct_contract.party_a` 是名称列（无外键），详情弹窗直接渲染该值；自动建档
+/// 只作为单位档案与联想候选的副作用，返回值必须是用户填写的名称。
 fn resolve_owner(conn: &Connection, name: &str, operator: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
         return Err(DomainError::MissingField("发包人（甲方）").into());
     }
-    ensure_contractor(conn, name, ContractorRole::Owner, operator)
+    ensure_contractor(conn, name, ContractorRole::Owner, operator)?;
+    Ok(name.to_string())
 }
 
 // ---------------------------------------------------------------- 合同

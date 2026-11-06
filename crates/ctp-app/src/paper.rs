@@ -197,7 +197,7 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         21.2,
         S1_RIGHT - S1_LEFT,
         14.0,
-        "财务支出审核监督表",
+        "宿城区交通运输局财务支出审核监督表",
         TextStyle::new(TITLE_PT, true, Align::Center, true).face(FACE_TITLE),
     );
 
@@ -275,7 +275,10 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         Align::Left,
     );
     // 行 5：三个审核栏（各带一个手签空格）
-    let x5 = [33.35, 63.5, 110.15, 135.7, 187.45, 216.15, 274.65];
+    // 「办公室负责人审核：」9 字在 14.5pt 下需 ≥5 字/行才稳定 2 行；把与前面手签空框
+    // 的分界线由模板的 187.45 左移 3mm 到 184.45，让出宽度给该标签格（31.70mm），
+    // 三格仍统一用 14.5pt，表格外框与其余各行坐标不变。
+    let x5 = [33.35, 63.5, 110.15, 135.7, 184.45, 216.15, 274.65];
     for i in 0..3 {
         // 标签只占左半，右半留空供手签
         let (lbl, a, label_w) = match i {
@@ -323,7 +326,7 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         21.2,
         right - left,
         14.0,
-        "工程项目进度款支付申请表",
+        "宿城区交通运输局工程项目进度款支付申请表",
         TextStyle::new(TITLE_PT, true, Align::Center, true).face(FACE_TITLE),
     );
     // 「年 月 日」在左、「单位：元」在右，二者同一行
@@ -527,7 +530,7 @@ mod tests {
     fn 两页各自的标题与关键字段都上纸() {
         let mut first = Rec::default();
         paint(&mut first, &sample(), 0);
-        assert!(first.texts.iter().any(|t| t == "财务支出审核监督表"));
+        assert!(first.texts.iter().any(|t| t == "宿城区交通运输局财务支出审核监督表"));
         assert!(first.texts.iter().any(|t| t.contains("大写:陆佰圆整")));
         assert!(first.texts.iter().any(|t| t.contains("小写:600.00")));
         assert!(first
@@ -537,7 +540,7 @@ mod tests {
 
         let mut second = Rec::default();
         paint(&mut second, &sample(), 1);
-        assert!(second.texts.iter().any(|t| t == "工程项目进度款支付申请表"));
+        assert!(second.texts.iter().any(|t| t == "宿城区交通运输局工程项目进度款支付申请表"));
         assert!(second.texts.iter().any(|t| t == "XX 公路改建工程"));
         assert!(second.texts.iter().any(|t| t == "1000.00"));
         assert!(second.texts.iter().any(|t| t == "600.00"));
@@ -570,7 +573,7 @@ mod tests {
     fn 页码范围之外按两页循环() {
         let mut rec = Rec::default();
         paint(&mut rec, &sample(), 2);
-        assert!(rec.texts.iter().any(|t| t == "财务支出审核监督表"));
+        assert!(rec.texts.iter().any(|t| t == "宿城区交通运输局财务支出审核监督表"));
     }
 
     /// R-29 字体族：第 1 页整页新宋体；第 2 页正文宋体，只有标题跟「标题 1」样式走新宋体。
@@ -587,7 +590,7 @@ mod tests {
         paint(&mut second, &sample(), 1);
         assert!(!second.styles.is_empty());
         for (t, st) in &second.styles {
-            if t == "工程项目进度款支付申请表" {
+            if t == "宿城区交通运输局工程项目进度款支付申请表" {
                 assert_eq!(st.face, Face::NSong, "标题走「标题 1」样式，应为新宋体");
             } else {
                 assert_eq!(st.face, Face::Song, "第 2 页正文应为宋体，但「{t}」不是");
@@ -601,7 +604,7 @@ mod tests {
         let mut first = Rec::default();
         paint(&mut first, &sample(), 0);
         // 标题 1：sz=43（21.5pt）+ 段内 <w:b/>，字体族被样式写死新宋体
-        let title = first.style_of("财务支出审核监督表");
+        let title = first.style_of("宿城区交通运输局财务支出审核监督表");
         assert_eq!(title.size_pt, 21.5);
         assert!(title.bold, "两页标题模板均为加粗");
         assert_eq!(title.face, Face::NSong);
@@ -614,7 +617,7 @@ mod tests {
 
         let mut second = Rec::default();
         paint(&mut second, &sample(), 1);
-        let title2 = second.style_of("工程项目进度款支付申请表");
+        let title2 = second.style_of("宿城区交通运输局工程项目进度款支付申请表");
         assert_eq!(title2.size_pt, 21.5);
         assert!(title2.bold);
         assert_eq!(title2.face, Face::NSong);
