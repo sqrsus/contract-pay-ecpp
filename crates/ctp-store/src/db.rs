@@ -297,3 +297,107 @@ pub fn insert_audit_log(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let sql = format!("PRAGMA table_info({table})");
+        conn.prepare(&sql)
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|c| c == column)
+    }
+
+    /// R-39 代表性旧库 fixture：先按当前结构建库并放入业务数据，
+    /// 再退回「补列之前」的形态（缺 `target_label` 与 6 个合同扩展列、视图全缺），
+    /// 然后验证 migrate 补齐结构、保留数据，且重复运行完全幂等。
+    #[test]
+    fn 旧库迁移补齐结构且保留数据_重复运行幂等() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        // 代表性存量数据：一条 sys_meta + 一条操作日志
+        set_meta(&conn, "legacy_marker", "keep-me", "t").unwrap();
+        insert_audit_log(
+            &conn,
+            "ct_contract",
+            "HT-OLD-1",
+            Some("旧合同"),
+            "CREATE",
+            Some("迁移前写入"),
+            "t",
+        )
+        .unwrap();
+        let logs_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sys_audit_log", [], |r| r.get(0))
+            .unwrap();
+
+        // 退回旧形态：先摘视图（视图引用待删列），再删列
+        for (name, _) in schema::view_statements() {
+            conn.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))
+                .unwrap();
+        }
+        conn.execute_batch("ALTER TABLE sys_audit_log DROP COLUMN target_label")
+            .unwrap();
+        for col in [
+            "bid_method",
+            "open_bid_date",
+            "project_leader",
+            "contact_info",
+            "bid_agent_id",
+            "delivery_date",
+        ] {
+            conn.execute_batch(&format!("ALTER TABLE ct_contract DROP COLUMN {col}"))
+                .unwrap();
+        }
+        assert!(!has_column(&conn, "sys_audit_log", "target_label"));
+        assert!(!has_column(&conn, "ct_contract", "delivery_date"));
+
+        // 连续迁移两次：第一次补齐，第二次必须什么都不错、不重复插数据
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+
+        assert!(has_column(&conn, "sys_audit_log", "target_label"));
+        for col in [
+            "bid_method",
+            "open_bid_date",
+            "project_leader",
+            "contact_info",
+            "bid_agent_id",
+            "delivery_date",
+        ] {
+            assert!(has_column(&conn, "ct_contract", col), "{col} 应被补齐");
+        }
+        assert_eq!(
+            get_meta(&conn, "legacy_marker").unwrap().as_deref(),
+            Some("keep-me"),
+            "存量 sys_meta 不能被覆盖"
+        );
+        assert_eq!(
+            schema_version(&conn).unwrap().as_deref(),
+            Some(schema::SCHEMA_VERSION)
+        );
+        let logs_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sys_audit_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logs_after, logs_before, "存量日志不能丢也不能多");
+        let old_label: Option<String> = conn
+            .query_row(
+                "SELECT target_label FROM sys_audit_log WHERE target_id = 'HT-OLD-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(old_label.is_none(), "旧日志新增列应为 NULL，由界面回退显示");
+
+        // 全部视图可查询（旧库重建视图是最容易出错的一步）
+        for (name, _) in schema::view_statements() {
+            conn.execute_batch(&format!("SELECT * FROM {name} LIMIT 1"))
+                .unwrap_or_else(|e| panic!("视图 {name} 不可用：{e}"));
+        }
+    }
+}

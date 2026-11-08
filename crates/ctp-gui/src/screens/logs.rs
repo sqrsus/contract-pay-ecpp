@@ -34,20 +34,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     );
     if app.log_key.as_ref() != Some(&key) {
         let f = view_filter(app);
-        let (rows, count, total, actions) = app
-            .read(|c| {
+        // R-39：4 个查询的错误不再被 unwrap_or_default 吞掉；
+        // 失败时不保留旧数据当「正常结果」，给出可见警告并等顶栏「重试读取」。
+        let result: Result<(Vec<ctp_store::audit::AuditLogRow>, i64, i64, Vec<String>), String> =
+            app.read(|c| {
                 Ok((
-                    logs::list(c, &f, PAGE_LIMIT).unwrap_or_default(),
-                    logs::count(c, &f).unwrap_or(0),
-                    logs::total(c).unwrap_or(0),
-                    logs::actions(c).unwrap_or_default(),
+                    logs::list(c, &f, PAGE_LIMIT)?,
+                    logs::count(c, &f)?,
+                    logs::total(c)?,
+                    logs::actions(c)?,
                 ))
-            })
-            .unwrap_or_default();
-        app.log_rows = rows;
-        app.log_count = count;
-        app.log_total = total;
-        app.log_actions = actions;
+            });
+        match result {
+            Ok((rows, count, total, actions)) => {
+                app.log_rows = rows;
+                app.log_count = count;
+                app.log_total = total;
+                app.log_actions = actions;
+            }
+            Err(e) => app.warn_data("查询操作日志", e),
+        }
+        // 失败也记下这个 key，避免每帧重查把提示条刷屏；重试时由 retry_data 清空
         app.log_key = Some(key);
     }
 
@@ -143,7 +150,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 .column(Column::remainder().at_least(220.0)) // 内容
                 .column(Column::auto().at_least(70.0)) // 操作人
                 .header(26.0, |mut h| {
-                    for t in ["时间", "操作类型", "对象类型", "操作对象", "操作内容", "操作人"] {
+                    for t in [
+                        "时间",
+                        "操作类型",
+                        "对象类型",
+                        "操作对象",
+                        "操作内容",
+                        "操作人",
+                    ] {
                         h.col(|ui| widgets::th(ui, &p, t, false));
                     }
                 })
@@ -177,10 +191,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     .clone()
                                     .unwrap_or_else(|| r.target_id.clone());
                                 ui.add(
-                                    egui::Label::new(
-                                        RichText::new(name).size(12.0).color(p.text),
-                                    )
-                                    .truncate(),
+                                    egui::Label::new(RichText::new(name).size(12.0).color(p.text))
+                                        .truncate(),
                                 );
                             });
                             row.col(|ui| {
@@ -215,9 +227,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if let Some((filter, desc)) = app.log_clear.clone() {
         let mut cancel = false;
         let mut submit = false;
-        let n = app
-            .read(|c| logs::count(c, &filter))
-            .unwrap_or(0);
+        let n = app.read(|c| logs::count(c, &filter)).unwrap_or(0);
         egui::Window::new("确认清理日志")
             .collapsible(false)
             .resizable(false)
@@ -231,7 +241,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             )
             .show(ui.ctx(), |ui| {
                 ui.set_width(430.0);
-                ui.label(RichText::new(desc.clone()).size(14.0).strong().color(p.text));
+                ui.label(
+                    RichText::new(desc.clone())
+                        .size(14.0)
+                        .strong()
+                        .color(p.text),
+                );
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!("将删除 {n} 条日志，删除后不可恢复。"))

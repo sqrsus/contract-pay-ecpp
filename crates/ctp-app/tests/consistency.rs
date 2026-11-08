@@ -99,13 +99,13 @@ fn fixture_with(
         "t",
     )
     .unwrap();
-    attach_contract(&conn, &c.id);
+    attach_contract(&mut conn, &c.id);
     service::activate_contract(&mut conn, &c.id, "t").unwrap();
     (conn, c.id)
 }
 
 /// 补一份「合同正本」附件：生效校验要求它必须在位。
-fn attach_contract(conn: &Connection, contract_id: &str) {
+fn attach_contract(conn: &mut Connection, contract_id: &str) {
     service::save_attachment(
         conn,
         contract_id,
@@ -118,8 +118,16 @@ fn attach_contract(conn: &Connection, contract_id: &str) {
     .unwrap();
 }
 
-fn pay(conn: &mut Connection, contract_id: &str, yuan: i64) -> ctp_store::Result<ctp_core::payment::Payment> {
-    service::register_payment(conn, NewPayment::new(contract_id, Money::from_cent(yuan * 100), "2026-03-31"), "t")
+fn pay(
+    conn: &mut Connection,
+    contract_id: &str,
+    yuan: i64,
+) -> ctp_store::Result<ctp_core::payment::Payment> {
+    service::register_payment(
+        conn,
+        NewPayment::new(contract_id, Money::from_cent(yuan * 100), "2026-03-31"),
+        "t",
+    )
 }
 
 #[test]
@@ -128,7 +136,10 @@ fn 比率口径_视图与应用层差异为零() {
     db::migrate(&mut conn).unwrap();
     ctp_app::demo::seed_demo(&mut conn, "t").unwrap();
 
-    assert!(service::reconcile(&conn).unwrap().is_empty(), "H1：视图与 Rate::ratio 必须逐位一致");
+    assert!(
+        service::reconcile(&conn).unwrap().is_empty(),
+        "H1：视图与 Rate::ratio 必须逐位一致"
+    );
 
     // 逐条复核：视图比率 = 已付 / 有效基准
     for s in repo::summaries(&conn).unwrap() {
@@ -256,7 +267,10 @@ fn 施工合同付清需审定且交工满两年() {
     )
     .unwrap();
     let err = pay(&mut conn, &cid, 200).unwrap_err();
-    assert!(err.is_payment_blocked(), "交工未满 2 年不得付清，实得 {err}");
+    assert!(
+        err.is_payment_blocked(),
+        "交工未满 2 年不得付清，实得 {err}"
+    );
 
     // 交工日期提前到 2023-01-01（+2 年 = 2025-01-01 < 开单日）→ 可付清
     service::set_delivery_date(&mut conn, &cid, "2023-01-01", "t").unwrap();
@@ -348,7 +362,10 @@ fn 金额编辑留痕_已审定不改基准() {
     // 必填原因
     let err = service::edit_contract_amount(&mut conn, &cid, Money::from_cent(110_000), "  ", "t")
         .unwrap_err();
-    assert!(matches!(err.domain(), Some(DomainError::MissingField("金额编辑原因"))));
+    assert!(matches!(
+        err.domain(),
+        Some(DomainError::MissingField("金额编辑原因"))
+    ));
 
     let c = service::edit_contract_amount(
         &mut conn,
@@ -424,7 +441,7 @@ fn 新建合同先草稿再生效后才能拨款() {
     ));
 
     // 3) 补齐合同附件后可生效
-    attach_contract(&conn, &c.id);
+    attach_contract(&mut conn, &c.id);
     let a = service::activate_contract(&mut conn, &c.id, "t").unwrap();
     assert_eq!(a.status, ContractStatus::Active);
     assert!(a.is_payable());
@@ -457,7 +474,11 @@ fn 会计分类与合同类别分离() {
     // 合同类别不得出现在会计分类表里
     let names: Vec<&str> = rows.iter().map(|r| r.category_name.as_str()).collect();
     for biz in ctp_core::dict::CONTRACT_CATEGORIES {
-        assert!(!names.contains(&biz.1), "合同类别 {} 混入了会计分类汇总", biz.1);
+        assert!(
+            !names.contains(&biz.1),
+            "合同类别 {} 混入了会计分类汇总",
+            biz.1
+        );
     }
     // 分类合计 = 各合同有效基准之和
     let total_cat: i64 = rows.iter().map(|r| r.base_amount.cent()).sum();
@@ -535,11 +556,23 @@ fn 付款打印九域解析与中文大写() {
 
     let data = service::payment_print_data(&conn, &pm.id).unwrap();
     assert_eq!(data.fields.len(), 9);
-    assert_eq!(data.get("项目名称"), Some("测试合同"), "取合同名称，非项目名称");
-    assert_eq!(data.get("中标单位"), Some("某施工单位"), "取承包单位，非发包人");
+    assert_eq!(
+        data.get("项目名称"),
+        Some("测试合同"),
+        "取合同名称，非项目名称"
+    );
+    assert_eq!(
+        data.get("中标单位"),
+        Some("某施工单位"),
+        "取承包单位，非发包人"
+    );
     assert_eq!(data.get("合同改成元"), Some("1000000.00"));
     assert_eq!(data.get("审计价改成元"), Some("0.00"), "未审定填 0");
-    assert_eq!(data.get("已付款改成元"), Some("100000.00"), "本次之前的累计已付");
+    assert_eq!(
+        data.get("已付款改成元"),
+        Some("100000.00"),
+        "本次之前的累计已付"
+    );
     assert_eq!(data.get("本次付款小写"), Some("250000.00"));
     assert_eq!(data.get("本次付款数大写"), Some("贰拾伍万圆整"));
     assert_eq!(data.get("本次付款后累计"), Some("350000.00"));
@@ -565,7 +598,7 @@ fn 打印走版面数据且不依赖外部软件() {
     assert_eq!(data.get("本次付款小写"), Some("250.00"));
 
     // 打印入口直接吐版面数据，一张两页
-    let vs = service::print_vouchers(&conn, &[pm.id.clone()]).unwrap();
+    let vs = service::print_vouchers(&conn, std::slice::from_ref(&pm.id)).unwrap();
     assert_eq!(vs.len(), 1);
     assert_eq!(vs[0].this_amount, "250.00");
     assert_eq!(page_count(vs.len()), 2);
@@ -575,10 +608,9 @@ fn 打印走版面数据且不依赖外部软件() {
 #[test]
 fn 合同编号按年度递增且唯一() {
     let (mut conn, _cid) = fixture(1000);
-    assert_eq!(
-        repo::find_contract_by_no(&conn, "HT-2026-001").unwrap().is_some(),
-        true
-    );
+    assert!(repo::find_contract_by_no(&conn, "HT-2026-001")
+        .unwrap()
+        .is_some());
     let c2 = service::create_contract(
         &mut conn,
         NewContract {
@@ -622,7 +654,10 @@ fn 合同必填项与字典校验生效() {
         "t",
     )
     .unwrap_err();
-    assert!(matches!(err.domain(), Some(DomainError::MissingField("付款条款"))));
+    assert!(matches!(
+        err.domain(),
+        Some(DomainError::MissingField("付款条款"))
+    ));
 
     // 合同类别填成会计分类（H4 的典型误用）
     let err = service::create_contract(
@@ -666,7 +701,7 @@ fn 名称输入自动建档_同名复用不重复() {
     };
 
     let c = service::create_contract(&mut conn, mk("自动建档一", "2026-03-01"), "t").unwrap();
-    assert_eq!(c.project_id.len() > 0, true);
+    assert!(!c.project_id.is_empty());
 
     let projects = repo::list_projects(&conn).unwrap();
     assert_eq!(projects.len(), 1);
@@ -719,7 +754,7 @@ fn 附件每类一份_替换即覆盖且可删除() {
     assert!(service::activate_contract(&mut conn, &c.id, "t").is_err());
 
     service::save_attachment(
-        &conn,
+        &mut conn,
         &c.id,
         AttachmentKind::Contract,
         "合同正本.pdf",
@@ -729,7 +764,7 @@ fn 附件每类一份_替换即覆盖且可删除() {
     )
     .unwrap();
     service::save_attachment(
-        &conn,
+        &mut conn,
         &c.id,
         AttachmentKind::BidNotice,
         "中标通知书.pdf",
@@ -742,7 +777,7 @@ fn 附件每类一份_替换即覆盖且可删除() {
 
     // 同类再传：覆盖而不是新增
     service::save_attachment(
-        &conn,
+        &mut conn,
         &c.id,
         AttachmentKind::Contract,
         "合同正本-v2.pdf",
@@ -756,13 +791,16 @@ fn 附件每类一份_替换即覆盖且可删除() {
     let con = list.iter().find(|a| a.kind_code == "CONTRACT").unwrap();
     assert_eq!(con.file_name, "合同正本-v2.pdf");
     assert_eq!(con.size_bytes, 12);
-    assert_eq!(service::attachment_bytes(&conn, &con.id).unwrap(), b"PDF-2-longer");
+    assert_eq!(
+        service::attachment_bytes(&conn, &con.id).unwrap(),
+        b"PDF-2-longer"
+    );
 
     // 合同正本在位后可生效
     service::activate_contract(&mut conn, &c.id, "t").unwrap();
 
     // 删除后计数下降
-    service::delete_attachment(&conn, &con.id, "t").unwrap();
+    service::delete_attachment(&mut conn, &con.id, "t").unwrap();
     assert_eq!(service::list_attachments(&conn, &c.id).unwrap().len(), 1);
 }
 
@@ -790,7 +828,7 @@ fn 附件空文件与超限被拒() {
     .unwrap();
 
     let empty = service::save_attachment(
-        &conn,
+        &mut conn,
         &c.id,
         AttachmentKind::Contract,
         "空.pdf",
@@ -803,7 +841,7 @@ fn 附件空文件与超限被拒() {
 
     let over = vec![0u8; (ctp_core::attachment::MAX_ATTACHMENT_BYTES + 1) as usize];
     let err = service::save_attachment(
-        &conn,
+        &mut conn,
         &c.id,
         AttachmentKind::Contract,
         "超大.pdf",
@@ -844,7 +882,7 @@ fn 汇总统计_四维度合计一致_筛选生效() {
         "t",
     )
     .unwrap();
-    attach_contract(&conn, &c2.id);
+    attach_contract(&mut conn, &c2.id);
     service::activate_contract(&mut conn, &c2.id, "t").unwrap();
     pay(&mut conn, &c2.id, 200_000).unwrap();
 
@@ -860,8 +898,7 @@ fn 汇总统计_四维度合计一致_筛选生效() {
     // 按合同维度带承包单位列；报表层为 5 列
     let rows = repo::payment_summary(&conn, SummaryDim::Contract, &all).unwrap();
     assert!(
-        rows.iter()
-            .all(|r| r.sub.as_deref() == Some("某施工单位")),
+        rows.iter().all(|r| r.sub.as_deref() == Some("某施工单位")),
         "按合同维度应带出承包单位"
     );
     let r5 = service::summary_of(&conn, SummaryDim::Contract, &all).unwrap();
@@ -945,4 +982,3 @@ fn 汇总统计_四维度合计一致_筛选生效() {
         600_000 * 100
     );
 }
-

@@ -46,6 +46,13 @@ pub const HEADERS: [&str; 9] = [
 /// 数据起始行（0-based）：第 1 行标题、第 2 行说明、第 3 行表头。
 const FIRST_DATA_ROW: usize = 3;
 
+/// 导入文件大小上限（10 MB）：xlsx 是压缩包，解压后可能放大几十倍，
+/// 不设上限会让一次误选大文件把 UI 帧长时间卡死（R-39）。
+pub const MAX_IMPORT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 导入行数上限（5000 行）：逐行提交是同步的，行数必须有上界。
+pub const MAX_IMPORT_ROWS: usize = 5_000;
+
 /// 列宽（字符）。
 const COL_WIDTHS: [f64; 9] = [34.0, 22.0, 15.0, 15.0, 15.0, 15.0, 13.0, 26.0, 11.0];
 
@@ -140,7 +147,8 @@ pub fn write_template(
         for (ci, h) in HEADERS.iter().enumerate() {
             ws.write_string_with_format(2, ci as u16, *h, &header_fmt)
                 .map_err(xerr)?;
-            ws.set_column_width(ci as u16, COL_WIDTHS[ci]).map_err(xerr)?;
+            ws.set_column_width(ci as u16, COL_WIDTHS[ci])
+                .map_err(xerr)?;
         }
         ws.set_row_height(1, 32.0).map_err(xerr)?;
 
@@ -175,8 +183,12 @@ pub fn write_template(
         let ws = workbook.add_worksheet();
         ws.set_name(CHECK_SHEET).map_err(xerr)?;
         ws.write_string(0, 0, CHECK_MARK).map_err(xerr)?;
-        ws.write_string(0, 1, "本表由系统生成，请勿删除或修改；导入时用于校验模板来源。")
-            .map_err(xerr)?;
+        ws.write_string(
+            0,
+            1,
+            "本表由系统生成，请勿删除或修改；导入时用于校验模板来源。",
+        )
+        .map_err(xerr)?;
         ws.set_hidden(true);
     }
 
@@ -246,24 +258,33 @@ fn cell_amount_skipped(row: &[calamine::Data], col: usize) -> bool {
 
 /// 金额列：既接受数值格，也接受文本（用户可能粘成文本）。
 fn cell_money(row: &[calamine::Data], col: usize) -> std::result::Result<Money, String> {
+    // 数值格与文本格共用同一个单笔上限，不让「改成数值格式」绕过 parse_yuan 的拦截
+    let check = |cent: i64| -> std::result::Result<Money, String> {
+        if cent <= 0 {
+            return Err("本次金额必须大于 0".into());
+        }
+        if cent > Money::MAX_SINGLE_CENT {
+            return Err(format!(
+                "本次金额超过单笔上限 {} 元",
+                Money::from_cent(Money::MAX_SINGLE_CENT).format_yuan()
+            ));
+        }
+        Ok(Money::from_cent(cent))
+    };
     match row.get(col) {
         Some(calamine::Data::Float(f)) => {
-            let cent = (*f * 100.0).round() as i64;
-            if cent <= 0 {
-                Err("本次金额必须大于 0".into())
-            } else {
-                Ok(Money::from_cent(cent))
+            if !f.is_finite() || *f < 0.0 {
+                return Err("本次金额不是有效数字".into());
             }
+            let y = (*f * 100.0).round();
+            // 浮点转 i64 在 Rust 里会饱和到 i64::MAX，交给 check 统一判超限
+            check(y as i64)
         }
         Some(calamine::Data::Int(v)) => {
             let cent = v
                 .checked_mul(100)
                 .ok_or_else(|| "本次金额过大".to_string())?;
-            if cent <= 0 {
-                Err("本次金额必须大于 0".into())
-            } else {
-                Ok(Money::from_cent(cent))
-            }
+            check(cent)
         }
         Some(calamine::Data::String(s)) => Money::parse_yuan(s).map_err(|e| e.to_string()),
         _ => Err("本次金额为空".into()),
@@ -285,21 +306,27 @@ fn cell_pay_method(row: &[calamine::Data], col: usize) -> std::result::Result<Pa
             return Ok(m);
         }
     }
-    Err(format!(
-        "支付方式「{t}」无法识别，可填 转账/承兑/现金/其他"
-    ))
+    Err(format!("支付方式「{t}」无法识别，可填 转账/承兑/现金/其他"))
 }
 
 /// 读取并导入。整张表先过校验标记，再逐行写入。
 ///
 /// 返回 `Err` 表示整份文件不可用（读不出、缺校验表、标记不符）；
 /// 行级问题放在 `ImportReport::failures` 里，不影响其他行。
-pub fn import(
-    conn: &mut Connection,
-    path: &Path,
-    operator: &str,
-) -> Result<ImportReport> {
+pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<ImportReport> {
     use calamine::Reader;
+
+    // R-39：先把文件大小与行数挡在解压之前/之初，避免超大表把 UI 帧卡死
+    let bytes = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| xerr(format!("读取文件信息失败：{e}")))?;
+    if bytes > MAX_IMPORT_FILE_BYTES {
+        return Err(xerr(format!(
+            "文件 {:.1} MB，超过 {} MB 上限；请拆成多个模板分批导入",
+            bytes as f64 / (1024.0 * 1024.0),
+            MAX_IMPORT_FILE_BYTES / 1024 / 1024
+        )));
+    }
 
     let mut wb: calamine::Xlsx<_> = calamine::open_workbook(path).map_err(|e| {
         xerr(format!(
@@ -316,10 +343,7 @@ pub fn import(
     let check = wb
         .worksheet_range(CHECK_SHEET)
         .map_err(|e| xerr(format!("读取校验表失败：{e}")))?;
-    let mark = check
-        .get_value((0, 0))
-        .map(cell_text)
-        .unwrap_or_default();
+    let mark = check.get_value((0, 0)).map(cell_text).unwrap_or_default();
     if mark != CHECK_MARK {
         return Err(xerr(format!(
             "校验标记不一致（读到「{mark}」，应为「{CHECK_MARK}」），模板可能被改动，已拒绝导入"
@@ -333,6 +357,13 @@ pub fn import(
     let range = wb
         .worksheet_range(TEMPLATE_SHEET)
         .map_err(|e| xerr(format!("读取「{TEMPLATE_SHEET}」失败：{e}")))?;
+    if range.height() > MAX_IMPORT_ROWS {
+        return Err(xerr(format!(
+            "共 {} 行，超过 {} 行上限；请拆成多个模板分批导入",
+            range.height(),
+            MAX_IMPORT_ROWS
+        )));
+    }
 
     // 3) 合同名称 → 合同 id（同名多份时无法确定，报错而不是猜）
     let summaries = repo::summaries(conn)?;
@@ -355,8 +386,8 @@ pub fn import(
             continue;
         }
         let line = abs + 1; // Excel 可见行号（从 1 起）
-        // 未填或填 0「本次金额」= 本行不导入、不算失败。模板会把全部合同预填一遍，
-        // 用户只填其中几行是正常用法。
+                            // 未填或填 0「本次金额」= 本行不导入、不算失败。模板会把全部合同预填一遍，
+                            // 用户只填其中几行是正常用法。
         if cell_amount_skipped(row, 5) {
             report.skipped += 1;
             continue;
@@ -547,10 +578,7 @@ mod tests {
         let p = repo::list_payments(&conn, None)
             .unwrap()
             .into_iter()
-            .find(|p| {
-                p.amount_cent.cent() == 10_000
-                    && p.reason.as_deref() == Some("拨付进度款")
-            })
+            .find(|p| p.amount_cent.cent() == 10_000 && p.reason.as_deref() == Some("拨付进度款"))
             .expect("应写入带默认事由的单据");
         assert_eq!(p.pay_date, today, "开单日期留空按当天");
         assert_eq!(p.pay_method, PayMethod::Transfer, "支付方式留空按转账");
@@ -618,8 +646,55 @@ mod tests {
         assert_eq!(report.imported, 0);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].line, FIRST_DATA_ROW + 1);
-        assert!(report.failures[0].message.contains("没有"), "{:?}", report.failures);
+        assert!(
+            report.failures[0].message.contains("没有"),
+            "{:?}",
+            report.failures
+        );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// R-39：数值格也受单笔上限约束，不能靠「改成数值格式」绕过 parse_yuan。
+    #[test]
+    fn 数值金额同样受单笔上限约束() {
+        let ok = vec![calamine::Data::Float(100.0)];
+        assert_eq!(cell_money(&ok, 0).unwrap().cent(), 10_000);
+        let too_big = vec![calamine::Data::Float(20_000_000_000.0)];
+        assert!(cell_money(&too_big, 0).is_err(), "数值格超限应拒绝");
+        let int_too_big = vec![calamine::Data::Int(i64::MAX)];
+        assert!(cell_money(&int_too_big, 0).is_err(), "整数格溢出应拒绝");
+        let nan = vec![calamine::Data::Float(f64::NAN)];
+        assert!(cell_money(&nan, 0).is_err(), "非有限数应拒绝");
+        let text_too_big = vec![calamine::Data::String("20000000000".into())];
+        assert!(cell_money(&text_too_big, 0).is_err(), "文本格同样拒绝");
+    }
+
+    /// R-39：文件大小与行数上限在解压/逐行写入之前生效。
+    #[test]
+    fn 超大文件与超量行数被整份拒绝() {
+        let mut conn = conn_with_demo();
+        let big = temp_path("bigfile");
+        // 超过 10 MB 的文件，在 open_workbook 之前就被 metadata 检查挡下
+        std::fs::write(&big, vec![0u8; (MAX_IMPORT_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(import(&mut conn, &big, "t").is_err());
+        let _ = std::fs::remove_file(&big);
+
+        let many = temp_path("manyrows");
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            for r in 0..=MAX_IMPORT_ROWS as u32 {
+                ws.write_string(r, 0, "占位").unwrap();
+            }
+            let chk = wb.add_worksheet();
+            chk.set_name(CHECK_SHEET).unwrap();
+            chk.write_string(0, 0, CHECK_MARK).unwrap();
+            wb.save(&many).unwrap();
+        }
+        let err = import(&mut conn, &many, "t").unwrap_err();
+        assert!(err.to_string().contains("行上限"), "{err}");
+        let _ = std::fs::remove_file(&many);
     }
 
     /// 落一份真实模板到临时目录，供肉眼核对版式（默认忽略）。

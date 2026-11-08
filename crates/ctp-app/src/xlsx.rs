@@ -23,15 +23,9 @@ fn cell_format(kind: ColumnKind, bold: bool) -> Format {
     }
     match kind {
         ColumnKind::Text => f,
-        ColumnKind::Integer => f
-            .set_num_format("#,##0")
-            .set_align(FormatAlign::Right),
-        ColumnKind::Money => f
-            .set_num_format("#,##0.00")
-            .set_align(FormatAlign::Right),
-        ColumnKind::Rate => f
-            .set_num_format("0.00\"%\"")
-            .set_align(FormatAlign::Right),
+        ColumnKind::Integer => f.set_num_format("#,##0").set_align(FormatAlign::Right),
+        ColumnKind::Money => f.set_num_format("#,##0.00").set_align(FormatAlign::Right),
+        ColumnKind::Rate => f.set_num_format("0.00\"%\"").set_align(FormatAlign::Right),
     }
 }
 
@@ -48,11 +42,7 @@ fn col_letter(col: u16) -> String {
 }
 
 /// 写出报表。返回已写入的行列数，供集成测试断言。
-pub fn write_report(
-    result: &ReportResult,
-    path: &Path,
-    operator: &str,
-) -> Result<(usize, usize)> {
+pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Result<(usize, usize)> {
     let mut workbook = Workbook::new();
     let ws = workbook.add_worksheet();
     ws.set_name(result.kind.sheet_name()).map_err(xerr)?;
@@ -184,6 +174,8 @@ pub fn write_report(
 
 #[cfg(test)]
 mod tests {
+    // 12_345_67 = 12,345.67 元，按「元_分」分组便于人工核对导出值。
+    #![allow(clippy::inconsistent_digit_grouping)]
     use super::*;
     use crate::report::ReportResult;
     use ctp_core::ledger::PeriodRow;

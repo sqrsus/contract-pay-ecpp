@@ -41,10 +41,9 @@ impl RefKind {
             (RefKind::Report, r)
         } else if let Some(r) = code.strip_prefix("RV-") {
             (RefKind::Revision, r)
-        } else if let Some(r) = code.strip_prefix("RK-") {
-            (RefKind::Risk, r)
         } else {
-            return None;
+            let r = code.strip_prefix("RK-")?;
+            (RefKind::Risk, r)
         };
         if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
             return None;

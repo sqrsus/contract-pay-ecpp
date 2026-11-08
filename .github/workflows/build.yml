@@ -13,9 +13,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 创建 Release 需要写权限；其余步骤实际只读
+# R-39 最小权限：顶层只读，只有发布 Release 的 job 单独提权到 write。
 permissions:
-  contents: write
+  contents: read
 
 # 同一分支的旧构建自动取消，避免连续提交堆叠排队（标签发布不取消）
 concurrency:
@@ -37,7 +37,8 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # R-39：第三方 Action 一律 pin 到完整 commit SHA（tag 可被移动）
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: 安装 Linux 图形依赖
         run: |
@@ -50,9 +51,19 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libgl1-mesa-dev libegl1-mesa-dev
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: test
+
+      # R-39：CI 补格式与静态检查，避免「能编译但风格/lint 漂移」
+      - name: 安装 rustfmt / clippy
+        run: rustup component add rustfmt clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test --workspace
         run: cargo test --workspace --locked
@@ -75,9 +86,9 @@ jobs:
             bin: ctp-gui.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.artifact }}
 
@@ -92,7 +103,7 @@ jobs:
           sha256sum "target/release/${{ matrix.bin }}"
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: target/release/${{ matrix.bin }}
@@ -108,8 +119,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    # 只有这个 job 需要创建 Release / 上传资产
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true

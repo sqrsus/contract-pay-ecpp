@@ -32,13 +32,7 @@ pub fn load(conn: &Connection, key: &str) -> Result<Vec<Value>> {
 }
 
 /// 构造一条金额变更记录（元与分都留档，便于人工核对）。
-pub fn amount_entry(
-    at: &str,
-    old_cent: i64,
-    new_cent: i64,
-    reason: &str,
-    operator: &str,
-) -> Value {
+pub fn amount_entry(at: &str, old_cent: i64, new_cent: i64, reason: &str, operator: &str) -> Value {
     json!({
         "at": at,
         "old_cent": old_cent,

@@ -299,7 +299,12 @@ pub fn create_contract(
     let now = now_iso();
 
     // 三个输入框的文本 → 具体档案；找不到就自动建档（甲方记为业主角色）
-    let project_id = resolve_project(&tx, &input.project_id, input.project_text.as_deref(), operator)?;
+    let project_id = resolve_project(
+        &tx,
+        &input.project_id,
+        input.project_text.as_deref(),
+        operator,
+    )?;
     let contractor_id = resolve_contractor(
         &tx,
         &input.contractor_id,
@@ -311,9 +316,12 @@ pub fn create_contract(
 
     // 招标代理：与承包单位同路径，但以 AGENT 角色建档，避免混入承包单位联想列表
     let bid_agent_id = match input.bid_agent_text.as_deref().map(|s| s.trim()) {
-        Some(name) if !name.is_empty() => {
-            Some(ensure_contractor(&tx, name, ContractorRole::Agent, operator)?)
-        }
+        Some(name) if !name.is_empty() => Some(ensure_contractor(
+            &tx,
+            name,
+            ContractorRole::Agent,
+            operator,
+        )?),
         _ => None,
     };
 
@@ -406,7 +414,11 @@ pub fn create_contract(
 ///
 /// 生效是「合同正本必须齐备」的卡点：存草稿阶段允许缺附件，避免手里没有
 /// 电子件时连合同信息都录不进去；一旦要进入可拨款状态，就要求合同附件在位。
-pub fn activate_contract(conn: &mut Connection, contract_id: &str, operator: &str) -> Result<Contract> {
+pub fn activate_contract(
+    conn: &mut Connection,
+    contract_id: &str,
+    operator: &str,
+) -> Result<Contract> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
     if !repo::has_attachment(&tx, &c.id, AttachmentKind::Contract.code())? {
@@ -433,10 +445,14 @@ pub fn activate_contract(conn: &mut Connection, contract_id: &str, operator: &st
 
 /// 保存或替换某类附件（每类仅一份，冲突即覆盖）。
 ///
-/// 文件本体写入 `ct_contract_attachment.content`，因此这里挡住两件事：
-/// 空文件与超过 50 MB 的文件——它们是数据库体积失控的主要来源。
+/// 文件本体写入 `ct_contract_attachment.content`，因此这里挡住三件事：
+/// 空文件、超过 50 MB 的单文件、以及该合同附件总量超过 20 × 单文件上限
+/// （R-39）——它们是数据库体积失控的主要来源。
+///
+/// 写附件与写审计日志在**同一个 IMMEDIATE 事务**里，避免出现「文件进了库、
+/// 日志没记上」或反之的半截状态。
 pub fn save_attachment(
-    conn: &Connection,
+    conn: &mut Connection,
     contract_id: &str,
     kind: AttachmentKind,
     file_name: &str,
@@ -463,11 +479,29 @@ pub fn save_attachment(
     if name.is_empty() {
         return Err(DomainError::MissingField("附件文件名").into());
     }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    // 同类是「覆盖」，先扣掉旧行的体积再算总量，否则反复替换同一类附件会被误判为超限
+    let kind_code = kind.code();
+    let existing = repo::list_attachments(&tx, contract_id)?;
+    let other_total = existing
+        .iter()
+        .filter(|x| x.kind_code != kind_code)
+        .fold(0_i64, |acc, x| acc.saturating_add(x.size_bytes));
+    let total_cap = ctp_core::attachment::MAX_ATTACHMENT_TOTAL_BYTES;
+    if other_total.saturating_add(content.len() as i64) > total_cap {
+        return Err(StoreError::Inconsistent(format!(
+            "该合同附件总量将达 {:.0} MB，超过 {} MB 上限，请先删除不用的附件",
+            (other_total + content.len() as i64) as f64 / (1024.0 * 1024.0),
+            total_cap / 1024 / 1024
+        )));
+    }
+
     let now = now_iso();
     let a = Attachment {
         id: ids::new_id("ATT"),
         contract_id: contract_id.to_string(),
-        kind_code: kind.code().to_string(),
+        kind_code: kind_code.to_string(),
         file_name: name.to_string(),
         mime_type: mime_type.map(|s| s.to_string()),
         size_bytes: content.len() as i64,
@@ -479,20 +513,21 @@ pub fn save_attachment(
         updated_by: Some(operator.to_string()),
         version: 1,
     };
-    repo::upsert_attachment(conn, &a, content)?;
+    repo::upsert_attachment(&tx, &a, content)?;
     db::insert_audit_log(
-        conn,
+        &tx,
         "ct_contract_attachment",
         &a.id,
-        Some(&name),
+        Some(name),
         "UPSERT",
         Some(&format!("{} · {}", kind.label(), name)),
         operator,
     )?;
     // 覆盖已有行时主键仍是旧 id，回读一次拿真实记录
-    let saved = repo::list_attachments(conn, contract_id)?
+    let saved = repo::list_attachments(&tx, contract_id)?
         .into_iter()
-        .find(|x| x.kind_code == kind.code());
+        .find(|x| x.kind_code == kind_code);
+    tx.commit()?;
     Ok(saved.unwrap_or(a))
 }
 
@@ -504,10 +539,12 @@ pub fn attachment_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
     repo::attachment_bytes(conn, id)
 }
 
-pub fn delete_attachment(conn: &Connection, id: &str, operator: &str) -> Result<()> {
-    if let Some((kind, name)) = repo::delete_attachment(conn, id)? {
+/// 删除附件与删除留痕同事务（R-39）。
+pub fn delete_attachment(conn: &mut Connection, id: &str, operator: &str) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some((kind, name)) = repo::delete_attachment(&tx, id)? {
         db::insert_audit_log(
-            conn,
+            &tx,
             "ct_contract_attachment",
             id,
             Some(&name),
@@ -516,6 +553,7 @@ pub fn delete_attachment(conn: &Connection, id: &str, operator: &str) -> Result<
             operator,
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -600,6 +638,8 @@ pub fn edit_contract_amount(
 /// * `price` 为 `None` 或 `<= 0` 即「未审定」，基准回退合同金额；
 /// * 必填原因，写 `audit_price_history`；
 /// * 只改档案与基准，**不改写任何历史拨款流水**（累计已付保持不变）。
+// 业务字段本就较多，且调用点只有一个，保留扁平签名比引入参数对象更直观。
+#[allow(clippy::too_many_arguments)]
 pub fn register_audit_price(
     conn: &mut Connection,
     contract_id: &str,
@@ -781,7 +821,7 @@ pub fn register_payment(
             p.payment_no,
             p.amount_cent.format_yuan(),
             c.contract_no,
-            (paid + p.amount_cent).format_yuan(),
+            paid.checked_add(p.amount_cent)?.format_yuan(),
             quota.base_amount.format_yuan()
         )),
         operator,
@@ -838,7 +878,13 @@ pub fn quota_on(conn: &Connection, contract_id: &str, pay_date: &str) -> Result<
     } else {
         today.as_str()
     };
-    Ok(PaymentQuota::compute(&c, paid, Money::ZERO, tolerance, date)?)
+    Ok(PaymentQuota::compute(
+        &c,
+        paid,
+        Money::ZERO,
+        tolerance,
+        date,
+    )?)
 }
 
 /// 口径对账（H1 / 5.5 约束第 5 条）：视图 `pay_rate_bp` 必须等于 `Rate::ratio`。
@@ -898,7 +944,10 @@ pub fn filter_note(f: &ctp_core::ledger::SummaryFilter) -> String {
 }
 
 /// 从视图行构造报表结果（屏幕表格与导出共用这一份）。
-pub fn report_of(conn: &Connection, kind: crate::report::ReportKind) -> Result<crate::report::ReportResult> {
+pub fn report_of(
+    conn: &Connection,
+    kind: crate::report::ReportKind,
+) -> Result<crate::report::ReportResult> {
     use crate::report::{ReportKind, ReportResult};
     use ctp_core::ledger::SummaryDim;
     match kind {

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 汇总测试结果（只取结果行，避免中文测试名在控制台编码错乱）
+# R-39：报告照常生成，但脚本以 cargo test 的真实退出码结束。
 set -uo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="$HOME/target-ctp"
@@ -19,3 +20,4 @@ EXIT=$?
 } > "$SUMMARY"
 
 cat "$SUMMARY"
+exit "$EXIT"

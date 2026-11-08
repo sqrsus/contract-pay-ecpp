@@ -112,6 +112,8 @@ pub fn rmb_uppercase(cent: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    // 分值字面量刻意按「元_分」分组（如 1_001_00 = 1001.00 元），便于人工核对大写结果。
+    #![allow(clippy::inconsistent_digit_grouping)]
     use super::*;
 
     #[test]

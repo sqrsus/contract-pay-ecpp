@@ -71,15 +71,26 @@ pub fn run(conn: &Connection) -> Result<CheckReport> {
     let mut items = Vec::with_capacity(6);
 
     match service::reconcile(conn) {
-        Ok(m) if m.is_empty() => items.push(CheckItem::pass(N_RATE, "视图与 Rate::ratio 逐位一致（差异 0）")),
+        Ok(m) if m.is_empty() => items.push(CheckItem::pass(
+            N_RATE,
+            "视图与 Rate::ratio 逐位一致（差异 0）",
+        )),
         Ok(m) => {
             let detail = m
                 .iter()
                 .take(5)
-                .map(|x| format!("{}：视图 {} bp ≠ 应用层 {} bp", x.contract_no, x.view_bp, x.app_bp))
+                .map(|x| {
+                    format!(
+                        "{}：视图 {} bp ≠ 应用层 {} bp",
+                        x.contract_no, x.view_bp, x.app_bp
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
-            items.push(CheckItem::fail(N_RATE, format!("{} 处不一致\n{detail}", m.len())));
+            items.push(CheckItem::fail(
+                N_RATE,
+                format!("{} 处不一致\n{detail}", m.len()),
+            ));
         }
         Err(e) => items.push(CheckItem::fail(N_RATE, e.to_string())),
     }
@@ -110,13 +121,22 @@ pub fn run(conn: &Connection) -> Result<CheckReport> {
     }
 
     match paid_net_mismatch(conn) {
-        Ok(0) => items.push(CheckItem::pass(N_PAID, "V1 已付与「仅 PAID 合计」完全一致（作废单未计入）")),
-        Ok(n) => items.push(CheckItem::fail(N_PAID, format!("{n} 份合同的已付口径不一致"))),
+        Ok(0) => items.push(CheckItem::pass(
+            N_PAID,
+            "V1 已付与「仅 PAID 合计」完全一致（作废单未计入）",
+        )),
+        Ok(n) => items.push(CheckItem::fail(
+            N_PAID,
+            format!("{n} 份合同的已付口径不一致"),
+        )),
         Err(e) => items.push(CheckItem::fail(N_PAID, e)),
     }
 
     match orphan_view_rows(conn) {
-        Ok(0) => items.push(CheckItem::pass(N_ROWS, "视图行数 = 合同行数（无因 JOIN 丢行）")),
+        Ok(0) => items.push(CheckItem::pass(
+            N_ROWS,
+            "视图行数 = 合同行数（无因 JOIN 丢行）",
+        )),
         Ok(n) => items.push(CheckItem::fail(N_ROWS, format!("视图与合同相差 {n} 行"))),
         Err(e) => items.push(CheckItem::fail(N_ROWS, e)),
     }

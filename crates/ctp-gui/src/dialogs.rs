@@ -50,6 +50,16 @@ pub struct ImportResultView {
     pub rejected: Option<String>,
 }
 
+/// 关闭导入结果弹窗：把弹窗状态与结果数据一起清空。
+///
+/// 抽成不依赖渲染上下文的纯状态变更，「关闭」按钮与登出两条路径共用，
+/// 也便于单测锁定「两处都清空」——避免只把 `dialog` 置回 `None`，
+/// 却把上一次的统计摘要留在 `import_result` 里造成下次打开显示脏数据。
+pub fn dismiss_import_result(dialog: &mut Dialog, result: &mut Option<ImportResultView>) {
+    *dialog = Dialog::None;
+    *result = None;
+}
+
 impl ImportResultView {
     pub fn from_report(r: &ctp_app::batch::ImportReport) -> Self {
         ImportResultView {
@@ -75,9 +85,7 @@ impl ImportResultView {
 
     /// 三种场景共用的状态：整份拒绝 / 全部失败为红，部分失败为黄，全成功为绿。
     fn tone(&self) -> Tone {
-        if self.rejected.is_some()
-            || (self.imported == 0 && !self.failures.is_empty())
-        {
+        if self.rejected.is_some() || (self.imported == 0 && !self.failures.is_empty()) {
             Tone::Danger
         } else if !self.failures.is_empty() {
             Tone::Warn
@@ -243,18 +251,10 @@ impl Default for AuditForm {
 }
 
 /// 合同金额编辑表单。
+#[derive(Default)]
 pub struct AmountForm {
     pub amount: String,
     pub reason: String,
-}
-
-impl Default for AmountForm {
-    fn default() -> Self {
-        Self {
-            amount: String::new(),
-            reason: String::new(),
-        }
-    }
 }
 
 const PAY_METHODS: [PayMethod; 4] = [
@@ -310,7 +310,14 @@ fn date_field(ui: &mut egui::Ui, p: &Palette, label: &str, id: &str, w: f32, val
 }
 
 /// 下拉框（索引式）。
-fn combo(ui: &mut egui::Ui, id: &str, width: f32, current: usize, labels: Vec<String>, sel: &mut usize) {
+fn combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    width: f32,
+    current: usize,
+    labels: Vec<String>,
+    sel: &mut usize,
+) {
     let text = labels
         .get(current)
         .cloned()
@@ -331,19 +338,23 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     if app.dialog != Dialog::None || app.confirm.is_some() {
         let alpha = if app.mode.is_dark() { 130 } else { 55 };
         // 画在背景层末尾：盖住主界面，但仍在 Order::Middle 的窗口之下
-        ctx.layer_painter(egui::LayerId::background())
-            .rect_filled(
-                ctx.screen_rect(),
-                egui::Rounding::ZERO,
-                egui::Color32::from_black_alpha(alpha),
-            );
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.screen_rect(),
+            egui::Rounding::ZERO,
+            egui::Color32::from_black_alpha(alpha),
+        );
     }
     // R-33：导入结果弹窗是真模态。全屏交互层吃掉所有点击，背后界面仍可见但不可操作；
     // Esc、点弹窗外、刷新、切换主题都不会关闭它，只有弹窗内的「关闭」按钮能退出。
+    //
+    // 层级必须是 Middle：egui 0.29 的 Order 顺序为
+    // Background → Panel → Middle → Foreground → Tooltip → Debug，Tooltip 高于
+    // Foreground，若拦截层用 Tooltip 会盖住弹窗，导致「关闭」收不到点击。
+    // 拦截层在 Middle（低于弹窗的 Foreground，高于背景主界面）才能既挡背景又可关窗。
     if app.dialog == Dialog::ImportResult {
         let rect = ctx.screen_rect();
         egui::Area::new(egui::Id::new("import_result_blocker"))
-            .order(egui::Order::Tooltip)
+            .order(egui::Order::Middle)
             .fixed_pos(rect.min)
             .show(ctx, |ui| {
                 let _ = ui.allocate_response(rect.size(), egui::Sense::click());
@@ -370,7 +381,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 /// 批量拨款导入结果：常驻真模态，只列统计摘要 + 失败条目，不列逐行明细。
 fn import_result(app: &mut App, ctx: &egui::Context) {
     let Some(view) = app.import_result.clone() else {
-        app.dialog = Dialog::None;
+        dismiss_import_result(&mut app.dialog, &mut app.import_result);
         return;
     };
     let p = app.pal;
@@ -470,8 +481,7 @@ fn import_result(app: &mut App, ctx: &egui::Context) {
         });
 
     if close {
-        app.dialog = Dialog::None;
-        app.import_result = None;
+        dismiss_import_result(&mut app.dialog, &mut app.import_result);
     }
 }
 
@@ -499,7 +509,9 @@ fn pick_attachment(kind: AttachmentKind) -> Result<PendingAttachment, String> {
         .set_title(format!("选择{}", kind.label()))
         .add_filter(
             "常见附件",
-            &["pdf", "doc", "docx", "xls", "xlsx", "jpg", "jpeg", "png", "txt"],
+            &[
+                "pdf", "doc", "docx", "xls", "xlsx", "jpg", "jpeg", "png", "txt",
+            ],
         )
         .add_filter("全部文件", &["*"])
         .pick_file()
@@ -542,15 +554,13 @@ fn step_chip(ui: &mut egui::Ui, p: &Palette, no: u32, label: &str, active: bool)
         .rounding(egui::Rounding::same(20.0))
         .inner_margin(egui::Margin::symmetric(11.0, 4.0))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(format!("{no} {label}"))
-                    .size(12.0)
-                    .color(fg),
-            );
+            ui.label(RichText::new(format!("{no} {label}")).size(12.0).color(fg));
         });
 }
 
 /// 带字段标签的联想输入框。
+// 表单字段渲染需要一次性拿到标签、联想源、模式等上下文，保持扁平签名。
+#[allow(clippy::too_many_arguments)]
 fn ac_field(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -1110,7 +1120,13 @@ fn delivery_date(app: &mut App, ctx: &egui::Context) {
             );
             ui.add_space(10.0);
             widgets::field_label(ui, &p, "* 交工日期");
-            widgets::date_input(ui, "delivery_date_dialog", &p, &mut app.delivery_form, 260.0);
+            widgets::date_input(
+                ui,
+                "delivery_date_dialog",
+                &p,
+                &mut app.delivery_form,
+                260.0,
+            );
 
             let ok = is_iso_date(&app.delivery_form);
             if !ok {
@@ -1278,12 +1294,20 @@ fn edit_amount(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.set_width(440.0);
             ui.label(
-                RichText::new(format!("当前合同金额 {cur} 元。修改会留痕（BR-22）；已审定合同不改基准。"))
-                    .size(12.0)
-                    .color(p.text_muted),
+                RichText::new(format!(
+                    "当前合同金额 {cur} 元。修改会留痕（BR-22）；已审定合同不改基准。"
+                ))
+                .size(12.0)
+                .color(p.text_muted),
             );
             ui.add_space(10.0);
-            field(ui, &p, "* 新合同金额（元）", 440.0, &mut app.amount_form.amount);
+            field(
+                ui,
+                &p,
+                "* 新合同金额（元）",
+                440.0,
+                &mut app.amount_form.amount,
+            );
             ui.add_space(6.0);
             widgets::field_label(ui, &p, "* 修改原因");
             ui.add_sized(
@@ -1321,7 +1345,10 @@ fn edit_amount(app: &mut App, ctx: &egui::Context) {
                     app.refresh();
                     app.amount_form = AmountForm::default();
                     app.dialog = Dialog::None;
-                    app.success(format!("合同金额已改为 {} 元", c.total_amount().format_yuan()));
+                    app.success(format!(
+                        "合同金额已改为 {} 元",
+                        c.total_amount().format_yuan()
+                    ));
                 }
                 Err(e) => app.error(format!("修改失败：{e}")),
             }
@@ -1423,8 +1450,7 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
                 if !voided && widgets::ghost_button(ui, &p, "打印").clicked() {
                     print = true;
                 }
-                if contract.is_some()
-                    && widgets::ghost_button(ui, &p, "查看合同详情").clicked()
+                if contract.is_some() && widgets::ghost_button(ui, &p, "查看合同详情").clicked()
                 {
                     open_contract = true;
                 }
@@ -1628,13 +1654,7 @@ pub(crate) fn open_external(path: &std::path::Path) -> Result<(), String> {
 /// 本期只做材料清点与入口预留；中标通知书 / 审计报告等模板渲染待接入，
 /// 点击「打印」只给出提示，不生成文件。
 /// 只读字段：标签 + 浅底值框，尺寸与新合同页的输入框一致。
-fn ro_field(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    label: &str,
-    value: &str,
-    w: f32,
-) {
+fn ro_field(ui: &mut egui::Ui, p: &Palette, label: &str, value: &str, w: f32) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         widgets::field_label(ui, p, label);
@@ -1860,10 +1880,7 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     ui,
                                     &p,
                                     "质保金率 %",
-                                    &format!(
-                                        "{:.2}",
-                                        c.retention_rate_bp as f32 / 100.0
-                                    ),
+                                    &format!("{:.2}", c.retention_rate_bp as f32 / 100.0),
                                     200.0,
                                 );
                                 ro_field(
@@ -1984,7 +2001,10 @@ fn material_print(app: &mut App, ctx: &egui::Context) {
                         ui.set_width(556.0);
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(kind.label()).size(13.0).strong().color(p.text),
+                                RichText::new(kind.label())
+                                    .size(13.0)
+                                    .strong()
+                                    .color(p.text),
                             );
                             if kind.is_required() {
                                 widgets::badge(ui, &p, "必传", Tone::Danger);
@@ -2061,12 +2081,7 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
     let list = app.attachments.clone();
     let items: Vec<(AttachmentKind, Option<Attachment>)> = AttachmentKind::ALL
         .iter()
-        .map(|k| {
-            (
-                *k,
-                list.iter().find(|a| a.kind_code == k.code()).cloned(),
-            )
-        })
+        .map(|k| (*k, list.iter().find(|a| a.kind_code == k.code()).cloned()))
         .collect();
 
     modal(format!("合同附件 · {cno}"), &p)
@@ -2112,9 +2127,7 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
                                         .unwrap_or_default();
                                     ui.vertical(|ui| {
                                         ui.label(
-                                            RichText::new(&a.file_name)
-                                                .size(12.5)
-                                                .color(p.primary),
+                                            RichText::new(&a.file_name).size(12.5).color(p.primary),
                                         );
                                         ui.label(
                                             RichText::new(format!(
@@ -2135,27 +2148,24 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    match att {
-                                        Some(a) => {
-                                            if widgets::ghost_button_sm(ui, &p, "删除").clicked() {
-                                                op_del = Some(a.clone());
-                                            }
-                                            if widgets::ghost_button_sm(ui, &p, "另存").clicked() {
-                                                op_save = Some(a.clone());
-                                            }
-                                            if widgets::ghost_button_sm(ui, &p, "打开").clicked() {
-                                                op_open = Some(a.clone());
-                                            }
-                                            if widgets::ghost_button_sm(ui, &p, "替换").clicked() {
-                                                op_pick = Some(*kind);
-                                            }
+                                |ui| match att {
+                                    Some(a) => {
+                                        if widgets::ghost_button_sm(ui, &p, "删除").clicked() {
+                                            op_del = Some(a.clone());
                                         }
-                                        None => {
-                                            if widgets::ghost_button_sm(ui, &p, "上传").clicked()
-                                            {
-                                                op_pick = Some(*kind);
-                                            }
+                                        if widgets::ghost_button_sm(ui, &p, "另存").clicked() {
+                                            op_save = Some(a.clone());
+                                        }
+                                        if widgets::ghost_button_sm(ui, &p, "打开").clicked() {
+                                            op_open = Some(a.clone());
+                                        }
+                                        if widgets::ghost_button_sm(ui, &p, "替换").clicked() {
+                                            op_pick = Some(*kind);
+                                        }
+                                    }
+                                    None => {
+                                        if widgets::ghost_button_sm(ui, &p, "上传").clicked() {
+                                            op_pick = Some(*kind);
                                         }
                                     }
                                 },
@@ -2371,9 +2381,40 @@ pub fn pay_methods() -> &'static [PayMethod] {
     &PAY_METHODS
 }
 
-pub fn new_payment_input(contract_id: &str, amount: Money, date: &str, reason: &str, idx: usize) -> NewPayment {
+pub fn new_payment_input(
+    contract_id: &str,
+    amount: Money,
+    date: &str,
+    reason: &str,
+    idx: usize,
+) -> NewPayment {
     let mut input = NewPayment::new(contract_id, amount, date);
     input.reason = Some(reason.to_string());
     input.pay_method = PAY_METHODS.get(idx).copied().unwrap_or(PayMethod::Transfer);
     input
+}
+
+/// R-39 回归：导入结果弹窗关闭后，`dialog` 与 `import_result` 必须同时清空。
+/// 纯状态变更，不依赖 egui 上下文，可在 `cargo test -p ctp-gui` 中直接断言。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 关闭导入结果后弹窗与数据都被清除() {
+        let mut dialog = Dialog::ImportResult;
+        let mut result = Some(ImportResultView::from_report(
+            &ctp_app::batch::ImportReport {
+                imported: 2,
+                skipped: 1,
+                failures: vec![],
+            },
+        ));
+        dismiss_import_result(&mut dialog, &mut result);
+        assert!(dialog == Dialog::None, "dialog 必须回到 None");
+        assert!(
+            result.is_none(),
+            "import_result 必须清空，避免下次打开残留旧摘要"
+        );
+    }
 }

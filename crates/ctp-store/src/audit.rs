@@ -103,11 +103,9 @@ pub fn count(conn: &Connection, f: &LogFilter) -> Result<i64> {
         LogFilter::where_clause()
     );
     let p = f.params();
-    let n: i64 = conn.query_row(
-        &sql,
-        rusqlite::params![p[0], p[1], p[2], p[3]],
-        |r| r.get(0),
-    )?;
+    let n: i64 = conn.query_row(&sql, rusqlite::params![p[0], p[1], p[2], p[3]], |r| {
+        r.get(0)
+    })?;
     Ok(n)
 }
 
@@ -186,11 +184,9 @@ mod tests {
         // now_iso 是 UTC；本地日期取它的 +8 版本，用同一天筛必然命中
         let utc = now_iso();
         let local_date: String = conn
-            .query_row(
-                "SELECT date(?1, '+8 hours')",
-                rusqlite::params![utc],
-                |r| r.get(0),
-            )
+            .query_row("SELECT date(?1, '+8 hours')", rusqlite::params![utc], |r| {
+                r.get(0)
+            })
             .unwrap();
         let f = LogFilter {
             from: local_date.clone(),

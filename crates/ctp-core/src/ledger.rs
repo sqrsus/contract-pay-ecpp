@@ -79,14 +79,16 @@ impl ContractSummary {
             .mul_rate(tolerance.bp())
             .map(|m| m.cent())
             .unwrap_or(0);
-        let ceiling = Money::from_cent(self.base_amount.cent() + tolerance_amt);
+        let ceiling = self
+            .base_amount
+            .saturating_add(Money::from_cent(tolerance_amt));
         let (limit_amount, cap_bp, limit_note) = match limit {
             Ok(l) if l.cap_bp >= 10_000 => (ceiling, l.cap_bp, l.note),
             Ok(l) if l.ceiling.cent() < ceiling.cent() => (l.ceiling, l.cap_bp, l.note),
             Ok(l) => (ceiling, l.cap_bp, l.note),
             Err(_) => (ceiling, 10_000, None),
         };
-        let payable_amount = Money::from_cent(limit_amount.cent() - self.occupied_amount.cent());
+        let payable_amount = limit_amount.saturating_sub(self.occupied_amount);
         PaymentQuota {
             contract_amount: self.total_amount,
             audit_price: self.audit_price,

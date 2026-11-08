@@ -21,6 +21,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     let mut browse = false;
     let mut admin = false;
     let mut submit = false;
+    let mut retry_audit = false;
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(p.bg))
@@ -98,6 +99,17 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                             let msg = app.login_err.clone().unwrap_or_default();
                             ui.label(RichText::new(msg).size(12.0).color(p.danger));
                         }
+                        // R-39：登录留痕写失败不能静默吞掉。登录本身照常放行，
+                        // 但给出可见警告与「重试留痕」入口。
+                        if let Some((_, warn)) = app.login_audit_warn.clone() {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(warn).size(11.0).color(p.danger));
+                                if widgets::link(ui, &p, "重试留痕", 11.5).clicked() {
+                                    retry_audit = true;
+                                }
+                            });
+                        }
                         ui.add_space(10.0);
                         let can = !app.login_pw.trim().is_empty();
                         if widgets::primary_button_sized(
@@ -125,7 +137,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
-                                "首次使用：初始管理密码 0001，登录后请在「自检与设置」中修改。",
+                                "首次使用建议立即改密：初始管理密码 0001，登录后请在「自检与设置」中修改。",
                             )
                             .size(11.0)
                             .color(p.text_muted),
@@ -150,46 +162,67 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     if browse {
         app.role = Some(Role::Browse);
         app.login_err = None;
+        app.login_audit_warn = None;
         app.login_pw.clear();
         app.login_admin = false;
-        app.toast(Tone::Neutral, "已以浏览身份进入：仅可查看，修改操作会被拒绝");
+        app.toast(
+            Tone::Neutral,
+            "已以浏览身份进入：仅可查看，修改操作会被拒绝",
+        );
     }
     if admin {
         app.login_admin = true;
         app.login_err = None;
     }
-    if submit {
-        let ok = app
-            .db
-            .as_ref()
-            .and_then(|c| auth::verify(c, &app.login_pw).ok())
-            .unwrap_or(false);
-        // 登录成败都留痕（R-31）：这是审计价值最高的动作之一
-        if let Some(conn) = app.db.as_ref() {
-            let (action, detail) = if ok {
-                ("LOGIN_OK", "管理登录成功")
-            } else {
-                ("LOGIN_FAIL", "管理登录失败：密码错误")
-            };
-            let _ = ctp_store::db::insert_audit_log(
-                conn,
-                "session",
-                "login",
-                Some("登录"),
-                action,
-                Some(detail),
-                "管理员",
-            );
+    // R-39：补写登录留痕；不阻止登录，失败时保留警告供再次重试。
+    if retry_audit {
+        if let Some((ok, _)) = app.login_audit_warn.clone() {
+            match app.db.as_ref().map(|c| auth::log_login(c, ok, "管理员")) {
+                Some(Ok(())) => {
+                    app.login_audit_warn = None;
+                    app.success("登录留痕已补写");
+                }
+                Some(Err(e)) => app.error(format!("重试留痕失败：{e}")),
+                None => app.error("数据库不可用，无法补写登录留痕"),
+            }
         }
-        if ok {
-            app.role = Some(Role::Admin);
-            app.login_pw.clear();
-            app.login_err = None;
-            app.login_admin = false;
-            app.success("已以管理员身份进入");
-        } else {
-            app.login_err = Some("密码错误，请重新输入".into());
-            app.login_pw.clear();
+    }
+    if submit {
+        // DB 故障必须和「密码错误」区分：旧实现 `.ok()` 会把两者都显示成密码错误。
+        let outcome: Result<bool, String> = match app.db.as_ref() {
+            None => Err("数据库未打开".into()),
+            Some(conn) => auth::verify(conn, &app.login_pw).map_err(|e| e.to_string()),
+        };
+        match outcome {
+            Err(e) => {
+                app.login_err = Some(format!(
+                    "无法校验密码：{e}（这是数据库读取失败，不是密码错误，请检查数据文件后重试）"
+                ));
+                app.login_pw.clear();
+            }
+            Ok(ok) => {
+                // 统一走 auth::log_login（R-31 埋点，此前全库零调用），失败不静默吞掉
+                if let Some(conn) = app.db.as_ref() {
+                    match auth::log_login(conn, ok, "管理员") {
+                        Ok(()) => app.login_audit_warn = None,
+                        Err(e) => {
+                            let msg = format!("登录留痕写入失败：{e}");
+                            app.login_audit_warn = Some((ok, msg.clone()));
+                            app.error(msg);
+                        }
+                    }
+                }
+                if ok {
+                    app.role = Some(Role::Admin);
+                    app.login_pw.clear();
+                    app.login_err = None;
+                    app.login_admin = false;
+                    app.success("已以管理员身份进入");
+                } else {
+                    app.login_err = Some("密码错误，请重新输入".into());
+                    app.login_pw.clear();
+                }
+            }
         }
     }
 }

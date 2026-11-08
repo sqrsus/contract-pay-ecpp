@@ -170,7 +170,10 @@ mod tests {
         assert_eq!(plus_years("2026-13-01", 2), None);
 
         assert!(years_elapsed_over("2024-05-10", "2026-05-11", 2));
-        assert!(!years_elapsed_over("2024-05-10", "2026-05-10", 2), "同日不算超过");
+        assert!(
+            !years_elapsed_over("2024-05-10", "2026-05-10", 2),
+            "同日不算超过"
+        );
         assert!(!years_elapsed_over("2024-05-10", "2026-05-09", 2));
         // 开单日期早于交工日期（录错）按未满处理
         assert!(!years_elapsed_over("2026-05-10", "2026-01-01", 2));

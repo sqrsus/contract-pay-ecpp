@@ -39,7 +39,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         .flatten();
     if app.expanded_contract.is_some() && ui.input(|i| i.pointer.any_pressed()) {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            if keep.map_or(true, |r| !r.contains(pos)) {
+            if keep.is_none_or(|r| !r.contains(pos)) {
                 app.expanded_contract = None;
             }
         }
@@ -93,9 +93,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             RichText::new(format!(
                 "共 {} 份 · 已付 {} 元",
                 app.summaries.len(),
-                ctp_core::money::Money::from_cent(
-                    app.summaries.iter().map(|s| s.paid_amount.cent()).sum::<i64>()
-                )
+                ctp_core::money::Money::from_cent(Money::sum_saturating(
+                    app.summaries.iter().map(|s| s.paid_amount.cent())
+                ))
                 .format_yuan()
             ))
             .size(11.5)
@@ -119,7 +119,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let detail_w = 300.0_f32;
     // 详情卡要占 300 + 12，窗口太窄时先保证列表不被挤压：不显示详情卡
     let show_detail = app.selected.is_some() && !app.narrow && avail_w > 1060.0;
-    let table_w = if show_detail { avail_w - detail_w - 12.0 } else { avail_w };
+    let table_w = if show_detail {
+        avail_w - detail_w - 12.0
+    } else {
+        avail_w
+    };
     let page_h = ui.available_height();
 
     ui.horizontal_top(|ui| {
@@ -257,9 +261,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                         egui::Label::new(txt)
                                                             .sense(egui::Sense::click()),
                                                     )
-                                                    .on_hover_cursor(
-                                                        egui::CursorIcon::PointingHand,
-                                                    )
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                                     .on_hover_text("查看合同详情");
                                                 if r.clicked() {
                                                     detail = Some(s.contract_id.clone());
@@ -284,12 +286,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                     if selected { p.primary } else { p.text },
                                                     egui::Sense::click(),
                                                 )
-                                                .on_hover_cursor(
-                                                    egui::CursorIcon::PointingHand,
-                                                )
-                                                .on_hover_text(
-                                                    "点击展开 / 收起该合同的拨款明细",
-                                                );
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("点击展开 / 收起该合同的拨款明细");
                                                 if r.clicked() {
                                                     expand = Some(s.contract_id.clone());
                                                 }
@@ -300,10 +298,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             if !compact {
                                                 table_cell(ui, c_contractor, false, |ui| {
                                                     let contractor = text_of("contractor_name");
-                                                widgets::clipped_text(
-                                                    ui,
-                                                    &contractor,
-                                                    (c_contractor - 8.0).max(20.0),
+                                                    widgets::clipped_text(
+                                                        ui,
+                                                        &contractor,
+                                                        (c_contractor - 8.0).max(20.0),
                                                         12.0,
                                                         p.text_muted,
                                                         egui::Sense::hover(),
@@ -311,33 +309,33 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 });
                                                 table_cell(ui, c_amount, true, |ui| {
                                                     ui.label(
-                                                    RichText::new(text_of("total_amount"))
-                                                        .size(12.5)
-                                                        .color(p.text),
+                                                        RichText::new(text_of("total_amount"))
+                                                            .size(12.5)
+                                                            .color(p.text),
                                                     );
                                                 });
                                             }
                                             if !tight_cols {
                                                 table_cell(ui, c_audit, true, |ui| {
                                                     ui.label(
-                                                    RichText::new(text_of("audit_price"))
-                                                        .size(12.5)
-                                                        .color(if s.is_audited {
-                                                            p.text
-                                                        } else {
-                                                            p.text_muted
-                                                        }),
+                                                        RichText::new(text_of("audit_price"))
+                                                            .size(12.5)
+                                                            .color(if s.is_audited {
+                                                                p.text
+                                                            } else {
+                                                                p.text_muted
+                                                            }),
                                                     );
                                                 });
                                                 table_cell(ui, c_delivery, false, |ui| {
                                                     ui.label(
-                                                    RichText::new(text_of("delivery_date"))
-                                                        .size(12.0)
-                                                        .color(if s.delivery_date.is_some() {
-                                                            p.text
-                                                        } else {
-                                                            p.text_muted
-                                                        }),
+                                                        RichText::new(text_of("delivery_date"))
+                                                            .size(12.0)
+                                                            .color(if s.delivery_date.is_some() {
+                                                                p.text
+                                                            } else {
+                                                                p.text_muted
+                                                            }),
                                                     );
                                                 });
                                             }
@@ -585,8 +583,7 @@ fn expand_panel(
     let mut mine: Vec<&ctp_core::payment::Payment> = payments
         .iter()
         .filter(|pm| {
-            pm.contract_id == s.contract_id
-                && pm.status != ctp_core::payment::PaymentStatus::Void
+            pm.contract_id == s.contract_id && pm.status != ctp_core::payment::PaymentStatus::Void
         })
         .collect();
     mine.sort_by(|a, b| {
@@ -611,12 +608,15 @@ fn expand_panel(
                         .color(p.text),
                 );
                 if !mine.is_empty() {
-                    let net: i64 = mine.iter().map(|x| x.amount_cent.cent()).sum();
+                    let net: i64 = Money::sum_saturating(mine.iter().map(|x| x.amount_cent.cent()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("净额 {} 元", Money::from_cent(net).format_yuan()))
-                                .size(11.5)
-                                .color(p.text_muted),
+                            RichText::new(format!(
+                                "净额 {} 元",
+                                Money::from_cent(net).format_yuan()
+                            ))
+                            .size(11.5)
+                            .color(p.text_muted),
                         );
                     });
                 }
@@ -624,7 +624,11 @@ fn expand_panel(
             ui.add_space(4.0);
 
             if mine.is_empty() {
-                ui.label(RichText::new("该合同暂无有效拨款记录").size(11.5).color(p.text_muted));
+                ui.label(
+                    RichText::new("该合同暂无有效拨款记录")
+                        .size(11.5)
+                        .color(p.text_muted),
+                );
                 return;
             }
 
@@ -698,7 +702,9 @@ fn expand_panel(
                                     widgets::badge(ui, p, text.as_str(), Tone::Success);
                                 }
                                 _ => {
-                                    ui.label(RichText::new(text.as_str()).size(11.5).color(p.text_muted));
+                                    ui.label(
+                                        RichText::new(text.as_str()).size(11.5).color(p.text_muted),
+                                    );
                                 }
                             });
                         }
@@ -752,7 +758,12 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
     widgets::card(&p).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&s.contract_no).size(15.0).strong().color(p.text));
+            ui.label(
+                RichText::new(&s.contract_no)
+                    .size(15.0)
+                    .strong()
+                    .color(p.text),
+            );
             let (pstatus, ptone) = project_status(s);
             widgets::badge(ui, &p, pstatus, ptone);
             // 标题行右侧放「设为生效 / 作废」：前者是草稿态主行动，
@@ -763,12 +774,21 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                 }
             });
         });
-        ui.label(RichText::new(&s.contract_name).size(12.5).color(p.text_muted));
+        ui.label(
+            RichText::new(&s.contract_name)
+                .size(12.5)
+                .color(p.text_muted),
+        );
         ui.add_space(8.0);
         widgets::divider(ui, &p);
 
         widgets::kv(ui, &p, "承包单位", &s.contractor_name);
-        widgets::kv(ui, &p, "合同金额", &format!("{} 元", s.total_amount.format_yuan()));
+        widgets::kv(
+            ui,
+            &p,
+            "合同金额",
+            &format!("{} 元", s.total_amount.format_yuan()),
+        );
         widgets::kv(
             ui,
             &p,
@@ -777,12 +797,27 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                 .map(|m| format!("{} 元", m.format_yuan()))
                 .unwrap_or_else(|| "未审定".into()),
         );
-        widgets::kv(ui, &p, "有效计价基准", &format!("{} 元", s.base_amount.format_yuan()));
-        widgets::kv(ui, &p, "累计已付", &format!("{} 元", s.paid_amount.format_yuan()));
+        widgets::kv(
+            ui,
+            &p,
+            "有效计价基准",
+            &format!("{} 元", s.base_amount.format_yuan()),
+        );
+        widgets::kv(
+            ui,
+            &p,
+            "累计已付",
+            &format!("{} 元", s.paid_amount.format_yuan()),
+        );
         // 可付额度按「付清条件」封顶后的口径，与拨款管理页一致
         let quota_view = s.to_quota(ctp_core::rate::Rate::ZERO);
         let payable_now = Money::from_cent(quota_view.payable_amount.cent().max(0));
-        widgets::kv(ui, &p, "可付额度", &format!("{} 元", payable_now.format_yuan()));
+        widgets::kv(
+            ui,
+            &p,
+            "可付额度",
+            &format!("{} 元", payable_now.format_yuan()),
+        );
         // 支付率后带上封顶比例：80% 说明付清条件尚未满足（不额外占一行）
         let rate_text = if quota_view.limit_note.is_some() {
             format!(
@@ -822,12 +857,7 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                     "项目负责人",
                     d.project_leader.as_deref().unwrap_or("—"),
                 );
-                widgets::kv(
-                    ui,
-                    &p,
-                    "联系方式",
-                    d.contact_info.as_deref().unwrap_or("—"),
-                );
+                widgets::kv(ui, &p, "联系方式", d.contact_info.as_deref().unwrap_or("—"));
                 let agent_name = d
                     .bid_agent_id
                     .as_ref()
@@ -888,9 +918,11 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
         if is_draft {
             ui.add_space(2.0);
             ui.label(
-                RichText::new("草稿不可登记拨款；点标题行「设为生效」即可，生效要求合同附件已在位。")
-                    .size(10.5)
-                    .color(p.text_muted),
+                RichText::new(
+                    "草稿不可登记拨款；点标题行「设为生效」即可，生效要求合同附件已在位。",
+                )
+                .size(10.5)
+                .color(p.text_muted),
             );
         }
     });

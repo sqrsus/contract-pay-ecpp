@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn 比率表达式把乘二放在分母() {
         let e = rate_bp_expr("paid", "base");
-        assert!(e.contains("(base * 2)")); 
+        assert!(e.contains("(base * 2)"));
         assert!(
             !e.contains("/ (base) * 2") && !e.contains("/ base * 2"),
             "不得出现除后乘 2：{e}"

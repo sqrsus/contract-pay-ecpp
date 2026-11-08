@@ -6,6 +6,9 @@ use ctp_core::money::Money;
 use ctp_core::rate::Rate;
 use eframe::egui::{self, RichText};
 
+/// 最近拨款一行：(单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额分, 是否作废)
+type RecentRow = (String, String, String, String, String, String, i64, bool);
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
 
@@ -77,9 +80,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let count = app.summaries.len();
     let archived = app.summaries.iter().filter(|s| s.is_archived()).count();
     let performing = count - archived;
-    let total: i64 = app.summaries.iter().map(|s| s.total_amount.cent()).sum();
-    let base: i64 = app.summaries.iter().map(|s| s.base_amount.cent()).sum();
-    let paid: i64 = app.summaries.iter().map(|s| s.paid_amount.cent()).sum();
+    let total: i64 = Money::sum_saturating(app.summaries.iter().map(|s| s.total_amount.cent()));
+    let base: i64 = Money::sum_saturating(app.summaries.iter().map(|s| s.base_amount.cent()));
+    let paid: i64 = Money::sum_saturating(app.summaries.iter().map(|s| s.paid_amount.cent()));
     let risk = app.summaries.iter().filter(|s| s.is_inverted).count();
     let rate = Rate::ratio(Money::from_cent(paid), Money::from_cent(base.max(1)));
 
@@ -111,14 +114,33 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             String::new(),
             Tone::Neutral,
         ),
-        ("有效计价基准", Money::from_cent(base).format_yuan(), "审计价优先".into(), Tone::Neutral),
-        ("累计已付", Money::from_cent(paid).format_yuan(), "仅已实付".into(), Tone::Primary),
-        ("综合支付率", rate.percent_string(), "已付 ÷ 基准".into(), Tone::Primary),
+        (
+            "有效计价基准",
+            Money::from_cent(base).format_yuan(),
+            "审计价优先".into(),
+            Tone::Neutral,
+        ),
+        (
+            "累计已付",
+            Money::from_cent(paid).format_yuan(),
+            "仅已实付".into(),
+            Tone::Primary,
+        ),
+        (
+            "综合支付率",
+            rate.percent_string(),
+            "已付 ÷ 基准".into(),
+            Tone::Primary,
+        ),
         (
             "超付风险",
             format!("{risk} 份"),
             "基准低于已付".into(),
-            if risk > 0 { Tone::Danger } else { Tone::Success },
+            if risk > 0 {
+                Tone::Danger
+            } else {
+                Tone::Success
+            },
         ),
     ];
 
@@ -147,17 +169,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut clear_sel = false;
     let mut sel_toggle: Vec<(String, bool)> = Vec::new();
 
-    // (单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额, 是否作废)
-    let mut recent: Vec<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        i64,
-        bool,
-    )> = app
+    let mut recent: Vec<RecentRow> = app
         .payments
         .iter()
         .map(|pm| {
@@ -194,12 +206,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     widgets::card(&p).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        widgets::section_title(
-            ui,
-            &p,
-            "最近拨款",
-            "点单号看拨款详情，点合同名称看合同详情",
-        );
+        widgets::section_title(ui, &p, "最近拨款", "点单号看拨款详情，点合同名称看合同详情");
         ui.add_space(2.0);
 
         if recent.is_empty() {
@@ -400,13 +407,7 @@ fn cell(ui: &mut egui::Ui, width: f32, right: bool, add: impl FnOnce(&mut egui::
     });
 }
 
-fn head_cell(
-    ui: &mut egui::Ui,
-    p: &crate::theme::Palette,
-    width: f32,
-    text: &str,
-    right: bool,
-) {
+fn head_cell(ui: &mut egui::Ui, p: &crate::theme::Palette, width: f32, text: &str, right: bool) {
     cell(ui, width, right, |ui| {
         ui.label(RichText::new(text).size(11.5).color(p.text_muted));
     });

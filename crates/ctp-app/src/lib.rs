@@ -50,6 +50,10 @@ pub fn print_vouchers_now(owner: isize, vs: &[Voucher], name: &str) -> Result<us
 }
 
 #[cfg(not(windows))]
-pub fn print_vouchers_now(_owner: isize, _vs: &[Voucher], _name: &str) -> Result<usize, PrintError> {
+pub fn print_vouchers_now(
+    _owner: isize,
+    _vs: &[Voucher],
+    _name: &str,
+) -> Result<usize, PrintError> {
     Err(PrintError::Print("打印功能仅支持 Windows".into()))
 }

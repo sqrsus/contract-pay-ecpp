@@ -92,6 +92,12 @@ impl GdiCanvas {
                 name.as_ptr(),
             )
         };
+        // R-39：CreateFontW 失败会返回 NULL，旧实现照旧缓存并把 NULL 交给
+        // SelectObject，轻则字体悄悄退化、重则后续绘制异常。这里退回系统默认字体；
+        // 系统对象不入缓存，避免 Drop 里对 stock object 调 DeleteObject。
+        if font.is_null() {
+            return unsafe { gdi::GetStockObject(gdi::DEFAULT_GUI_FONT) };
+        }
         self.fonts.push((key, font));
         font
     }
@@ -210,13 +216,33 @@ fn ask_printer(owner: *mut c_void) -> Result<Option<gdi::HDC>, PrintError> {
     pd.nCopies = 1;
 
     let ok = unsafe { dlg::PrintDlgW(&mut pd) };
+    // R-39：对话框分配的 DEVMODE / DEVNAMES 全局句柄由调用方负责释放；
+    // 成功、取消、失败三条路径都要释放，否则每次打印都泄漏两块全局内存。
+    let free_dialog_handles = |pd: &dlg::PRINTDLGW| unsafe {
+        if !pd.hDevMode.is_null() {
+            windows_sys::Win32::Foundation::GlobalFree(pd.hDevMode);
+        }
+        if !pd.hDevNames.is_null() {
+            windows_sys::Win32::Foundation::GlobalFree(pd.hDevNames);
+        }
+    };
     if ok == 0 {
-        // 不确定是取消还是失败：hDC 为空即视为取消
-        return Ok(None);
+        // 用 CommDlgExtendedError 区分「用户取消」与「对话框真失败」：
+        // 0 = 用户主动取消，非 0 = 公共对话框错误码，旧实现一律当取消。
+        let code = unsafe { dlg::CommDlgExtendedError() };
+        free_dialog_handles(&pd);
+        if code == 0 {
+            return Ok(None);
+        }
+        return Err(PrintError::Print(format!(
+            "打印对话框失败（公共对话框错误码 {code}），不是用户取消"
+        )));
     }
     if pd.hDC.is_null() {
+        free_dialog_handles(&pd);
         return Err(PrintError::Print("打印对话框没有返回打印机句柄".into()));
     }
+    free_dialog_handles(&pd);
     Ok(Some(pd.hDC))
 }
 
@@ -281,13 +307,16 @@ pub fn print_vouchers(owner: *mut c_void, vs: &[Voucher], name: &str) -> Result<
     unsafe {
         if prn::StartDocW(hdc, &info) <= 0 {
             gdi::DeleteDC(hdc);
-            return Err(PrintError::Print("无法开始打印作业（检查打印机是否就绪）".into()));
+            return Err(PrintError::Print(
+                "无法开始打印作业（检查打印机是否就绪）".into(),
+            ));
         }
         let mut pages = 0usize;
         for v in vs {
             for page in 0..paper::PAGES_PER_VOUCHER {
                 if prn::StartPage(hdc) <= 0 {
-                    prn::EndDoc(hdc);
+                    // R-39：中途失败必须 AbortDoc，不能用 EndDoc 把半成品送进打印队列
+                    prn::AbortDoc(hdc);
                     gdi::DeleteDC(hdc);
                     return Err(PrintError::Print(format!("第 {} 页开始失败", pages + 1)));
                 }
@@ -296,15 +325,23 @@ pub fn print_vouchers(owner: *mut c_void, vs: &[Voucher], name: &str) -> Result<
                     paper::paint(&mut c, v, page);
                 }
                 if prn::EndPage(hdc) <= 0 {
-                    prn::EndDoc(hdc);
+                    prn::AbortDoc(hdc);
                     gdi::DeleteDC(hdc);
                     return Err(PrintError::Print(format!("第 {} 页输出失败", pages + 1)));
                 }
                 pages += 1;
             }
         }
-        prn::EndDoc(hdc);
-        gdi::DeleteDC(hdc);
+        // EndDoc 失败意味着作业没有正常提交（可能卡在驱动/队列），不能报「已输出 N 页」
+        if prn::EndDoc(hdc) <= 0 {
+            gdi::DeleteDC(hdc);
+            return Err(PrintError::Print(
+                "打印作业结束失败，纸张可能未完整输出，请检查打印机队列后重试".into(),
+            ));
+        }
+        if gdi::DeleteDC(hdc) == 0 {
+            return Err(PrintError::Print("释放打印机句柄失败".into()));
+        }
         Ok(pages)
     }
 }
@@ -362,7 +399,7 @@ pub fn render_page(v: &Voucher, page: usize, dpi: f32) -> Result<Preview, PrintE
         let rgba = {
             let src = std::slice::from_raw_parts(bits as *const u8, len);
             let mut out = Vec::with_capacity(len);
-            for px in src.chunks_exact(4) {
+            for px in src.as_chunks::<4>().0 {
                 out.extend_from_slice(&[px[2], px[1], px[0], 255]);
             }
             out

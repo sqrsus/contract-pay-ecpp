@@ -335,12 +335,8 @@ pub fn resolve(conn: &Connection, payment_id: &str) -> Result<PaymentPrintData, 
         .into_iter()
         .find(|s| s.contract_id == pm.contract_id)
         .map(|s| s.contractor_name);
-    let paid_before = repo::paid_before_payment(
-        conn,
-        &pm.contract_id,
-        &pm.pay_date,
-        &pm.payment_no,
-    )?;
+    let paid_before =
+        repo::paid_before_payment(conn, &pm.contract_id, &pm.pay_date, &pm.payment_no)?;
     let after = Money::from_cent(paid_before.cent().saturating_add(pm.amount_cent.cent()));
 
     let d = &PAYMENT_TEMPLATE;
@@ -478,7 +474,10 @@ mod tests {
 
     #[test]
     fn 注册表可按键查找() {
-        assert_eq!(find_template("payment_voucher_v1").unwrap().id, PAYMENT_TEMPLATE.id);
+        assert_eq!(
+            find_template("payment_voucher_v1").unwrap().id,
+            PAYMENT_TEMPLATE.id
+        );
         assert!(find_template("not_exist").is_none());
     }
 
@@ -550,7 +549,7 @@ mod tests {
     #[test]
     fn 打印件名称随张数变化() {
         let one = to_voucher(&data_with(&[]));
-        assert!(doc_name(&[one.clone()]).contains("拨款单 FK-1"));
+        assert!(doc_name(std::slice::from_ref(&one)).contains("拨款单 FK-1"));
         assert_eq!(doc_name(&[]), "拨款单");
         let many = vec![one; 3];
         assert!(doc_name(&many).contains("等 3 张"));

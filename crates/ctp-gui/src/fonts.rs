@@ -7,10 +7,10 @@ use eframe::egui;
 
 /// 候选字体路径（按优先级）。
 const CANDIDATES: &[&str] = &[
-    "C:/Windows/Fonts/msyh.ttc",       // 微软雅黑（界面观感最接近系统应用）
-    "C:/Windows/Fonts/simhei.ttf",     // 黑体
-    "C:/Windows/Fonts/Deng.ttf",       // 等线（字重偏细，作为后备）
-    "C:/Windows/Fonts/simsun.ttc",     // 宋体
+    "C:/Windows/Fonts/msyh.ttc",   // 微软雅黑（界面观感最接近系统应用）
+    "C:/Windows/Fonts/simhei.ttf", // 黑体
+    "C:/Windows/Fonts/Deng.ttf",   // 等线（字重偏细，作为后备）
+    "C:/Windows/Fonts/simsun.ttc", // 宋体
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",

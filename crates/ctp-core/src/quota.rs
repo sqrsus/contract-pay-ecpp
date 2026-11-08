@@ -234,7 +234,7 @@ impl PaymentQuota {
             return Err(DomainError::QuotaExceeded {
                 requested: amount.cent(),
                 available: self.payable_amount.cent(),
-                over: amount.cent() - self.payable_amount.cent(),
+                over: amount.checked_sub(self.payable_amount)?.cent(),
             });
         }
         Ok(())
@@ -253,7 +253,7 @@ impl PaymentQuota {
 
     /// 合同余款 = Base − 已付（可为负）。
     pub fn remaining(&self) -> Money {
-        Money::from_cent(self.base_amount.cent() - self.paid_amount.cent())
+        self.base_amount.saturating_sub(self.paid_amount)
     }
 
     /// 是否已付清（`paid = base`，不含容差）。
@@ -416,16 +416,19 @@ mod tests {
 
         // 已审定但交工未满 2 年 → 80%
         let c = construct(1_000, Some(1_000), Some("2024-06-01"));
-        let q = PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-05-31").unwrap();
+        let q =
+            PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-05-31").unwrap();
         assert_eq!(q.cap_bp, UNSETTLED_CAP_BP);
         assert!(q.limit_note.unwrap().contains("未满 2 年"));
 
         // 恰好满 2 年（同日）不算「大于 2 年」
-        let q = PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-06-01").unwrap();
+        let q =
+            PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-06-01").unwrap();
         assert_eq!(q.cap_bp, UNSETTLED_CAP_BP);
 
         // 严格超过 2 年 → 可付清
-        let q = PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-06-02").unwrap();
+        let q =
+            PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-06-02").unwrap();
         assert_eq!(q.cap_bp, 10_000);
         assert!(q.limit_note.is_none());
         assert_eq!(q.payable_amount.cent(), 1_000);

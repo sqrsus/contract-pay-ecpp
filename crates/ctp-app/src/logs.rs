@@ -69,11 +69,14 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
 /// 清理日志并留痕，返回删除条数。
 ///
 /// `filter` 四个条件全空即「全部清理」；否则按条件清理（例如只清某个时间范围）。
-pub fn clear(conn: &Connection, filter: &LogFilter, operator: &str) -> Result<usize> {
-    let n = audit::clear(conn, filter)?;
+/// R-39：删除与 `CLEAR` 留痕放在同一个 IMMEDIATE 事务里，
+/// 否则「删光了但留痕写入失败」会得到一个没有来源说明的空日志表。
+pub fn clear(conn: &mut Connection, filter: &LogFilter, operator: &str) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let n = audit::clear(&tx, filter)?;
     let scope = describe(filter);
     db::insert_audit_log(
-        conn,
+        &tx,
         "sys_audit_log",
         "sys_audit_log",
         Some("操作日志"),
@@ -81,6 +84,7 @@ pub fn clear(conn: &Connection, filter: &LogFilter, operator: &str) -> Result<us
         Some(&format!("{scope}，共 {n} 条")),
         operator,
     )?;
+    tx.commit()?;
     Ok(n)
 }
 
@@ -143,10 +147,10 @@ mod tests {
 
     #[test]
     fn 全部清理会留一条清理日志() {
-        let conn = fixture();
+        let mut conn = fixture();
         add(&conn, "CREATE", "HT-001 道路改造");
         add(&conn, "VOID", "HT-001 道路改造");
-        let n = clear(&conn, &LogFilter::default(), "管理员").unwrap();
+        let n = clear(&mut conn, &LogFilter::default(), "管理员").unwrap();
         assert_eq!(n, 2);
         // 清完只剩那条留痕
         assert_eq!(total(&conn).unwrap(), 1);
@@ -158,14 +162,14 @@ mod tests {
 
     #[test]
     fn 按条件清理的留痕写明范围() {
-        let conn = fixture();
+        let mut conn = fixture();
         add(&conn, "CREATE", "HT-001 道路改造");
         add(&conn, "VOID", "HT-002 桥梁维修");
         let f = LogFilter {
             action: Some("VOID".into()),
             ..Default::default()
         };
-        assert_eq!(clear(&conn, &f, "管理员").unwrap(), 1);
+        assert_eq!(clear(&mut conn, &f, "管理员").unwrap(), 1);
         let rows = list(&conn, &LogFilter::default(), 10).unwrap();
         let clear_row = rows.iter().find(|r| r.action == "CLEAR").unwrap();
         let detail = clear_row.detail.as_deref().unwrap();

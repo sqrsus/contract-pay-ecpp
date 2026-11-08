@@ -22,8 +22,8 @@ use ctp_core::payment::{Payment, PaymentStatus};
 use ctp_core::project::{Contractor, Project};
 use ctp_store::{db, repo};
 use eframe::egui::{self, Color32, Margin, RichText, Rounding};
-use rusqlite::Connection;
 use raw_window_handle::HasWindowHandle;
+use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -98,9 +98,20 @@ pub struct Toast {
 
 /// 待确认的破坏性操作。
 pub enum Confirm {
-    VoidPayment(Payment),
-    VoidContract(Contract),
+    // 两个业务实体都较大，装箱让枚举本身保持指针大小。
+    VoidPayment(Box<Payment>),
+    VoidContract(Box<Contract>),
 }
+
+/// 汇总统计的筛选条件快照（与当前筛选值不同就重算）。
+pub type SummaryKey = (
+    ctp_core::ledger::SummaryDim,
+    String,
+    String,
+    Option<bool>,
+    Option<String>,
+    String,
+);
 
 /// 冒烟/截图任务：`CTP_SELFTEST=1` 跑满帧退出；`CTP_SHOT=路径` 保存一帧界面。
 pub struct ShotJob {
@@ -122,6 +133,13 @@ pub struct App {
     pub db: Option<Connection>,
     pub db_path: String,
     pub init_error: Option<String>,
+    /// R-39：只读查询失败时保留的一条可见警告；内容不变就不重复刷提示条。
+    /// 顶栏上的「重试读取」会清掉它并重新载入全部视图数据。
+    pub data_warning: Option<String>,
+    /// R-39：耗时操作的「处理中」状态。批量导入仍是同步的（本轮不做线程化），
+    /// 该状态用于挡住重复提交，并在下一帧真正执行前给出可见反馈。
+    pub busy: Option<String>,
+    pub pending_import: Option<std::path::PathBuf>,
 
     pub summaries: Vec<ContractSummary>,
     pub projects: Vec<Project>,
@@ -184,6 +202,9 @@ pub struct App {
     pub login_err: Option<String>,
     /// 「管理登录」是否已展开密码框
     pub login_admin: bool,
+    /// 登录审计留痕失败时的可见警告 + 待重试的登录结果（R-39）。
+    /// 审计失败不阻止登录，但必须让人看得见并能重试，而不是静默 `let _ =`。
+    pub login_audit_warn: Option<(bool, String)>,
     /// 设置页修改密码表单：旧密码 / 新密码 / 确认
     pub pw_old: String,
     pub pw_new: String,
@@ -204,14 +225,7 @@ pub struct App {
     /// 当前结果（屏幕与导出同源）
     pub summary: Option<ctp_app::report::ReportResult>,
     /// 上次查询用的筛选快照；与当前值不同就重算
-    pub summary_key: Option<(
-        ctp_core::ledger::SummaryDim,
-        String,
-        String,
-        Option<bool>,
-        Option<String>,
-        String,
-    )>,
+    pub summary_key: Option<SummaryKey>,
 
     // ---------------- 操作日志（仅管理员可见）
     /// 筛选：起 / 止（本地日期闭区间，空串 = 不限）
@@ -302,6 +316,9 @@ impl App {
             db: None,
             db_path: path.to_string_lossy().to_string(),
             init_error: None,
+            data_warning: None,
+            busy: None,
+            pending_import: None,
             summaries: Vec::new(),
             projects: Vec::new(),
             contractors: Vec::new(),
@@ -339,6 +356,7 @@ impl App {
             login_pw: String::new(),
             login_err: None,
             login_admin: false,
+            login_audit_warn: None,
             pw_old: String::new(),
             pw_new: String::new(),
             pw_new2: String::new(),
@@ -478,7 +496,7 @@ impl App {
                 if let Some(pm) = self.payments.first().cloned() {
                     self.screen = Screen::Payments;
                     self.pay_contract = Some(pm.contract_id.clone());
-                    self.confirm = Some(Confirm::VoidPayment(pm));
+                    self.confirm = Some(Confirm::VoidPayment(Box::new(pm)));
                 }
             }
             "payment_detail" => {
@@ -528,8 +546,7 @@ impl App {
                         .payments
                         .iter()
                         .filter(|p| {
-                            p.contract_id == pm.contract_id
-                                && p.status == PaymentStatus::Paid
+                            p.contract_id == pm.contract_id && p.status == PaymentStatus::Paid
                         })
                         .take(2)
                         .map(|p| p.id.clone())
@@ -542,51 +559,77 @@ impl App {
     }
 
     /// 重新载入全部视图数据。写操作之后必须调用。
+    ///
+    /// R-39：任何一个查询失败都不再静默保留旧缓存，而是汇总成一条可见警告，
+    /// 由顶栏「重试读取」重新执行；`data_warning` 内容不变时不重复刷提示条。
     pub fn refresh(&mut self) {
-        let Some(conn) = self.db.as_ref() else {
-            return;
-        };
-        if let Ok(v) = repo::summaries(conn) {
-            self.summaries = v;
-        }
-        if let Ok(v) = repo::list_projects(conn) {
-            self.projects = v;
-        }
-        if let Ok(v) = repo::list_contractors(conn) {
-            self.contractors = v;
-        }
-        if let Ok(v) = repo::list_party_a_names(conn) {
-            self.party_a_names = v;
-        }
-        if let Ok(v) = repo::list_payments(conn, None) {
-            self.payments = v;
-        }
-        if let Ok(v) = repo::category_summary(conn) {
-            self.categories = v;
-        }
-        if let Ok(v) = repo::period_summary(conn) {
-            self.periods = v;
-        }
-        if let Ok(Some(v)) = db::schema_version(conn) {
-            self.schema_version = v;
-        }
-        // 写操作之后日志一定有新条目：置空快照让操作日志页下一帧重查
-        self.log_key = None;
-
-        // 选中项跟随数据刷新：合同不在了就清空
-        if let Some(id) = self.selected.clone() {
-            match repo::get_contract(conn, &id) {
-                Ok(c) => self.detail = Some(c),
-                Err(_) => {
-                    self.selected = None;
-                    self.detail = None;
+        let mut errs: Vec<String> = Vec::new();
+        {
+            let Some(conn) = self.db.as_ref() else {
+                return;
+            };
+            macro_rules! load {
+                ($label:expr, $call:expr, $field:ident) => {
+                    match $call {
+                        Ok(v) => self.$field = v,
+                        Err(e) => errs.push(format!("{}({e})", $label)),
+                    }
+                };
+            }
+            load!("合同汇总", repo::summaries(conn), summaries);
+            load!("项目档案", repo::list_projects(conn), projects);
+            load!("单位档案", repo::list_contractors(conn), contractors);
+            load!("发包人候选", repo::list_party_a_names(conn), party_a_names);
+            load!("拨款明细", repo::list_payments(conn, None), payments);
+            load!("分类汇总", repo::category_summary(conn), categories);
+            load!("期间统计", repo::period_summary(conn), periods);
+            match db::schema_version(conn) {
+                Ok(Some(v)) => self.schema_version = v,
+                Ok(None) => {}
+                Err(e) => errs.push(format!("结构版本({e})")),
+            }
+            // 选中项跟随数据刷新：合同不在了就清空
+            if let Some(id) = self.selected.clone() {
+                match repo::get_contract(conn, &id) {
+                    Ok(c) => self.detail = Some(c),
+                    Err(_) => {
+                        self.selected = None;
+                        self.detail = None;
+                    }
                 }
             }
         }
+        // 写操作之后日志一定有新条目：置空快照让操作日志页下一帧重查
+        self.log_key = None;
         if self.pay_contract.is_none() {
             self.pay_contract = self.summaries.first().map(|s| s.contract_id.clone());
         }
         self.sync_pay_text();
+        if errs.is_empty() {
+            self.data_warning = None;
+        } else {
+            self.warn_data("刷新视图数据", errs.join("；"));
+        }
+    }
+
+    /// 只读查询失败：合并成一条可见警告（toast + 顶栏常驻提示）。
+    pub fn warn_data(&mut self, what: &str, err: impl std::fmt::Display) {
+        let msg = format!("{what}失败：{err}");
+        if self.data_warning.as_deref() != Some(msg.as_str()) {
+            self.error(msg.clone());
+            self.data_warning = Some(msg);
+        }
+    }
+
+    /// 顶栏「重试读取」：清掉警告并重新载入全部视图与页面级快照。
+    pub fn retry_data(&mut self) {
+        self.data_warning = None;
+        self.log_key = None;
+        self.summary_key = None;
+        self.refresh();
+        if self.data_warning.is_none() {
+            self.success("数据已重新读取");
+        }
     }
 
     /// 合同在搜索框里的展示文本：`编号 名称`。
@@ -677,8 +720,8 @@ impl App {
             let Some(a) = list.into_iter().find(|a| a.kind_code == kind_code) else {
                 return Ok(None);
             };
-            let bytes = ctp_app::service::attachment_bytes(conn, &a.id)
-                .map_err(|e| e.to_string())?;
+            let bytes =
+                ctp_app::service::attachment_bytes(conn, &a.id).map_err(|e| e.to_string())?;
             Ok(Some((a.file_name, bytes)))
         })();
         match got {
@@ -850,7 +893,7 @@ impl App {
         let outcome: Result<(usize, std::path::PathBuf), String> = (|| {
             let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
             let path = rfd::FileDialog::new()
-                .set_file_name(&result.default_file_name())
+                .set_file_name(result.default_file_name())
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .save_file()
                 .ok_or_else(String::new)?;
@@ -874,6 +917,19 @@ impl App {
     pub fn show_import_result(&mut self, view: crate::dialogs::ImportResultView) {
         self.import_result = Some(view);
         self.dialog = Dialog::ImportResult;
+    }
+
+    /// 上一帧登记的批量导入，在这一帧真正执行（R-39「处理中」状态的落地）。
+    fn run_pending_import(&mut self, path: &std::path::Path) {
+        let view = match self.exec(|c| ctp_app::batch::import(c, path, "管理员")) {
+            Ok(report) => {
+                self.refresh();
+                crate::dialogs::ImportResultView::from_report(&report)
+            }
+            Err(e) => crate::dialogs::ImportResultView::rejected(format!("导入失败：{e}")),
+        };
+        self.busy = None;
+        self.show_import_result(view);
     }
 
     pub fn toast(&mut self, tone: Tone, text: impl Into<String>) {
@@ -904,7 +960,8 @@ impl App {
     }
 
     /// 权限不足的统一提示文案。
-    pub const NO_PERMISSION: &'static str = "无权限：浏览模式仅可查看，请用「管理登录」进入后再操作";
+    pub const NO_PERMISSION: &'static str =
+        "无权限：浏览模式仅可查看，请用「管理登录」进入后再操作";
 
     /// 写操作入口的守卫：浏览用户直接提示「无权限」并返回 false。
     ///
@@ -960,6 +1017,8 @@ impl App {
     fn top_bar(&mut self, ctx: &egui::Context) {
         let p = self.pal;
         let mut logout = false;
+        let mut retry_audit = false;
+        let mut retry_data = false;
         egui::TopBottomPanel::top("top_bar")
             .exact_height(62.0)
             .frame(
@@ -969,11 +1028,10 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(34.0, 34.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect_filled(rect, Rounding::same(9.0), p.primary);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, Rounding::same(9.0), p.primary);
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -983,11 +1041,20 @@ impl App {
                     );
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("工程合同台账与拨款管理平台").size(16.0).strong().color(p.text));
                         ui.label(
-                            RichText::new(format!("{} · {}", self.screen.label(), self.screen.hint()))
-                                .size(11.5)
-                                .color(p.text_muted),
+                            RichText::new("工程合同台账与拨款管理平台")
+                                .size(16.0)
+                                .strong()
+                                .color(p.text),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}",
+                                self.screen.label(),
+                                self.screen.hint()
+                            ))
+                            .size(11.5)
+                            .color(p.text_muted),
                         );
                     });
 
@@ -1000,6 +1067,23 @@ impl App {
                             logout = true;
                         }
                         ui.add_space(6.0);
+                        // R-39：登录留痕写入失败的补写入口，登录后仍可见
+                        if self.login_audit_warn.is_some() {
+                            if widgets::ghost_button(ui, &p, "重试留痕").clicked() {
+                                retry_audit = true;
+                            }
+                            ui.label(RichText::new("登录留痕待补写").size(11.0).color(p.danger));
+                            ui.add_space(6.0);
+                        }
+                        // R-39：读库失败的可见警告 + 重试入口
+                        if let Some(msg) = self.data_warning.clone() {
+                            if widgets::ghost_button(ui, &p, "重试读取").clicked() {
+                                retry_data = true;
+                            }
+                            ui.label(RichText::new(msg.clone()).size(11.0).color(p.danger))
+                                .on_hover_text(msg);
+                            ui.add_space(6.0);
+                        }
                         let (role_text, role_tone) = match self.role {
                             Some(r) if r.can_write() => (r.label(), Tone::Primary),
                             Some(r) => (r.label(), Tone::Neutral),
@@ -1007,7 +1091,11 @@ impl App {
                         };
                         widgets::badge(ui, &p, role_text, role_tone);
                         ui.add_space(8.0);
-                        let theme_text = if self.mode.is_dark() { "浅色" } else { "深色" };
+                        let theme_text = if self.mode.is_dark() {
+                            "浅色"
+                        } else {
+                            "深色"
+                        };
                         if widgets::ghost_button(ui, &p, &format!("切换{theme_text}")).clicked() {
                             self.mode.toggle();
                             self.pal = Palette::of(self.mode);
@@ -1037,16 +1125,35 @@ impl App {
         ))
         .rect_filled(rect, Rounding::same(0.0), p.border);
 
+        if retry_data {
+            self.retry_data();
+        }
+        if retry_audit {
+            if let Some((ok, _)) = self.login_audit_warn.clone() {
+                match self
+                    .db
+                    .as_ref()
+                    .map(|c| ctp_app::auth::log_login(c, ok, "管理员"))
+                {
+                    Some(Ok(())) => {
+                        self.login_audit_warn = None;
+                        self.success("登录留痕已补写");
+                    }
+                    Some(Err(e)) => self.error(format!("重试留痕失败：{e}")),
+                    None => self.error("数据库不可用，无法补写登录留痕"),
+                }
+            }
+        }
         if logout {
             self.role = None;
-            self.dialog = Dialog::None;
-            self.import_result = None;
+            crate::dialogs::dismiss_import_result(&mut self.dialog, &mut self.import_result);
             self.confirm = None;
             self.modal_contract = None;
             self.screen = Screen::Dashboard;
             self.login_pw.clear();
             self.login_err = None;
             self.login_admin = false;
+            self.login_audit_warn = None;
             self.toast(Tone::Neutral, "已退出登录");
         }
     }
@@ -1066,11 +1173,7 @@ impl App {
             )
             .show(ctx, |ui| {
                 if !self.narrow {
-                    ui.label(
-                        RichText::new("功能导航")
-                            .size(11.0)
-                            .color(p.text_muted),
-                    );
+                    ui.label(RichText::new("功能导航").size(11.0).color(p.text_muted));
                     ui.add_space(6.0);
                 }
                 for s in Screen::ALL {
@@ -1146,7 +1249,13 @@ impl App {
 }
 
 /// 导航项：选中态为主色浅底 + 主色文字 + 左侧色条。
-fn nav_item(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool, narrow: bool) -> egui::Response {
+fn nav_item(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    text: &str,
+    selected: bool,
+    narrow: bool,
+) -> egui::Response {
     let width = ui.available_width();
     let height = 38.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -1164,12 +1273,16 @@ fn nav_item(ui: &mut egui::Ui, p: &Palette, text: &str, selected: bool, narrow: 
             egui::pos2(rect.left() + 1.0, rect.center().y - 8.0),
             egui::vec2(3.0, 16.0),
         );
-        ui.painter().rect_filled(bar, Rounding::same(2.0), p.primary);
+        ui.painter()
+            .rect_filled(bar, Rounding::same(2.0), p.primary);
     }
     let color = if selected { p.primary } else { p.text };
     let font = egui::FontId::proportional(if narrow { 12.5 } else { 13.5 });
     ui.painter().text(
-        egui::pos2(rect.left() + if narrow { rect.width() / 2.0 } else { 16.0 }, rect.center().y),
+        egui::pos2(
+            rect.left() + if narrow { rect.width() / 2.0 } else { 16.0 },
+            rect.center().y,
+        ),
         if narrow {
             egui::Align2::CENTER_CENTER
         } else {
@@ -1195,7 +1308,8 @@ fn write_ppm(path: &str, image: &egui::ColorImage) {
     let _ = std::fs::write(path, buf);
 }
 
-fn shorten_path(path: &str) -> String {    let s = path.replace('\\', "/");
+fn shorten_path(path: &str) -> String {
+    let s = path.replace('\\', "/");
     if s.chars().count() <= 46 {
         return s;
     }
@@ -1213,7 +1327,7 @@ impl eframe::App for App {
         if self.hwnd == 0 {
             if let Ok(h) = frame.window_handle() {
                 if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
-                    self.hwnd = w.hwnd.get() as isize;
+                    self.hwnd = w.hwnd.get();
                 }
             }
         }
@@ -1289,6 +1403,10 @@ impl eframe::App for App {
         if (self.screen == Screen::Checks || self.screen == Screen::Logs) && !self.can_write() {
             self.screen = Screen::Dashboard;
         }
+        // R-39：上一帧登记的耗时操作在这一帧执行，期间「处理中」状态挡住重复提交
+        if let Some(path) = self.pending_import.take() {
+            self.run_pending_import(&path);
+        }
 
         self.top_bar(ctx);
         self.status_bar(ctx);
@@ -1304,7 +1422,12 @@ impl eframe::App for App {
                 if let Some(err) = self.init_error.clone() {
                     let p = self.pal;
                     widgets::card(&p).show(ui, |ui| {
-                        ui.label(RichText::new("数据库初始化失败").size(16.0).strong().color(p.danger));
+                        ui.label(
+                            RichText::new("数据库初始化失败")
+                                .size(16.0)
+                                .strong()
+                                .color(p.danger),
+                        );
                         ui.add_space(6.0);
                         ui.label(RichText::new(err).size(13.0).color(p.text));
                         ui.add_space(6.0);
@@ -1320,6 +1443,27 @@ impl eframe::App for App {
             });
 
         dialogs::draw(self, ctx);
+
+        // R-39：处理中状态。同步任务执行前显示一帧，并吃掉所有点击防止重复提交。
+        if let Some(msg) = self.busy.clone() {
+            let p = self.pal;
+            let rect = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("busy_overlay"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(rect.min)
+                .show(ctx, |ui| {
+                    let _ = ui.allocate_response(rect.size(), egui::Sense::click());
+                    widgets::card(&p).show(ui, |ui| {
+                        ui.label(RichText::new(msg).size(14.0).strong().color(p.text));
+                        ui.label(
+                            RichText::new("处理中，请勿重复操作…")
+                                .size(11.5)
+                                .color(p.text_muted),
+                        );
+                    });
+                });
+            ctx.request_repaint();
+        }
     }
 }
 

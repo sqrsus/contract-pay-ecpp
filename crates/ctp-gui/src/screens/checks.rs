@@ -25,15 +25,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             run = true;
         }
         if let Some(r) = &app.report {
-            let tone = if r.all_passed() { Tone::Success } else { Tone::Danger };
+            let tone = if r.all_passed() {
+                Tone::Success
+            } else {
+                Tone::Danger
+            };
             widgets::badge(
                 ui,
                 &p,
-                &format!(
-                    "{} / {} 通过",
-                    r.total() - r.failed(),
-                    r.total()
-                ),
+                &format!("{} / {} 通过", r.total() - r.failed(), r.total()),
                 tone,
             );
             ui.label(
@@ -42,9 +42,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     .color(p.text_muted),
             );
         } else {
-            ui.label(
-                RichText::new("尚未运行").size(11.5).color(p.text_muted),
-            );
+            ui.label(RichText::new("尚未运行").size(11.5).color(p.text_muted));
         }
     });
 
@@ -160,9 +158,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     });
 
     if run {
-        let res = app.db.as_ref().and_then(|c| ctp_app::checks::run(c).ok());
+        // R-39：区分「数据库没打开」与「自检执行报错」，后者要带出真实错误
+        let res = match app.db.as_ref() {
+            None => Err("数据库未打开".to_string()),
+            Some(c) => ctp_app::checks::run(c).map_err(|e| e.to_string()),
+        };
         match res {
-            Some(r) => {
+            Ok(r) => {
                 let failed = r.failed();
                 app.report = Some(r);
                 if failed == 0 {
@@ -171,7 +173,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     app.error(format!("自检发现 {failed} 项未通过"));
                 }
             }
-            None => app.error("自检失败：数据库不可用"),
+            Err(e) => app.warn_data("运行口径自检", e),
         }
     }
 

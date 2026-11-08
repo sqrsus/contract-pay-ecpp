@@ -5,9 +5,7 @@
 //! * 圆角统一 8px（卡片 12px），边框 1px，靠“底色分层 + 细边框”而不是重阴影区分层级；
 //! * 文字三级：正文 / 次要 / 弱化，保证表格在浅深两套里都可读。
 
-use eframe::egui::{
-    self, Color32, FontId, Rounding, Stroke, TextStyle, Visuals,
-};
+use eframe::egui::{self, Color32, FontId, Rounding, Stroke, TextStyle, Visuals};
 
 /// 主题模式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

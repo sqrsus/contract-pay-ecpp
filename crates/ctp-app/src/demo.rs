@@ -14,7 +14,7 @@ fn yuan(v: i64) -> Money {
 /// 演示附件。真实项目当然是扫描件，这里落一段可读文本占位，
 /// 目的是让「附件 3/4」「生效前必须齐备」这些链路在演示库里真的能走通。
 fn seed_attachments(
-    conn: &Connection,
+    conn: &mut Connection,
     contract_id: &str,
     operator: &str,
     with_audit: bool,
@@ -238,7 +238,12 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
     let mut p = NewPayment::new(&c3.id, yuan(200_000), "2026-05-31");
     p.reason = Some("首批供货（金额录错，稍后作废重登）".into());
     let wrong = service::register_payment(conn, p, operator)?;
-    service::void_payment(conn, &wrong.id, "金额录入错误，作废后按实际 120,000 元重登", operator)?;
+    service::void_payment(
+        conn,
+        &wrong.id,
+        "金额录入错误，作废后按实际 120,000 元重登",
+        operator,
+    )?;
 
     let mut p = NewPayment::new(&c3.id, yuan(120_000), "2026-05-31");
     p.reason = Some("首批供货（重登）".into());

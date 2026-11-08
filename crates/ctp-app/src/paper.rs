@@ -178,7 +178,7 @@ const S2_PT_DENSE: f32 = 10.0;
 
 /// 画第 `page` 页（0 起）。
 pub fn paint(c: &mut dyn Canvas, v: &Voucher, page: usize) {
-    if page % PAGES_PER_VOUCHER == 0 {
+    if page.is_multiple_of(PAGES_PER_VOUCHER) {
         sheet_supervision(c, v);
     } else {
         sheet_application(c, v);
@@ -223,9 +223,25 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
     let r = S1_ROWS;
 
     // 行 1：支付内容（会计科目手填，留空）
-    cell(c, S1_LEFT, r[0], 89.75 - S1_LEFT, r[1] - r[0], "支付内容\n(按照会计科目)：", Align::Center);
+    cell(
+        c,
+        S1_LEFT,
+        r[0],
+        89.75 - S1_LEFT,
+        r[1] - r[0],
+        "支付内容\n(按照会计科目)：",
+        Align::Center,
+    );
     // 行 2：支付金额 —— 大写（89.75..216.15）/ 小写（216.15..274.65）
-    cell(c, S1_LEFT, r[1], 89.75 - S1_LEFT, r[2] - r[1], "支付金额：", Align::Center);
+    cell(
+        c,
+        S1_LEFT,
+        r[1],
+        89.75 - S1_LEFT,
+        r[2] - r[1],
+        "支付金额：",
+        Align::Center,
+    );
     cell_fit(
         c,
         89.75,
@@ -245,7 +261,15 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         Align::Right,
     );
     // 行 3：票据 / 附件张数（张数留空手填，位置按模板的 tab 停位）
-    cell(c, S1_LEFT, r[2], 135.7 - S1_LEFT, r[3] - r[2], "票　　据:", Align::Left);
+    cell(
+        c,
+        S1_LEFT,
+        r[2],
+        135.7 - S1_LEFT,
+        r[3] - r[2],
+        "票　　据:",
+        Align::Left,
+    );
     c.text(
         117.0,
         r[2],
@@ -254,7 +278,15 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         "张",
         TextStyle::new(S1_PT, false, Align::Left, true).face(F),
     );
-    cell(c, 135.7, r[2], S1_RIGHT - 135.7, r[3] - r[2], "附件:", Align::Left);
+    cell(
+        c,
+        135.7,
+        r[2],
+        S1_RIGHT - 135.7,
+        r[3] - r[2],
+        "附件:",
+        Align::Left,
+    );
     c.text(
         190.0,
         r[2],
@@ -264,7 +296,15 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         TextStyle::new(S1_PT, false, Align::Left, true).face(F),
     );
     // 行 4：经办人签名（33.35..110.15）/ 支付用途说明（110.15..274.65）
-    cell(c, S1_LEFT, r[3], 110.15 - S1_LEFT, r[4] - r[3], "经办人签名:", Align::Left);
+    cell(
+        c,
+        S1_LEFT,
+        r[3],
+        110.15 - S1_LEFT,
+        r[4] - r[3],
+        "经办人签名:",
+        Align::Left,
+    );
     cell_fit(
         c,
         110.15,
@@ -289,8 +329,24 @@ fn sheet_supervision(c: &mut dyn Canvas, v: &Voucher) {
         cell(c, a, r[4], label_w, r[5] - r[4], lbl, Align::Center);
     }
     // 行 6：分管领导审批 / 单位负责人批准（竖线在 33.35 / 63.5 / 135.7 / 187.45 / 274.65）
-    cell(c, x5[0], r[5], x5[1] - x5[0], r[6] - r[5], "分管领导\n审批：", Align::Center);
-    cell(c, 135.7, r[5], 187.45 - 135.7, r[6] - r[5], "单位负责人\n批准：", Align::Center);
+    cell(
+        c,
+        x5[0],
+        r[5],
+        x5[1] - x5[0],
+        r[6] - r[5],
+        "分管领导\n审批：",
+        Align::Center,
+    );
+    cell(
+        c,
+        135.7,
+        r[5],
+        187.45 - 135.7,
+        r[6] - r[5],
+        "单位负责人\n批准：",
+        Align::Center,
+    );
 
     // ---- 网格线（按每行实际分格画竖线，再统一画横线）
     let row_cols: [&[f32]; 6] = [
@@ -355,7 +411,10 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         ("施工单位", S2_PT),
         ("合同价", S2_PT),
         ("审计价\n（如已审计填报）", S2_PT_DENSE),
-        ("合同履行情况\n(已完成工程量*%/\n已交工验收/\n已交工验收满*年)", S2_PT_DENSE),
+        (
+            "合同履行情况\n(已完成工程量*%/\n已交工验收/\n已交工验收满*年)",
+            S2_PT_DENSE,
+        ),
         ("目前已累计\n支付金额", S2_PT),
         ("本期申请\n支付金额", S2_PT),
         ("本期末累计\n支付金额", S2_PT),
@@ -376,9 +435,29 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
     // 表头行 / 取值行：9 列全分
     for i in 0..9 {
         let (x, w) = (S2_COLS[i], S2_COLS[i + 1] - S2_COLS[i]);
-        fit_in(c, x, r[0], w, r[1] - r[0], headers[i].0, headers[i].1, 6.0, Align::Center);
+        fit_in(
+            c,
+            x,
+            r[0],
+            w,
+            r[1] - r[0],
+            headers[i].0,
+            headers[i].1,
+            6.0,
+            Align::Center,
+        );
         if !values[i].is_empty() {
-            fit_in(c, x, r[1], w, r[2] - r[1], &values[i], S2_PT, 5.5, Align::Center);
+            fit_in(
+                c,
+                x,
+                r[1],
+                w,
+                r[2] - r[1],
+                &values[i],
+                S2_PT,
+                5.5,
+                Align::Center,
+            );
         }
     }
 
@@ -389,14 +468,26 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         (S2_COLS[4], S2_COLS[6], "项目牵头部门\n分管领导意见："),
     ];
     for (a, b, txt) in sign {
-        fit_in(c, a, r[2], b - a, r[3] - r[2], txt, S2_PT, 7.0, Align::Center);
+        fit_in(
+            c,
+            a,
+            r[2],
+            b - a,
+            r[3] - r[2],
+            txt,
+            S2_PT,
+            7.0,
+            Align::Center,
+        );
     }
 
     // 网格线：表头/取值行保持全列，签字行按合并后的分格
-    for i in 0..10 {
-        c.line(S2_COLS[i], r[0], S2_COLS[i], r[2]);
+    for x in S2_COLS {
+        c.line(x, r[0], x, r[2]);
     }
-    for x in [S2_COLS[0], S2_COLS[1], S2_COLS[3], S2_COLS[4], S2_COLS[6], S2_COLS[7], S2_COLS[9]] {
+    for x in [
+        S2_COLS[0], S2_COLS[1], S2_COLS[3], S2_COLS[4], S2_COLS[6], S2_COLS[7], S2_COLS[9],
+    ] {
         c.line(x, r[2], x, r[3]);
     }
     for y in r.iter() {
@@ -439,6 +530,8 @@ fn cell_fit(c: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, text: &str, alig
 }
 
 /// 表 2 的通用单元格：居中，按格宽格高自动降字号，避免长条款溢出格线。
+// 版面坐标 / 字号 / 对齐是一组扁平的绘制参数，拆成结构体反而让调用点难读。
+#[allow(clippy::too_many_arguments)]
 fn fit_in(
     c: &mut dyn Canvas,
     x: f32,
@@ -530,7 +623,10 @@ mod tests {
     fn 两页各自的标题与关键字段都上纸() {
         let mut first = Rec::default();
         paint(&mut first, &sample(), 0);
-        assert!(first.texts.iter().any(|t| t == "宿城区交通运输局财务支出审核监督表"));
+        assert!(first
+            .texts
+            .iter()
+            .any(|t| t == "宿城区交通运输局财务支出审核监督表"));
         assert!(first.texts.iter().any(|t| t.contains("大写:陆佰圆整")));
         assert!(first.texts.iter().any(|t| t.contains("小写:600.00")));
         assert!(first
@@ -540,7 +636,10 @@ mod tests {
 
         let mut second = Rec::default();
         paint(&mut second, &sample(), 1);
-        assert!(second.texts.iter().any(|t| t == "宿城区交通运输局工程项目进度款支付申请表"));
+        assert!(second
+            .texts
+            .iter()
+            .any(|t| t == "宿城区交通运输局工程项目进度款支付申请表"));
         assert!(second.texts.iter().any(|t| t == "XX 公路改建工程"));
         assert!(second.texts.iter().any(|t| t == "1000.00"));
         assert!(second.texts.iter().any(|t| t == "600.00"));
@@ -573,7 +672,10 @@ mod tests {
     fn 页码范围之外按两页循环() {
         let mut rec = Rec::default();
         paint(&mut rec, &sample(), 2);
-        assert!(rec.texts.iter().any(|t| t == "宿城区交通运输局财务支出审核监督表"));
+        assert!(rec
+            .texts
+            .iter()
+            .any(|t| t == "宿城区交通运输局财务支出审核监督表"));
     }
 
     /// R-29 字体族：第 1 页整页新宋体；第 2 页正文宋体，只有标题跟「标题 1」样式走新宋体。

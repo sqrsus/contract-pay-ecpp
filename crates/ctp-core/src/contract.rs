@@ -351,7 +351,7 @@ impl Contract {
     /// 审减额（派生展示，不落盘；审增时为负）。
     pub fn audit_reduction(&self) -> Money {
         if self.is_audited() {
-            Money::from_cent(self.total_amount().cent() - self.effective_base().cent())
+            self.total_amount().saturating_sub(self.effective_base())
         } else {
             Money::ZERO
         }
@@ -412,7 +412,9 @@ impl Contract {
             }
         }
         if self.original_amount_cent.cent() < 0 {
-            return Err(DomainError::NegativeAmount(self.original_amount_cent.cent()));
+            return Err(DomainError::NegativeAmount(
+                self.original_amount_cent.cent(),
+            ));
         }
         if let Some(a) = self.audit_price_cent {
             if a.cent() < 0 {
@@ -451,7 +453,9 @@ impl Contract {
             }
         }
         if !self.status.in_phase() {
-            return Err(DomainError::StatusOutOfPhase(self.status.code().to_string()));
+            return Err(DomainError::StatusOutOfPhase(
+                self.status.code().to_string(),
+            ));
         }
         Ok(())
     }
@@ -491,7 +495,10 @@ mod tests {
     #[test]
     fn 合同类型采购标签改为货物() {
         assert_eq!(ContractType::Supply.label(), "货物");
-        assert_eq!(ContractType::from_code("SUPPLY"), Some(ContractType::Supply));
+        assert_eq!(
+            ContractType::from_code("SUPPLY"),
+            Some(ContractType::Supply)
+        );
     }
 
     #[test]

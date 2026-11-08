@@ -2,7 +2,8 @@
 # 端到端业务演练（无界面）。
 # 命令行入口已移除，业务链路由 crates/ctp-app/tests/consistency.rs 的集成测试承担：
 # 建库 → 演示数据 → 台账/分类/期间三表口径 → 超付拦截 → 审计价切换 → 作废回退 → 六项自检。
-set -uo pipefail
+# R-39：严格失败传播，演练失败时脚本以测试的真实退出码结束。
+set -euo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="$HOME/target-ctp"
 cd /mnt/d/pay2 || exit 1
@@ -19,7 +20,12 @@ cargo test -p ctp-app --test consistency -- --list >> "$OUT" 2>&1
 
 echo >> "$OUT"
 echo "=== 执行 ===" >> "$OUT"
-cargo test -p ctp-app --test consistency -- --nocapture >> "$OUT" 2>&1
-echo "[exit=$?]" >> "$OUT"
+if cargo test -p ctp-app --test consistency -- --nocapture >> "$OUT" 2>&1; then
+  EXIT=0
+else
+  EXIT=$?
+fi
+echo "[exit=$EXIT]" >> "$OUT"
 
 tail -30 "$OUT"
+exit "$EXIT"

@@ -4,9 +4,7 @@
 
 use crate::theme::Palette;
 use ctp_core::date::today_iso;
-use eframe::egui::{
-    self, Color32, Margin, Response, RichText, Rounding, Stroke, Ui, Vec2,
-};
+use eframe::egui::{self, Color32, Margin, Response, RichText, Rounding, Stroke, Ui, Vec2};
 
 /// 语义色调。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,15 +59,7 @@ pub fn section_title(ui: &mut Ui, p: &Palette, title: &str, hint: &str) {
 }
 
 /// KPI 卡：小标题 + 大数字 + 说明。
-pub fn kpi(
-    ui: &mut Ui,
-    p: &Palette,
-    width: f32,
-    label: &str,
-    value: &str,
-    sub: &str,
-    tone: Tone,
-) {
+pub fn kpi(ui: &mut Ui, p: &Palette, width: f32, label: &str, value: &str, sub: &str, tone: Tone) {
     let (fg, _) = tone.colors(p);
     card(p).show(ui, |ui| {
         // 卡片内边距 16×2，这里扣掉，保证外框总宽等于调用方给的 width
@@ -271,13 +261,7 @@ pub fn ghost_button_sm_on(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -
 }
 
 /// 定宽文本：超出宽度时默认只显示开头；鼠标悬停后自动横向滚动查看全文。
-pub fn marquee(
-    ui: &mut Ui,
-    text: &str,
-    width: f32,
-    size: f32,
-    color: Color32,
-) -> Response {
+pub fn marquee(ui: &mut Ui, text: &str, width: f32, size: f32, color: Color32) -> Response {
     marquee_sense(ui, text, width, size, color, egui::Sense::hover())
 }
 
@@ -323,9 +307,8 @@ pub fn clipped_text(
     sense: egui::Sense,
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width.max(1.0), 18.0), sense);
-    let galley = ui.fonts(|f| {
-        f.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), color)
-    });
+    let galley =
+        ui.fonts(|f| f.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), color));
     let y = rect.center().y - galley.size().y / 2.0;
     ui.painter()
         .with_clip_rect(rect)
@@ -374,8 +357,10 @@ pub fn kv(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
 /// 水平分隔线。
 pub fn divider(ui: &mut Ui, p: &Palette) {
     ui.add_space(2.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, Rounding::same(0.5), p.border);
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::same(0.5), p.border);
     ui.add_space(2.0);
 }
 
@@ -409,13 +394,7 @@ pub fn link(ui: &mut Ui, p: &Palette, text: &str, size: f32) -> Response {
 }
 
 /// 弱化的可点击文字：常态灰、悬停主色下划线，避免和主编号抢注意力。
-fn link_colored(
-    ui: &mut Ui,
-    text: &str,
-    size: f32,
-    color: Color32,
-    hover: Color32,
-) -> Response {
+fn link_colored(ui: &mut Ui, text: &str, size: f32, color: Color32, hover: Color32) -> Response {
     let resp = ui
         .add(
             egui::Label::new(RichText::new(text).size(size).color(color))
@@ -462,6 +441,8 @@ pub struct AcOutcome {
 /// * `ShowAllOnEmpty`：空输入展示全部已有条目；输入后筛选；无匹配不弹层。
 ///
 /// 返回 `Some(值)` 表示这一帧用户点选了某一项（调用方据此刷新联动字段）。
+// 组件入参是 UI 状态与展示配置的扁平组合，调用点遍布各表单页。
+#[allow(clippy::too_many_arguments)]
 pub fn autocomplete(
     ui: &mut Ui,
     id: &str,
@@ -476,6 +457,8 @@ pub fn autocomplete(
 }
 
 /// 同 `autocomplete`，额外回报「输入是否变化」与焦点状态。
+// 与 autocomplete 共用同一组入参，保持签名一致。
+#[allow(clippy::too_many_arguments)]
 pub fn autocomplete_full(
     ui: &mut Ui,
     id: &str,
@@ -509,7 +492,7 @@ pub fn autocomplete_full(
     if ui.input(|i| i.pointer.any_pressed()) {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
             let in_input = resp.rect.contains(pos);
-            let in_popup = last_rect.map_or(false, |r| r.contains(pos));
+            let in_popup = last_rect.is_some_and(|r| r.contains(pos));
             if !in_input && !in_popup {
                 open = false;
             }
@@ -597,11 +580,9 @@ fn matched_candidates(candidates: &[String], text: &str, mode: SuggestMode) -> V
     if q.is_empty() {
         return match mode {
             SuggestMode::TypedOnly => Vec::new(),
-            SuggestMode::ShowAllOnEmpty => candidates
-                .iter()
-                .take(MAX_SUGGESTIONS)
-                .cloned()
-                .collect(),
+            SuggestMode::ShowAllOnEmpty => {
+                candidates.iter().take(MAX_SUGGESTIONS).cloned().collect()
+            }
         };
     }
     candidates
@@ -664,7 +645,7 @@ pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: 
     if ui.input(|i| i.pointer.any_pressed()) {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
             let in_input = resp.rect.contains(pos);
-            let in_popup = last_rect.map_or(false, |r| r.contains(pos));
+            let in_popup = last_rect.is_some_and(|r| r.contains(pos));
             if !in_input && !in_popup {
                 open = false;
             }
@@ -698,10 +679,8 @@ pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: 
                             if ui
                                 .add_sized(
                                     [26.0, 24.0],
-                                    egui::Button::new(
-                                        RichText::new("‹").size(16.0).color(p.text),
-                                    )
-                                    .frame(false),
+                                    egui::Button::new(RichText::new("‹").size(16.0).color(p.text))
+                                        .frame(false),
                                 )
                                 .clicked()
                             {
@@ -720,9 +699,7 @@ pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: 
                                         .add_sized(
                                             [26.0, 24.0],
                                             egui::Button::new(
-                                                RichText::new("›")
-                                                    .size(16.0)
-                                                    .color(p.text),
+                                                RichText::new("›").size(16.0).color(p.text),
                                             )
                                             .frame(false),
                                         )
@@ -738,12 +715,11 @@ pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: 
                             .num_columns(7)
                             .spacing([2.0, 2.0])
                             .show(ui, |ui| {
-                                for (i, w) in
-                                    ["一", "二", "三", "四", "五", "六", "日"].iter().enumerate()
+                                for (i, w) in ["一", "二", "三", "四", "五", "六", "日"]
+                                    .iter()
+                                    .enumerate()
                                 {
-                                    ui.label(
-                                        RichText::new(*w).size(11.0).color(p.text_muted),
-                                    );
+                                    ui.label(RichText::new(*w).size(11.0).color(p.text_muted));
                                     if i == 6 {
                                         ui.end_row();
                                     }
@@ -783,10 +759,8 @@ pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: 
                                 )
                                 .clicked()
                             {
-                                picked = Some(format!(
-                                    "{:04}-{:02}-{:02}",
-                                    today.0, today.1, today.2
-                                ));
+                                picked =
+                                    Some(format!("{:04}-{:02}-{:02}", today.0, today.1, today.2));
                             }
                             if ui
                                 .add(
@@ -898,18 +872,15 @@ fn days_in_month(y: i32, m: u32) -> u32 {
 fn weekday_monday0(y: i32, m: u32, d: u32) -> u32 {
     const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let yy = if m < 3 { y - 1 } else { y };
-    let sun0 = (yy + yy / 4 - yy / 100 + yy / 400 + T[(m - 1) as usize] + d as i32)
-        .rem_euclid(7) as u32;
+    let sun0 =
+        (yy + yy / 4 - yy / 100 + yy / 400 + T[(m - 1) as usize] + d as i32).rem_euclid(7) as u32;
     (sun0 + 6) % 7
 }
 
 /// 表格「合计行」上方的分隔线。须在表格绘制完成后调用，`(left, right)` 取表格横向范围。
 pub fn total_rule(ui: &Ui, p: &Palette, left: f32, right: f32, y: f32) {
-    ui.painter().hline(
-        left..=right,
-        y,
-        Stroke::new(1.0_f32, p.border_strong),
-    );
+    ui.painter()
+        .hline(left..=right, y, Stroke::new(1.0_f32, p.border_strong));
 }
 
 #[cfg(test)]

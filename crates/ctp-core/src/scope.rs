@@ -186,7 +186,11 @@ mod tests {
 
     #[test]
     fn p0_必须在本期范围内() {
-        assert!(audit_p0_consistency().is_empty(), "{:?}", audit_p0_consistency());
+        assert!(
+            audit_p0_consistency().is_empty(),
+            "{:?}",
+            audit_p0_consistency()
+        );
     }
 
     #[test]

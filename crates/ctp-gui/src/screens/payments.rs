@@ -146,14 +146,25 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(cid) = app.pay_contract.clone() else {
         return;
     };
-    let Some(s) = app.summaries.iter().find(|s| s.contract_id == cid) else {
+    // 取一份自有副本，避免整段绘制期间持续借用 app.summaries（R-39：期间要能写警告）
+    let Some(s) = app.summaries.iter().find(|s| s.contract_id == cid).cloned() else {
         return;
     };
-    // 额度按表单里的开单日期计算，与登记时的校验口径一致
-    let quota = app
+    // 额度按表单里的开单日期计算，与登记时的校验口径一致。
+    // R-39：查询失败不再静默退回缓存值，而是给出可见警告 + 重试入口。
+    let quota_res = app
         .db
         .as_ref()
-        .and_then(|c| service::quota_on(c, &cid, &app.pay_form.date).ok());
+        .map(|c| service::quota_on(c, &cid, &app.pay_form.date));
+    let mut quota_warn: Option<String> = None;
+    let quota = match quota_res {
+        Some(Ok(q)) => Some(q),
+        Some(Err(e)) => {
+            quota_warn = Some(e.to_string());
+            None
+        }
+        None => None,
+    };
     let (base, paid, rate) = match &quota {
         Some(q) => (
             q.base_amount.format_yuan(),
@@ -175,11 +186,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let cap_bp = quota.as_ref().map(|q| q.cap_bp).unwrap_or(10_000);
     let limit_note = quota.as_ref().and_then(|q| q.limit_note);
     let avail = Money::from_cent(payable_cent.max(0)).format_yuan();
-    let overdue = quota.as_ref().map(|q| q.available_amount.cent() < 0).unwrap_or(false);
+    let overdue = quota
+        .as_ref()
+        .map(|q| q.available_amount.cent() < 0)
+        .unwrap_or(false);
     let is_draft = s.status == ContractStatus::Draft.code();
     let payable = ContractStatus::from_code(&s.status)
         .map(|x| x.is_payable())
         .unwrap_or(false);
+    // `s` 是对 app.summaries 的不可变借用，用完后再写警告，避免借用冲突
+    if let Some(e) = quota_warn {
+        app.warn_data("读取可付额度", e);
+    }
     // 待办动作先收集，等借用释放后再落到 App 上
     let mut goto_contract: Option<String> = None;
     let mut open_pay: Option<String> = None;
@@ -269,14 +287,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ),
         (
             "已登记单据",
-            format!("{} 笔", app.payments.iter().filter(|x| x.contract_id == cid).count()),
+            format!(
+                "{} 笔",
+                app.payments.iter().filter(|x| x.contract_id == cid).count()
+            ),
             format!(
                 "作废 {} 笔",
                 app.payments
                     .iter()
                     .filter(|x| {
-                        x.contract_id == cid
-                            && x.status == ctp_core::payment::PaymentStatus::Void
+                        x.contract_id == cid && x.status == ctp_core::payment::PaymentStatus::Void
                     })
                     .count()
             ),
@@ -367,8 +387,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             }
                         });
 
-                    // 校验
-                    let amount = Money::parse_yuan(&app.pay_form.amount).ok();
+                    // 校验（R-39：解析失败要说出原因，不能只是把按钮悄悄禁用）
+                    let parsed = Money::parse_yuan(&app.pay_form.amount);
+                    let amount = parsed.as_ref().ok().copied();
+                    let amount_parse_err = parsed.as_ref().err().map(|e| e.to_string());
                     let amount_ok = amount.map(|m| m.cent() > 0).unwrap_or(false);
                     let date_ok = is_iso_date(&app.pay_form.date);
                     let over = amount.map(|m| m.cent() > payable_cent).unwrap_or(false);
@@ -398,6 +420,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 );
                             }
                         });
+                        ui.add_space(6.0);
+                    } else if let Some(e) = amount_parse_err.clone() {
+                        ui.label(
+                            RichText::new(format!("金额无法识别：{e}（可填 1250000.00 这类数字）"))
+                                .size(11.5)
+                                .color(p.warn),
+                        );
                         ui.add_space(6.0);
                     } else if !date_ok {
                         ui.label(
@@ -432,7 +461,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 |ui| {
                     widgets::card(&p).show(ui, |ui| {
                         ui.set_width(list_w - 34.0);
-                        widgets::section_title(ui, &p, "拨款明细", "作废单保留记录、不计入已付净额");
+                        widgets::section_title(
+                            ui,
+                            &p,
+                            "拨款明细",
+                            "作废单保留记录、不计入已付净额",
+                        );
                         ui.add_space(6.0);
                         let rows: Vec<ctp_core::payment::Payment> = app
                             .payments
@@ -448,17 +482,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             return;
                         }
                         // 批量打印：勾选若干条 → 合并成一份，一份一页
-                        let chosen = rows.iter().filter(|pm| app.print_sel.contains(&pm.id)).count();
+                        let chosen = rows
+                            .iter()
+                            .filter(|pm| app.print_sel.contains(&pm.id))
+                            .count();
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
-                            if widgets::link(
-                                ui,
-                                &p,
-                                &format!("批量打印所选（{chosen}）"),
-                                11.0,
-                            )
-                            .on_hover_text("勾选的拨款单合并成一份 Word，每张一页")
-                            .clicked()
+                            if widgets::link(ui, &p, &format!("批量打印所选（{chosen}）"), 11.0)
+                                .on_hover_text("勾选的拨款单合并成一份 Word，每张一页")
+                                .clicked()
                             {
                                 batch_print = true;
                             }
@@ -506,13 +538,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 let cells = &result.rows[ri];
                                 body.row(30.0, |mut row| {
                                     row.col(|ui| {
-                                        let paid = pm.status
-                                            == ctp_core::payment::PaymentStatus::Paid;
+                                        let paid =
+                                            pm.status == ctp_core::payment::PaymentStatus::Paid;
                                         let mut on = app.print_sel.contains(&pm.id);
-                                        let cb = ui.add_enabled(
-                                            paid,
-                                            egui::Checkbox::new(&mut on, ""),
-                                        );
+                                        let cb =
+                                            ui.add_enabled(paid, egui::Checkbox::new(&mut on, ""));
                                         if !paid {
                                             cb.on_hover_text("作废单不可打印");
                                         } else if cb.changed() {
@@ -524,14 +554,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         let text = cell.display();
                                         row.col(|ui| match c.key {
                                             "payment_no" => {
-                                                if widgets::link(ui, &p, text.as_str(), 12.0).clicked()
+                                                if widgets::link(ui, &p, text.as_str(), 12.0)
+                                                    .clicked()
                                                 {
                                                     open_pay = Some(pm.id.clone());
                                                 }
                                             }
                                             "amount" => {
                                                 ui.with_layout(
-                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
                                                     |ui| {
                                                         ui.label(
                                                             RichText::new(text.as_str())
@@ -545,9 +578,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 if pm.status
                                                     == ctp_core::payment::PaymentStatus::Paid
                                                 {
-                                                    widgets::badge(ui, &p, text.as_str(), Tone::Success);
+                                                    widgets::badge(
+                                                        ui,
+                                                        &p,
+                                                        text.as_str(),
+                                                        Tone::Success,
+                                                    );
                                                 } else {
-                                                    widgets::badge(ui, &p, text.as_str(), Tone::Neutral);
+                                                    widgets::badge(
+                                                        ui,
+                                                        &p,
+                                                        text.as_str(),
+                                                        Tone::Neutral,
+                                                    );
                                                 }
                                             }
                                             _ => {
@@ -563,9 +606,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         ui.horizontal(|ui| {
                                             // 表格列间距是 20px，操作列内要收紧，否则第三个操作会被挤出
                                             ui.spacing_mut().item_spacing.x = 6.0;
-                                            if pm.status
-                                                == ctp_core::payment::PaymentStatus::Paid
-                                            {
+                                            if pm.status == ctp_core::payment::PaymentStatus::Paid {
                                                 if widgets::link(ui, &p, "打印拨款单", 11.0)
                                                     .on_hover_text(
                                                         "预览两页版面后直接送打印机（不经过 Word）",
@@ -588,8 +629,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             {
                                                 material_target = Some(pm.contract_id.clone());
                                             }
-                                            if pm.status
-                                                == ctp_core::payment::PaymentStatus::Paid
+                                            if pm.status == ctp_core::payment::PaymentStatus::Paid
                                                 && ui
                                                     .add(
                                                         egui::Button::new(
@@ -658,8 +698,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             .payments
             .iter()
             .filter(|pm| {
-                pm.contract_id == cid
-                    && pm.status == ctp_core::payment::PaymentStatus::Paid
+                pm.contract_id == cid && pm.status == ctp_core::payment::PaymentStatus::Paid
             })
             .map(|pm| pm.id.clone())
             .collect();
@@ -677,7 +716,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     if submit {
-        let amount = Money::parse_yuan(&app.pay_form.amount).unwrap_or(Money::ZERO);
+        // 正常路径由表单校验保证解析成功；这里兜底，绝不把解析失败悄悄写成 0 元单据
+        let amount = match Money::parse_yuan(&app.pay_form.amount) {
+            Ok(m) if m.cent() > 0 => m,
+            _ => {
+                app.error("金额无法识别，未登记拨款单");
+                return;
+            }
+        };
         let date = app.pay_form.date.trim().to_string();
         let reason = {
             let r = app.pay_form.reason.trim().to_string();
@@ -704,7 +750,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
     if let Some(pm) = void_target {
         app.confirm_reason.clear();
-        app.confirm = Some(Confirm::VoidPayment(pm));
+        app.confirm = Some(Confirm::VoidPayment(Box::new(pm)));
     }
     if let Some(pm) = print_target {
         app.open_print_preview(&pm);
@@ -746,22 +792,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     if import_tpl && app.require_write() {
-        if let Some(path) = rfd::FileDialog::new()
+        // R-39：导入仍是同步执行（本轮不做线程化），但先置「处理中」状态挡住重复提交，
+        // 真正的文件读取放到下一帧，让用户至少能看到一次明确的处理中反馈。
+        if app.busy.is_some() {
+            app.toast(Tone::Neutral, "正在处理上一次导入，请稍候");
+        } else if let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx"])
             .pick_file()
         {
-            match app.exec(move |c| ctp_app::batch::import(c, &path, "管理员")) {
-                Ok(report) => {
-                    app.refresh();
-                    app.show_import_result(
-                        crate::dialogs::ImportResultView::from_report(&report),
-                    );
-                }
-                // 整份拒绝（文件打不开 / 缺校验表 / 标记不符）也用同一个弹窗
-                Err(e) => app.show_import_result(crate::dialogs::ImportResultView::rejected(
-                    format!("导入失败：{e}"),
-                )),
-            }
+            app.pending_import = Some(path);
+            app.busy = Some("正在导入批量拨款…".to_string());
         }
     }
 

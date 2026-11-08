@@ -31,9 +31,10 @@ fn draw_cell(
         Cell::Rate(s, bp) => {
             let frac = (*bp as f32 / 10_000.0).clamp(0.0, 1.0);
             widgets::bar(ui, p, frac, p.primary, bar_width, 7.0);
-            let mut label = RichText::new(s)
-                .size(11.5)
-                .color(if strong { p.text } else { p.text_muted });
+            let mut label =
+                RichText::new(s)
+                    .size(11.5)
+                    .color(if strong { p.text } else { p.text_muted });
             if strong {
                 label = label.strong();
             }
@@ -67,7 +68,7 @@ fn result_table(ui: &mut egui::Ui, p: &Palette, result: &ReportResult, bar_width
             Column::auto().at_least(c.screen_width)
         });
     }
-    tb    .header(26.0, |mut h| {
+    tb.header(26.0, |mut h| {
         for c in &result.columns {
             h.col(|ui| widgets::th(ui, p, c.title, c.right));
         }
@@ -305,9 +306,14 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
                 contract_type: ty,
                 keyword: kw,
             };
-            app.summary = app
-                .read(|c| ctp_app::service::summary_of(c, dim, &filter))
-                .ok();
+            // R-39：查询失败不再被 .ok() 静默变成「无数据」
+            match app.read(|c| ctp_app::service::summary_of(c, dim, &filter)) {
+                Ok(s) => app.summary = Some(s),
+                Err(e) => {
+                    app.summary = None;
+                    app.warn_data("查询汇总统计", e);
+                }
+            }
         } else {
             app.summary = None;
         }
@@ -318,9 +324,11 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
         widgets::card(&p).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("统计区间日期格式不对：应为 YYYY-MM-DD，且起始不晚于结束（留空 = 不限）")
-                    .size(13.0)
-                    .color(p.danger),
+                RichText::new(
+                    "统计区间日期格式不对：应为 YYYY-MM-DD，且起始不晚于结束（留空 = 不限）",
+                )
+                .size(13.0)
+                .color(p.danger),
             );
         });
     } else {

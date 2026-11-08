@@ -102,6 +102,12 @@ impl Attachment {
 /// 单文件上限：50 MB。超过则拒绝落库，避免数据库无上限膨胀。
 pub const MAX_ATTACHMENT_BYTES: i64 = 50 * 1024 * 1024;
 
+/// 单份合同的附件总量上限：20 × 单文件上限（1 GB，R-39）。
+///
+/// 附件本体以 BLOB 存在数据库里，单文件上限只能挡住「一次传一个超大文件」，
+/// 挡不住「反复传满额文件」把库撑爆；这里按合同维度再设一道总量闸门。
+pub const MAX_ATTACHMENT_TOTAL_BYTES: i64 = 20 * MAX_ATTACHMENT_BYTES;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,8 +130,10 @@ mod tests {
 
     #[test]
     fn 体积显示() {
-        let mut a = Attachment::default();
-        a.size_bytes = 900;
+        let mut a = Attachment {
+            size_bytes: 900,
+            ..Default::default()
+        };
         assert_eq!(a.size_label(), "900 B");
         a.size_bytes = 2048;
         assert_eq!(a.size_label(), "2 KB");

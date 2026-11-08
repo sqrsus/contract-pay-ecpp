@@ -180,7 +180,10 @@ fn map_contract(row: &Row) -> rusqlite::Result<Contract> {
         },
         retention_rate_bp: row.get(23)?,
         advance_rate_bp: row.get(24)?,
-        status: conv(ContractStatus::from_code(&row.get::<_, String>(25)?), "status")?,
+        status: conv(
+            ContractStatus::from_code(&row.get::<_, String>(25)?),
+            "status",
+        )?,
         payment_terms: row.get(26)?,
         remark: row.get(27)?,
         is_deleted: row.get::<_, i32>(28)? != 0,
@@ -342,7 +345,9 @@ pub fn find_contract_by_no(conn: &Connection, no: &str) -> Result<Option<Contrac
 }
 
 pub fn list_contracts(conn: &Connection) -> Result<Vec<Contract>> {
-    let sql = format!("SELECT {CONTRACT_COLS} FROM ct_contract WHERE is_deleted = 0 ORDER BY contract_no");
+    let sql = format!(
+        "SELECT {CONTRACT_COLS} FROM ct_contract WHERE is_deleted = 0 ORDER BY contract_no"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], map_contract)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -381,7 +386,8 @@ pub fn list_projects(conn: &Connection) -> Result<Vec<Project>> {
 
 /// 参建单位清单（供界面下拉选择）。
 pub fn list_contractors(conn: &Connection) -> Result<Vec<Contractor>> {
-    let sql = "SELECT id, contractor_name, role_type, credit_code, bank_name, bank_account, remark, \
+    let sql =
+        "SELECT id, contractor_name, role_type, credit_code, bank_name, bank_account, remark, \
         is_deleted, version, created_at, created_by, updated_at, updated_by \
         FROM org_contractor WHERE is_deleted = 0 ORDER BY contractor_name";
     let mut stmt = conn.prepare(sql)?;
@@ -425,11 +431,17 @@ fn map_payment(row: &Row) -> rusqlite::Result<Payment> {
         pay_date: row.get(7)?,
         amount_cent: money(row.get(8)?),
         reason: row.get(9)?,
-        pay_method: conv(PayMethod::from_code(&row.get::<_, String>(10)?), "pay_method")?,
+        pay_method: conv(
+            PayMethod::from_code(&row.get::<_, String>(10)?),
+            "pay_method",
+        )?,
         bank_serial_no: row.get(11)?,
         pay_account: row.get(12)?,
         receive_account: row.get(13)?,
-        status: conv(PaymentStatus::from_code(&row.get::<_, String>(14)?), "status")?,
+        status: conv(
+            PaymentStatus::from_code(&row.get::<_, String>(14)?),
+            "status",
+        )?,
         operator_id: row.get(15)?,
         print_count: row.get(16)?,
         remark: row.get(17)?,
@@ -558,7 +570,11 @@ pub fn paid_before_payment(
            AND (pay_date < ?2 OR (pay_date = ?2 AND payment_no < ?3))",
         schema::PAID_STATUS_SQL
     );
-    let v: i64 = conn.query_row(&sql, rusqlite::params![contract_id, pay_date, payment_no], |r| r.get(0))?;
+    let v: i64 = conn.query_row(
+        &sql,
+        rusqlite::params![contract_id, pay_date, payment_no],
+        |r| r.get(0),
+    )?;
     Ok(money(v))
 }
 
@@ -645,7 +661,9 @@ pub fn summaries(conn: &Connection) -> Result<Vec<ContractSummary>> {
 pub fn summary(conn: &Connection, contract_id: &str) -> Result<Option<ContractSummary>> {
     use rusqlite::OptionalExtension;
     let sql = format!("SELECT {SUMMARY_COLS} FROM v_contract_summary WHERE contract_id = ?1");
-    Ok(conn.query_row(&sql, [contract_id], map_summary).optional()?)
+    Ok(conn
+        .query_row(&sql, [contract_id], map_summary)
+        .optional()?)
 }
 
 pub fn ledger(conn: &Connection, project_id: Option<&str>) -> Result<Vec<LedgerRow>> {
@@ -676,7 +694,9 @@ pub fn ledger(conn: &Connection, project_id: Option<&str>) -> Result<Vec<LedgerR
     };
     match project_id {
         Some(pid) => {
-            let mut stmt = conn.prepare(&format!("{sql} WHERE project_id = ?1 ORDER BY pay_date, payment_no"))?;
+            let mut stmt = conn.prepare(&format!(
+                "{sql} WHERE project_id = ?1 ORDER BY pay_date, payment_no"
+            ))?;
             let rows = stmt.query_map([pid], map)?;
             for r in rows {
                 out.push(r?);
@@ -823,7 +843,13 @@ pub fn summary_with_expected_rate(conn: &Connection) -> Result<Vec<(String, i32,
 
 /// 表结构自检：返回不满足 DB-06 的表清单（评审 M4）。
 pub fn audit_column_violations(conn: &Connection) -> Result<Vec<String>> {
-    let required = ["created_at", "created_by", "updated_at", "updated_by", "version"];
+    let required = [
+        "created_at",
+        "created_by",
+        "updated_at",
+        "updated_by",
+        "version",
+    ];
     let mut tables: Vec<String> = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -900,7 +926,8 @@ pub fn find_contractor_by_name(conn: &Connection, name: &str) -> Result<Option<C
     if t.is_empty() {
         return Ok(None);
     }
-    let sql = "SELECT id, contractor_name, role_type, credit_code, bank_name, bank_account, remark, \
+    let sql =
+        "SELECT id, contractor_name, role_type, credit_code, bank_name, bank_account, remark, \
         is_deleted, version, created_at, created_by, updated_at, updated_by \
         FROM org_contractor WHERE is_deleted = 0 AND contractor_name = ?1 LIMIT 1";
     let c = conn
@@ -1054,11 +1081,7 @@ pub fn delete_attachment(conn: &Connection, id: &str) -> Result<Option<(String, 
 }
 
 /// 该合同是否已上传某一类附件。
-pub fn has_attachment(
-    conn: &Connection,
-    contract_id: &str,
-    kind_code: &str,
-) -> Result<bool> {
+pub fn has_attachment(conn: &Connection, contract_id: &str, kind_code: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM ct_contract_attachment WHERE contract_id = ?1 AND att_type = ?2",
         rusqlite::params![contract_id, kind_code],

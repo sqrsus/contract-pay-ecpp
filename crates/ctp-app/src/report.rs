@@ -67,9 +67,7 @@ impl ReportKind {
             }
             ReportKind::PeriodSummary => "按开单月份归集（V4 口径），仅统计已实付单据",
             ReportKind::SummaryProject => "按所属项目归集，仅统计已实付单据（作废单不计）",
-            ReportKind::SummaryContractor => {
-                "按合同承包单位归集，仅统计已实付单据（作废单不计）"
-            }
+            ReportKind::SummaryContractor => "按合同承包单位归集，仅统计已实付单据（作废单不计）",
             ReportKind::SummaryContract => {
                 "按合同归集（只列区间内有拨款的合同），仅统计已实付单据（作废单不计）"
             }
@@ -170,9 +168,18 @@ pub struct LedgerColumns {
 }
 
 impl LedgerColumns {
-    pub const FULL: Self = LedgerColumns { wide: true, medium: true };
-    pub const COMPACT: Self = LedgerColumns { wide: false, medium: true };
-    pub const TIGHT: Self = LedgerColumns { wide: false, medium: false };
+    pub const FULL: Self = LedgerColumns {
+        wide: true,
+        medium: true,
+    };
+    pub const COMPACT: Self = LedgerColumns {
+        wide: false,
+        medium: true,
+    };
+    pub const TIGHT: Self = LedgerColumns {
+        wide: false,
+        medium: false,
+    };
 }
 
 /// 一个单元格。导出与屏幕显示都通过 `display()` / `yuan()` 取值，不各写一套。
@@ -263,7 +270,8 @@ impl ReportResult {
             })
             .collect();
 
-        let sum = |f: fn(&CategoryRow) -> i64| -> i64 { rows.iter().map(|r| f(r)).sum() };
+        let sum =
+            |f: fn(&CategoryRow) -> i64| -> i64 { Money::sum_saturating(rows.iter().map(&f)) };
         let tb = sum(|r| r.base_amount.cent());
         let tp = sum(|r| r.paid_amount.cent());
         let total_bp = ratio_bp(tp, tb);
@@ -285,13 +293,19 @@ impl ReportResult {
     pub fn period(rows: &[PeriodRow]) -> Self {
         let mut columns = vec![
             ReportColumn::new("period_month", "期间", ColumnKind::Text, 16.0, 180.0),
-            ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 120.0),
+            ReportColumn::new(
+                "payment_count",
+                "单据笔数",
+                ColumnKind::Integer,
+                14.0,
+                120.0,
+            ),
             ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 180.0),
             ReportColumn::new("share", "占期间合计", ColumnKind::Rate, 18.0, 160.0),
         ];
         columns[3].screen_remainder = true;
 
-        let total: i64 = rows.iter().map(|r| r.amount.cent()).sum();
+        let total: i64 = Money::sum_saturating(rows.iter().map(|r| r.amount.cent()));
         let data: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
@@ -307,7 +321,7 @@ impl ReportResult {
         let total_bp = if total > 0 { 10_000 } else { 0 };
         let totals = vec![
             Cell::Text("合计".to_string()),
-            Cell::Integer(rows.iter().map(|r| r.payment_count).sum()),
+            Cell::Integer(Money::sum_saturating(rows.iter().map(|r| r.payment_count))),
             Cell::Money(Money::from_cent(total)),
             Cell::Rate(percent_text(total_bp), total_bp),
         ];
@@ -341,29 +355,47 @@ impl ReportResult {
         // 「按合同」多一列承包单位（R-32 确认口径：合同行信息量大，单独给 5 列）
         let mut columns = if dim == SummaryDim::Contract {
             vec![
-                ReportColumn::new("group_label", dim.key_title(), ColumnKind::Text, 30.0, 220.0),
                 ReportColumn::new(
-                    "sub",
-                    "承包单位",
+                    "group_label",
+                    dim.key_title(),
                     ColumnKind::Text,
-                    20.0,
-                    170.0,
+                    30.0,
+                    220.0,
                 ),
-                ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 110.0),
+                ReportColumn::new("sub", "承包单位", ColumnKind::Text, 20.0, 170.0),
+                ReportColumn::new(
+                    "payment_count",
+                    "单据笔数",
+                    ColumnKind::Integer,
+                    14.0,
+                    110.0,
+                ),
                 ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 170.0),
                 ReportColumn::new("share", "占合计", ColumnKind::Rate, 18.0, 150.0),
             ]
         } else {
             vec![
-                ReportColumn::new("group_label", dim.key_title(), ColumnKind::Text, 30.0, 200.0),
-                ReportColumn::new("payment_count", "单据笔数", ColumnKind::Integer, 14.0, 110.0),
+                ReportColumn::new(
+                    "group_label",
+                    dim.key_title(),
+                    ColumnKind::Text,
+                    30.0,
+                    200.0,
+                ),
+                ReportColumn::new(
+                    "payment_count",
+                    "单据笔数",
+                    ColumnKind::Integer,
+                    14.0,
+                    110.0,
+                ),
                 ReportColumn::new("amount", "支付金额", ColumnKind::Money, 20.0, 170.0),
                 ReportColumn::new("share", "占合计", ColumnKind::Rate, 18.0, 150.0),
             ]
         };
         columns[0].screen_remainder = true;
 
-        let total: i64 = rows.iter().map(|r| r.amount.cent()).sum();
+        let total: i64 = Money::sum_saturating(rows.iter().map(|r| r.amount.cent()));
         let data: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
@@ -391,7 +423,9 @@ impl ReportResult {
         if dim == SummaryDim::Contract {
             totals.push(Cell::Text(String::new()));
         }
-        totals.push(Cell::Integer(rows.iter().map(|r| r.payment_count).sum()));
+        totals.push(Cell::Integer(Money::sum_saturating(
+            rows.iter().map(|r| r.payment_count),
+        )));
         totals.push(Cell::Money(Money::from_cent(total)));
         totals.push(Cell::Rate(percent_text(total_bp), total_bp));
 
@@ -401,7 +435,11 @@ impl ReportResult {
             format!("；筛选：{filter_note}")
         };
         // 区间留空 = 不限；副标题里写明，避免出现「统计区间  ~ 」的空壳
-        let from_txt = if from.trim().is_empty() { "不限" } else { from };
+        let from_txt = if from.trim().is_empty() {
+            "不限"
+        } else {
+            from
+        };
         let to_txt = if to.trim().is_empty() { "不限" } else { to };
         ReportResult {
             kind,
@@ -519,7 +557,7 @@ impl ReportResult {
             .collect();
 
         let sum = |f: fn(&ctp_core::ledger::ContractSummary) -> i64| -> i64 {
-            rows.iter().map(f).sum()
+            Money::sum_saturating(rows.iter().map(f))
         };
         let total_amount = sum(|s| s.total_amount.cent());
         let audit = sum(|s| s.audit_price.map(|m| m.cent()).unwrap_or(0));
@@ -553,10 +591,7 @@ impl ReportResult {
 
     /// 拨款一览（R-33）：按合同筛出的单据；勾选列与操作列属于交互，不进结果。
     /// 合计只累加已实付单据，作废单保留行但不计入金额。
-    pub fn payment_ledger(
-        rows: &[ctp_core::payment::Payment],
-        contract_label: &str,
-    ) -> Self {
+    pub fn payment_ledger(rows: &[ctp_core::payment::Payment], contract_label: &str) -> Self {
         use ctp_core::payment::PaymentStatus;
         let kind = ReportKind::PaymentLedger;
         let mut columns = vec![
@@ -568,11 +603,11 @@ impl ReportResult {
         ];
         columns[3].screen_remainder = true;
 
-        let total: i64 = rows
-            .iter()
-            .filter(|p| p.status != PaymentStatus::Void)
-            .map(|p| p.amount_cent.cent())
-            .sum();
+        let total: i64 = Money::sum_saturating(
+            rows.iter()
+                .filter(|p| p.status != PaymentStatus::Void)
+                .map(|p| p.amount_cent.cent()),
+        );
         let data: Vec<Vec<Cell>> = rows
             .iter()
             .map(|p| {
@@ -645,13 +680,13 @@ fn report(
     }
 }
 
-/// 整数万分比，避免 f64 参与业务比率运算（与 `Rate::ratio` 同口径）。
+/// 整数万分比，避免 f64 参与业务比率运算。
+///
+/// R-39：唯一实现委托 `Rate::ratio`，与 SQL 视图 `pay_rate_bp`、`selfcheck`
+/// 及主业务比率保持同一套四舍五入口径；旧版这里用整数除法直接截断，
+/// 会让报表占比比主业务少 1 bp。分母 <= 0 由 `Rate::ratio` 统一返回 0。
 pub fn ratio_bp(num: i64, den: i64) -> i32 {
-    if den == 0 {
-        return 0;
-    }
-    let v = (num as i128) * 10_000 / (den as i128);
-    v.clamp(i32::MIN as i128, i32::MAX as i128) as i32
+    ctp_core::rate::Rate::ratio(Money::from_cent(num), Money::from_cent(den)).bp()
 }
 
 pub fn percent_text(bp: i32) -> String {
@@ -724,5 +759,34 @@ mod tests {
         let name = r.default_file_name();
         assert!(name.starts_with("支付期间统计_"), "{name}");
         assert!(name.ends_with(".xlsx"), "{name}");
+    }
+
+    /// R-39：报表比率与 `Rate::ratio`（含 SQL 视图）同口径，
+    /// 半值要进位、负分母要返回 0，不再用整数除法截断。
+    #[test]
+    fn 比率统一到四舍五入且边界安全() {
+        // 0.5 bp：旧实现截断成 0，统一后按四舍五入得 1
+        assert_eq!(ratio_bp(1, 20_000), 1);
+        assert_eq!(ratio_bp(3, 20_000), 2, "1.5 bp 应进位到 2");
+        // 半值不进位的一侧
+        assert_eq!(ratio_bp(1, 30_000), 0, "0.333 bp 应为 0");
+        // 分母 <= 0：统一返回 0（旧实现对负分母会给出负数）
+        assert_eq!(ratio_bp(5, 0), 0);
+        assert_eq!(ratio_bp(5, -10), 0);
+        // 逐位一致：所有取样点都等于 Rate::ratio
+        for (n, d) in [
+            (0, 1),
+            (1, 3),
+            (100, 300),
+            (150, 300),
+            (300, 300),
+            (-100, 300),
+        ] {
+            assert_eq!(
+                ratio_bp(n, d),
+                Rate::ratio(Money::from_cent(n), Money::from_cent(d)).bp(),
+                "ratio_bp({n},{d}) 必须与 Rate::ratio 一致"
+            );
+        }
     }
 }

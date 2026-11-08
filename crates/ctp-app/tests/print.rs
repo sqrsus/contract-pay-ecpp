@@ -83,7 +83,7 @@ fn fixture() -> (Connection, String) {
     )
     .unwrap();
     service::save_attachment(
-        &conn,
+        &mut conn,
         &c.id,
         ctp_core::attachment::AttachmentKind::Contract,
         "合同正本.pdf",
@@ -191,16 +191,23 @@ fn 预览渲染两页且版面有实际内容() {
     for page in 0..ctp_app::paper::PAGES_PER_VOUCHER {
         let pv = ctp_app::render_print_page(&vs[0], page, 100.0).expect("渲染失败");
         // 100 dpi 下 A4 横向约 1169 × 827
-        assert!(pv.width > pv.height, "必须是横向：{}×{}", pv.width, pv.height);
+        assert!(
+            pv.width > pv.height,
+            "必须是横向：{}×{}",
+            pv.width,
+            pv.height
+        );
         assert_eq!(pv.rgba.len(), (pv.width * pv.height * 4) as usize);
         let dark = pv
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] < 128 && px[1] < 128 && px[2] < 128)
             .count();
         assert!(dark > 5000, "第 {page} 页几乎没有笔迹（dark={dark}）");
         assert!(
-            pv.rgba.chunks_exact(4).all(|px| px[3] == 255),
+            pv.rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
             "预览必须完全不透明"
         );
     }
@@ -233,7 +240,7 @@ fn 落一份预览供肉眼核对() {
 /// RGBA8（自上而下）→ 24 位 BMP（自下而上，行按 4 字节对齐）。
 #[cfg(windows)]
 fn to_bmp(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let row = ((w as usize * 3 + 3) / 4) * 4;
+    let row = (w as usize * 3).div_ceil(4) * 4;
     let size = row * h as usize;
     let mut out = Vec::with_capacity(54 + size);
     out.extend_from_slice(b"BM");

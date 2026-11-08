@@ -66,7 +66,12 @@ mod tests {
         let paid = Money::from_cent(100);
         let base = Money::from_cent(300);
         let r = Rate::ratio(paid, base);
-        assert_eq!(r.bp(), 3_333, "100/300 应为 3333 bp（33.33%），实得 {}", r.bp());
+        assert_eq!(
+            r.bp(),
+            3_333,
+            "100/300 应为 3333 bp（33.33%），实得 {}",
+            r.bp()
+        );
         assert_ne!(r.bp(), 13_334, "这是除后乘 2 的错误结果");
     }
 

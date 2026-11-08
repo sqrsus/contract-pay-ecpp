@@ -87,10 +87,12 @@ pub fn is_initial(conn: &Connection) -> Result<bool, StoreError> {
 ///
 /// R-31：同时写一条操作日志。日志里只记「已修改」，**不记任何密码痕迹**
 /// （明文、摘要都不写）。
-pub fn change(conn: &Connection, new_password: &str, operator: &str) -> Result<(), StoreError> {
-    db::set_meta(conn, PASSWORD_META_KEY, &digest(new_password), operator)?;
+/// R-39：摘要与日志放进同一个 IMMEDIATE 事务，避免「密码改了但没留痕」。
+pub fn change(conn: &mut Connection, new_password: &str, operator: &str) -> Result<(), StoreError> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    db::set_meta(&tx, PASSWORD_META_KEY, &digest(new_password), operator)?;
     db::insert_audit_log(
-        conn,
+        &tx,
         "sys_meta",
         PASSWORD_META_KEY,
         Some("管理密码"),
@@ -98,6 +100,7 @@ pub fn change(conn: &Connection, new_password: &str, operator: &str) -> Result<(
         Some("管理密码已修改"),
         operator,
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -151,14 +154,14 @@ mod tests {
 
     #[test]
     fn 初始密码是0001且只写一次() {
-        let c = conn();
+        let mut c = conn();
         assert!(!password_set(&c).unwrap());
         assert!(ensure_initial(&c).unwrap(), "首次应写入");
         assert!(password_set(&c).unwrap());
         assert!(is_initial(&c).unwrap());
 
         // 再调一次不应覆盖用户已改的密码
-        change(&c, "8866", "t").unwrap();
+        change(&mut c, "8866", "t").unwrap();
         assert!(!ensure_initial(&c).unwrap(), "已有密码时不应重写");
         assert!(verify(&c, "8866").unwrap());
         assert!(!verify(&c, "0001").unwrap());
@@ -187,7 +190,10 @@ mod tests {
         assert!(validate_new_password("abcd1234").is_ok());
         assert!(validate_new_password("").is_err());
         assert!(validate_new_password("abc").is_err(), "少于 4 位应拒绝");
-        assert!(validate_new_password(&"a".repeat(21)).is_err(), "超过 20 位应拒绝");
+        assert!(
+            validate_new_password(&"a".repeat(21)).is_err(),
+            "超过 20 位应拒绝"
+        );
         assert!(validate_new_password(" 1234").is_err(), "首部空格应拒绝");
     }
 
