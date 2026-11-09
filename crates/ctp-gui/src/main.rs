@@ -27,7 +27,10 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dialogs::{AmountForm, AuditForm, ContractForm, Dialog, PayForm};
+use dialogs::{
+    classify_print_failure, failure_for_outcome, offer_print_failure, AmountForm, AuditForm,
+    ContractForm, Dialog, PayForm, PrintStage,
+};
 use theme::{Palette, ThemeMode};
 use widgets::Tone;
 
@@ -179,6 +182,12 @@ pub struct App {
     pub print_page: usize,
     /// 预览位图纹理及其对应页码，避免每帧重绘
     pub print_tex: Option<(egui::TextureHandle, usize)>,
+    /// R-42：打印失败弹窗的数据。它是不改变 `dialog` 的叠加层，
+    /// 关闭后预览窗、单据、页码、位图全部保留。
+    pub print_failure: Option<crate::dialogs::PrintFailureView>,
+    /// R-42：当前页预览渲染已失败，不再每帧重试，避免重复报错 / 重复弹窗。
+    /// 翻页或重新打开预览时清零。
+    pub print_render_failed: bool,
     /// 主窗口句柄（打印对话框的 owner），未取到时为 0
     pub hwnd: isize,
     /// 拨款管理页「批量打印」的勾选集合
@@ -344,6 +353,8 @@ impl App {
             print_ids: Vec::new(),
             print_page: 0,
             print_tex: None,
+            print_failure: None,
+            print_render_failed: false,
             hwnd: 0,
             print_sel: std::collections::BTreeSet::new(),
             new_contract: ContractForm::default(),
@@ -806,6 +817,10 @@ impl App {
 
     /// 解析版面数据并打开预览。取数与打印同一入口，不存在第二套口径。
     fn load_print_vouchers(&mut self) {
+        // R-42：失败弹窗未关闭期间忽略新的打开预览请求，避免重复弹出。
+        if self.print_failure.is_some() {
+            return;
+        }
         let ids = self.print_ids.clone();
         let out = self
             .db
@@ -816,32 +831,43 @@ impl App {
                 self.print_vouchers = vs;
                 self.print_page = 0;
                 self.print_tex = None;
+                self.print_render_failed = false;
                 self.dialog = Dialog::PrintPreview;
             }
             Some(Ok(_)) => self.error("没有可打印的拨款单"),
-            Some(Err(e)) => self.error(format!("准备打印数据失败：{e}")),
+            Some(Err(e)) => {
+                self.show_print_failure(classify_print_failure(PrintStage::Prepare, &e))
+            }
             None => self.error("数据库未打开"),
         }
     }
 
     /// 打印：直接弹系统「打印」对话框并出纸，不经过 Word / PDF。
     ///
-    /// 用户取消对话框不算错误（`Ok(0)`）；其余失败一律报错中止。
+    /// 用户取消对话框不算错误（`Ok(0)`）；只有 `Err` 才展示统一失败弹窗。
     pub fn print_now(&mut self) {
+        // R-42：失败弹窗未关闭期间忽略重复点击，不再发起第二次出纸。
+        if self.print_failure.is_some() {
+            return;
+        }
         if self.print_vouchers.is_empty() {
             self.error("没有可打印的拨款单");
             return;
         }
         let vs = self.print_vouchers.clone();
         let name = ctp_app::print::doc_name(&vs);
-        match ctp_app::print_vouchers_now(self.hwnd, &vs, &name) {
-            Ok(0) => {}
-            Ok(pages) => self.success(format!(
-                "已向打印机发送 {} 张单据、共 {} 页",
-                vs.len(),
-                pages
-            )),
-            Err(e) => self.error(e.to_string()),
+        let outcome = ctp_app::print_vouchers_now(self.hwnd, &vs, &name);
+        if let Some(view) = failure_for_outcome(PrintStage::Print, &outcome) {
+            self.show_print_failure(view);
+        } else if let Ok(pages) = outcome {
+            // Ok(0) = 用户主动取消，保持静默；成功才发绿色提示条。
+            if pages > 0 {
+                self.success(format!(
+                    "已向打印机发送 {} 张单据、共 {} 页",
+                    vs.len(),
+                    pages
+                ));
+            }
         }
     }
 
@@ -917,6 +943,12 @@ impl App {
     pub fn show_import_result(&mut self, view: crate::dialogs::ImportResultView) {
         self.import_result = Some(view);
         self.dialog = Dialog::ImportResult;
+    }
+
+    /// R-42：打印失败的唯一入口。只弹统一卡片弹窗，不再发红色提示条；
+    /// 已有未关闭的失败弹窗时忽略后续失败，保留首次原因，避免重复弹出。
+    pub fn show_print_failure(&mut self, view: crate::dialogs::PrintFailureView) {
+        let _ = offer_print_failure(&mut self.print_failure, view);
     }
 
     /// 上一帧登记的批量导入，在这一帧真正执行（R-39「处理中」状态的落地）。
@@ -1147,6 +1179,8 @@ impl App {
         if logout {
             self.role = None;
             crate::dialogs::dismiss_import_result(&mut self.dialog, &mut self.import_result);
+            crate::dialogs::dismiss_print_failure(&mut self.print_failure);
+            self.print_render_failed = false;
             self.confirm = None;
             self.modal_contract = None;
             self.screen = Screen::Dashboard;

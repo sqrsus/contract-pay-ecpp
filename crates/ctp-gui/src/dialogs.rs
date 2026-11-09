@@ -60,6 +60,189 @@ pub fn dismiss_import_result(dialog: &mut Dialog, result: &mut Option<ImportResu
     *result = None;
 }
 
+// ---------------------------------------------------------------- 打印失败提示（R-42）
+
+/// 打印失败的三个来源：准备打印数据、真正出纸、生成预览画面。
+///
+/// 底层抛的都是同一个 `PrintError`，但同一个错误在不同来源下给用户的解释与建议
+/// 并不相同，所以分类时必须带上来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrintStage {
+    Prepare,
+    Print,
+    Preview,
+}
+
+/// 打印失败弹窗的全部内容。
+///
+/// `reason` / `solution` 是给用户看的人话，`technical` 是原始错误串，
+/// 只作为底部小字「技术信息」附在弹窗里，便于管理员排查。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrintFailureView {
+    /// 固定标题，所有失败一致。
+    pub title: &'static str,
+    /// 短标签，显示在标题右侧的徽标里。
+    pub kind: &'static str,
+    pub reason: String,
+    pub solution: String,
+    pub technical: String,
+}
+
+const PRINT_FAILURE_TITLE: &str = "打印失败";
+
+fn failure_view(
+    kind: &'static str,
+    reason: impl Into<String>,
+    solution: impl Into<String>,
+    technical: String,
+) -> PrintFailureView {
+    PrintFailureView {
+        title: PRINT_FAILURE_TITLE,
+        kind,
+        reason: reason.into(),
+        solution: solution.into(),
+        technical,
+    }
+}
+
+/// 未知原因 / 拿不到原因时的统一兜底：所有未归类错误返回完全相同的一份内容，
+/// 避免同一个故障在不同入口出现不同说法。
+fn unknown_failure(technical: String) -> PrintFailureView {
+    failure_view(
+        "原因未获取",
+        "未获取到本次打印失败的具体原因。",
+        "请检查打印机是否就绪以及 Windows 打印队列，然后重试；若持续失败，请联系管理员。",
+        technical,
+    )
+}
+
+/// 把底层 `PrintError` 翻译成用户能看懂、能照做的提示。
+///
+/// 只在 GUI 层做映射，不改动 `ctp-app` 的公共 API：出纸 / 取数 / 预览三条链路
+/// 继续抛原来的错误，其他模块零影响。
+pub fn classify_print_failure(
+    stage: PrintStage,
+    e: &ctp_app::print::PrintError,
+) -> PrintFailureView {
+    let technical = e.to_string();
+    match stage {
+        PrintStage::Prepare => prepare_failure(e, technical),
+        PrintStage::Preview => failure_view(
+            "预览渲染失败",
+            "预览画面未能生成；本次打印数据已经准备完成，出纸链路不受影响。",
+            "请点击「关闭」返回预览窗后直接点「打印」出纸；若反复出现，请重启程序后再试。",
+            technical,
+        ),
+        PrintStage::Print => print_reason(e, technical),
+    }
+}
+
+fn prepare_failure(e: &ctp_app::print::PrintError, technical: String) -> PrintFailureView {
+    use ctp_app::print::PrintError as E;
+    let detail = match e {
+        E::Voided(no) => format!("所选拨款单 {no} 已作废，按口径不允许打印。"),
+        E::MissingField(f) => format!("打印所需的「{f}」字段缺失，无法生成完整版面。"),
+        E::NothingSelected => "没有选中任何拨款单，无法生成打印数据。".into(),
+        E::Store(err) => format!("读取打印数据失败：{err}"),
+        E::Print(msg) => format!("打印数据准备未完成：{msg}"),
+        E::Cancelled => "打印数据准备被取消。".into(),
+    };
+    failure_view(
+        "打印数据准备失败",
+        format!("打印数据准备失败，未向打印机发送任何内容。{detail}"),
+        "请刷新页面后重新选择拨款单再打印；若仍失败，请联系管理员检查单据数据。",
+        technical,
+    )
+}
+
+/// 出纸阶段的 7 类固定消息 → 用户文案。顺序即优先级：
+/// 先判纸张方向 / 对话框 / 作业启动，再判带页码的中途失败，最后判作业结束。
+fn print_reason(e: &ctp_app::print::PrintError, technical: String) -> PrintFailureView {
+    use ctp_app::print::PrintError as E;
+    let E::Print(msg) = e else {
+        // 出纸阶段理论上只会拿到 Print(..)；万一拿到别的变体也不能把原因吞掉。
+        return failure_view(
+            "打印数据准备失败",
+            format!("打印未完成，未向打印机发送任何内容：{technical}"),
+            "请刷新页面后重新选择单据再打印；若仍失败，请联系管理员。",
+            technical,
+        );
+    };
+    if msg.contains("纵向") || msg.contains("纸型") {
+        return failure_view(
+            "纸张方向不符",
+            "打印机当前设置为纵向，A4 横向的单据会被裁掉右半边，程序已拦下本次打印。",
+            "在系统打印对话框的「首选项」里把纸张方向改为「横向」（A4），然后重新点击「打印」。",
+            technical,
+        );
+    }
+    if msg.contains("打印对话框") || msg.contains("没有返回打印机句柄") {
+        return failure_view(
+            "打印对话框异常",
+            "系统打印对话框未能正常打开，或没有返回可用的打印机句柄。",
+            "请确认已安装打印机并设为默认打印机；关闭后重新打开程序再试。",
+            technical,
+        );
+    }
+    if msg.contains("无法开始打印作业") {
+        return failure_view(
+            "打印机未就绪",
+            "打印作业没能启动，通常是打印机未开机、断线、缺纸或队列卡住。",
+            "请检查打印机开机与连线、补足纸张、清空打印队列后重新打印。",
+            technical,
+        );
+    }
+    if msg.starts_with("第 ") && (msg.contains("页开始失败") || msg.contains("页输出失败"))
+    {
+        let page: String = msg.chars().filter(|c| c.is_ascii_digit()).collect();
+        return failure_view(
+            "出纸中断",
+            format!("第 {page} 页输出中断，多为缺纸或卡纸导致；本次作业已中止。"),
+            "请处理卡纸 / 补足纸张后重新打印；已经输出的纸张请勿重复使用，避免重复报销。",
+            technical,
+        );
+    }
+    if msg.contains("打印作业结束失败") || msg.contains("释放打印机句柄失败") {
+        return failure_view(
+            "作业未正常结束",
+            "打印作业未能正常提交，纸张可能未完整输出。",
+            "请到 Windows 打印队列确认是否有卡住的任务，清理后重试；重打前先确认是否已经出纸，避免重复出纸。",
+            technical,
+        );
+    }
+    unknown_failure(technical)
+}
+
+/// 只有 `Err` 才生成失败弹窗；`Ok(0)`（用户取消）与 `Ok(n)`（成功）一律返回 None。
+///
+/// 用泛型接住 `Result<usize, _>`（出纸）与 `Result<Vec<Voucher>, _>`（取数），
+/// 让「成功 / 取消不弹窗」这条边界由类型而不是调用方自觉来保证。
+pub fn failure_for_outcome<T>(
+    stage: PrintStage,
+    outcome: &std::result::Result<T, ctp_app::print::PrintError>,
+) -> Option<PrintFailureView> {
+    outcome
+        .as_ref()
+        .err()
+        .map(|e| classify_print_failure(stage, e))
+}
+
+/// 同一时间只允许一个打印失败弹窗：已有未关闭的弹窗时忽略后续失败，
+/// 保留首次原因，不重复弹出、不互相覆盖。返回是否真正展示了新弹窗。
+pub fn offer_print_failure(slot: &mut Option<PrintFailureView>, v: PrintFailureView) -> bool {
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(v);
+    true
+}
+
+/// 关闭打印失败弹窗：只清失败提示，预览单据 / 页码 / 位图一律保留，
+/// 让用户关掉提示就能直接再点「打印」。
+pub fn dismiss_print_failure(view: &mut Option<PrintFailureView>) {
+    *view = None;
+}
+
 impl ImportResultView {
     pub fn from_report(r: &ctp_app::batch::ImportReport) -> Self {
         ImportResultView {
@@ -335,7 +518,7 @@ fn combo(
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     // 弹窗打开时压暗底图，把注意力收到弹窗上。
     // 该图层在弹窗图层之前创建，因此始终绘制在弹窗下方；它不参与交互，点击可正常穿透到按钮。
-    if app.dialog != Dialog::None || app.confirm.is_some() {
+    if app.dialog != Dialog::None || app.confirm.is_some() || app.print_failure.is_some() {
         let alpha = if app.mode.is_dark() { 130 } else { 55 };
         // 画在背景层末尾：盖住主界面，但仍在 Order::Middle 的窗口之下
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
@@ -375,6 +558,92 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
+    }
+    // R-42：打印失败弹窗是叠加层，不改变 `app.dialog`。预览窗仍在下面，
+    // 关掉提示即可回到原来的单据与页码；用 Foreground 保证它盖在预览窗之上。
+    if app.print_failure.is_some() {
+        print_failure_dialog(app, ctx);
+    }
+}
+
+/// 打印失败：所有打印失败的唯一展示入口。
+///
+/// 标题 / 失败原因 / 建议操作 / 技术信息 / 关闭方式齐备；只认窗口内的「关闭」按钮，
+/// Esc 与点击弹窗外部都不会关闭，也不额外再发一条红色提示条。
+fn print_failure_dialog(app: &mut App, ctx: &egui::Context) {
+    let Some(view) = app.print_failure.clone() else {
+        return;
+    };
+    let p = app.pal;
+    let mut close = false;
+    egui::Window::new(view.title)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(egui::Stroke::new(1.0_f32, p.border))
+                .rounding(egui::Rounding::same(14.0))
+                .inner_margin(egui::Margin::same(20.0)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(500.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(view.title)
+                        .size(17.0)
+                        .strong()
+                        .color(p.danger),
+                );
+                widgets::badge(ui, &p, view.kind, Tone::Danger);
+            });
+            ui.add_space(10.0);
+            widgets::divider(ui, &p);
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("失败原因").size(12.5).strong().color(p.text));
+            ui.add_space(2.0);
+            ui.label(RichText::new(&view.reason).size(13.0).color(p.text));
+            ui.add_space(10.0);
+
+            widgets::soft_box(&p, p.primary_soft).show(ui, |ui| {
+                ui.set_width(480.0);
+                ui.label(
+                    RichText::new("建议操作")
+                        .size(12.5)
+                        .strong()
+                        .color(p.primary),
+                );
+                ui.add_space(2.0);
+                ui.label(RichText::new(&view.solution).size(12.5).color(p.text));
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("技术信息：{}", view.technical))
+                    .size(11.0)
+                    .color(p.text_muted),
+            );
+
+            ui.add_space(10.0);
+            widgets::divider(ui, &p);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("关闭方式：点击下方「关闭」返回；按 Esc 或点击弹窗外部不会关闭。")
+                    .size(11.0)
+                    .color(p.text_muted),
+            );
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        dismiss_print_failure(&mut app.print_failure);
     }
 }
 
@@ -1489,7 +1758,12 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
     let mut do_print = false;
 
     // ---- 当前页位图（带缓存，只在换页/首次时渲染）
-    if app.print_tex.as_ref().map(|(_, i)| *i) != Some(page) {
+    // R-42：失败弹窗未关闭、或本页已经渲染失败时不再重试，
+    // 避免每帧重复报错 / 重复弹窗；预览区会显示「预览渲染失败」占位。
+    if app.print_failure.is_none()
+        && !app.print_render_failed
+        && app.print_tex.as_ref().map(|(_, i)| *i) != Some(page)
+    {
         let rendered = {
             let v = &app.print_vouchers[page / ctp_app::paper::PAGES_PER_VOUCHER];
             let sub = page % ctp_app::paper::PAGES_PER_VOUCHER;
@@ -1510,9 +1784,9 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
             }
             Err(e) => {
                 app.print_tex = None;
-                app.error(format!("渲染预览失败：{e}"));
-                app.dialog = Dialog::None;
-                return;
+                app.print_render_failed = true;
+                // 预览失败也走统一弹窗；预览窗保留在原页，关掉提示即可直接出纸。
+                app.show_print_failure(classify_print_failure(PrintStage::Preview, &e));
             }
         }
     }
@@ -1556,10 +1830,12 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
             let can_prev = page > 0;
             if widgets::ghost_button_sm_on(ui, &p, "上一页", can_prev).clicked() && can_prev {
                 app.print_page = page - 1;
+                app.print_render_failed = false;
             }
             let can_next = page + 1 < total_pages;
             if widgets::ghost_button_sm_on(ui, &p, "下一页", can_next).clicked() && can_next {
                 app.print_page = page + 1;
+                app.print_render_failed = false;
             }
             ui.add_space(10.0);
             let sheet_no = page / ctp_app::paper::PAGES_PER_VOUCHER + 1;
@@ -1602,7 +1878,8 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
         });
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if widgets::primary_button(ui, &p, "打印", true)
+            // 失败弹窗未关闭时禁掉「打印」，与 print_now 里的守卫一起挡住重复提交。
+            if widgets::primary_button(ui, &p, "打印", app.print_failure.is_none())
                 .on_hover_text("弹系统打印对话框并输出")
                 .clicked()
             {
@@ -1625,6 +1902,8 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
         app.print_ids.clear();
         app.print_tex = None;
         app.print_page = 0;
+        app.print_render_failed = false;
+        dismiss_print_failure(&mut app.print_failure);
     }
 }
 
@@ -2399,6 +2678,11 @@ pub fn new_payment_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ctp_app::print::PrintError;
+
+    fn pv(stage: PrintStage, msg: &str) -> PrintFailureView {
+        classify_print_failure(stage, &PrintError::Print(msg.into()))
+    }
 
     #[test]
     fn 关闭导入结果后弹窗与数据都被清除() {
@@ -2416,5 +2700,110 @@ mod tests {
             result.is_none(),
             "import_result 必须清空，避免下次打开残留旧摘要"
         );
+    }
+
+    #[test]
+    fn 出纸常见失败按类型给出原因和解决方案() {
+        // （原始错误, 期望短标签, 原因或建议里必须出现的用户可操作关键词）
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "当前打印机纸型是纵向（210×297 mm），单据需要 A4 横向",
+                "纸张方向不符",
+                "横向",
+            ),
+            (
+                "打印对话框失败（公共对话框错误码 2），不是用户取消",
+                "打印对话框异常",
+                "默认打印机",
+            ),
+            (
+                "打印对话框没有返回打印机句柄",
+                "打印对话框异常",
+                "默认打印机",
+            ),
+            (
+                "无法开始打印作业（检查打印机是否就绪）",
+                "打印机未就绪",
+                "打印队列",
+            ),
+            ("第 3 页输出失败", "出纸中断", "第 3 页"),
+            (
+                "打印作业结束失败，纸张可能未完整输出，请检查打印机队列后重试",
+                "作业未正常结束",
+                "打印队列",
+            ),
+            ("释放打印机句柄失败", "作业未正常结束", "打印队列"),
+        ];
+        for (msg, kind, hint) in cases {
+            let v = pv(PrintStage::Print, msg);
+            assert_eq!(v.title, "打印失败");
+            assert_eq!(v.kind, *kind, "错误：{msg}");
+            assert!(!v.reason.is_empty() && !v.solution.is_empty(), "{msg}");
+            assert!(
+                v.reason.contains(hint) || v.solution.contains(hint),
+                "{msg} -> 原因 {} / 建议 {}",
+                v.reason,
+                v.solution
+            );
+            assert!(v.technical.contains(msg), "技术信息须保留原文：{msg}");
+        }
+    }
+
+    #[test]
+    fn 未知原因统一兜底且保留原始技术信息() {
+        let a = pv(PrintStage::Print, "驱动返回了未预期的结果 A");
+        let b = pv(PrintStage::Print, "驱动返回了未预期的结果 B");
+        assert_eq!(a.title, "打印失败");
+        assert_eq!(a.kind, "原因未获取");
+        assert_eq!(a.reason, b.reason, "兜底原因必须完全一致");
+        assert_eq!(a.solution, b.solution, "兜底建议必须完全一致");
+        assert_ne!(a.technical, b.technical, "原始错误仍要各自保留");
+        assert!(a.technical.contains("驱动返回了未预期的结果 A"));
+    }
+
+    #[test]
+    fn 取数与预览失败给出对应来源的文案() {
+        let v = classify_print_failure(
+            PrintStage::Prepare,
+            &PrintError::Voided("PM-2026-001".into()),
+        );
+        assert_eq!(v.kind, "打印数据准备失败");
+        assert!(v.reason.contains("已作废"));
+        assert!(v.reason.contains("未向打印机发送任何内容"));
+        assert!(v.solution.contains("刷新页面"));
+
+        let p = pv(PrintStage::Preview, "创建预览画布失败");
+        assert_eq!(p.kind, "预览渲染失败");
+        assert!(p.reason.contains("出纸链路不受影响"));
+        assert!(p.solution.contains("直接点「打印」"));
+    }
+
+    #[test]
+    fn 成功与取消都不生成失败弹窗() {
+        let cancelled: std::result::Result<usize, PrintError> = Ok(0);
+        let success: std::result::Result<usize, PrintError> = Ok(4);
+        let failed: std::result::Result<usize, PrintError> =
+            Err(PrintError::Print("第 1 页输出失败".into()));
+        assert!(failure_for_outcome(PrintStage::Print, &cancelled).is_none());
+        assert!(failure_for_outcome(PrintStage::Print, &success).is_none());
+        let v = failure_for_outcome(PrintStage::Print, &failed).expect("失败必须生成弹窗");
+        assert_eq!(v.title, "打印失败");
+    }
+
+    #[test]
+    fn 失败弹窗同时只存在一个且关闭后可再次弹出() {
+        let mut slot = None;
+        let first = pv(PrintStage::Print, "无法开始打印作业（检查打印机是否就绪）");
+        let second = pv(PrintStage::Print, "打印作业结束失败");
+        assert!(offer_print_failure(&mut slot, first.clone()));
+        assert!(
+            !offer_print_failure(&mut slot, second.clone()),
+            "未关闭时必须忽略后续失败"
+        );
+        assert_eq!(slot.as_ref(), Some(&first), "必须保留首次原因");
+        dismiss_print_failure(&mut slot);
+        assert!(slot.is_none(), "关闭只清提示，预览单据与页码由调用方保留");
+        assert!(offer_print_failure(&mut slot, second), "关闭后可再次弹出");
+        assert_eq!(slot.as_ref().map(|v| v.kind), Some("作业未正常结束"));
     }
 }

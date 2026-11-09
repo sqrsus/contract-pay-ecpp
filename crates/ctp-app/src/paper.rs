@@ -461,11 +461,14 @@ fn sheet_application(c: &mut dyn Canvas, v: &Voucher) {
         }
     }
 
-    // 签字行：跨列区间必须与下面网格线画出的合并格一致。
+    // 签字行按版式基准模板 ROW 2 的合并格：三个标签各占一个单列（col 0 / 3 / 6），
+    // 其后各跟一个 span=2 的空白手签格（col 1-2 / 4-5 / 7-8）。
+    // R-40：此前两个「项目牵头部门…」标签错画进了前面的空白手签格，
+    // 与竖线分格正好差一格；整体后移一个合并格，文字才落在模板给定的单列里。
     let sign = [
         (S2_COLS[0], S2_COLS[1], "经办人："),
-        (S2_COLS[1], S2_COLS[3], "项目牵头部门\n负责人："),
-        (S2_COLS[4], S2_COLS[6], "项目牵头部门\n分管领导意见："),
+        (S2_COLS[3], S2_COLS[4], "项目牵头部门\n负责人："),
+        (S2_COLS[6], S2_COLS[7], "项目牵头部门\n分管领导意见："),
     ];
     for (a, b, txt) in sign {
         fit_in(
@@ -574,18 +577,24 @@ mod tests {
         texts: Vec<String>,
         /// （文字, 样式），用于断言字体族 / 字号 / 加粗。
         styles: Vec<(String, TextStyle)>,
+        /// （文字, x, 宽），用于断言横向位置落在正确的格内。
+        placed: Vec<(String, f32, f32)>,
+        /// 所有线段坐标，用于断言网格分格。
+        segs: Vec<(f32, f32, f32, f32)>,
     }
 
     impl Canvas for Rec {
-        fn line(&mut self, _x1: f32, _y1: f32, _x2: f32, _y2: f32) {
+        fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
             self.lines += 1;
+            self.segs.push((x1, y1, x2, y2));
         }
         fn rect(&mut self, _x: f32, _y: f32, _w: f32, _h: f32) {
             self.lines += 4;
         }
-        fn draw_text(&mut self, _x: f32, _y: f32, _w: f32, _h: f32, s: &str, st: TextStyle) {
+        fn draw_text(&mut self, x: f32, _y: f32, w: f32, _h: f32, s: &str, st: TextStyle) {
             self.texts.push(s.to_string());
             self.styles.push((s.to_string(), st));
+            self.placed.push((s.to_string(), x, w));
         }
         fn measure_text(&mut self, text: &str, _st: TextStyle, _w: f32) -> f32 {
             // 每 20 字一行，行高按字号估算（足够驱动降字号逻辑）
@@ -666,6 +675,56 @@ mod tests {
         assert_eq!(a.lines, 25 + 7);
         // 表 2：10 列贯穿前两行 + 签字行 7 条 + 4 条横线
         assert_eq!(b.lines, 10 + 7 + 4);
+    }
+
+    /// R-40：表 2 签字行（第三行）三个标签必须落在版式基准模板给定的单列格
+    /// （col 0 / 3 / 6），不能画进前一个 span=2 的空白手签格；竖线分格同步锁定。
+    #[test]
+    fn 表2签字行标签落在模板单列格() {
+        let mut rec = Rec::default();
+        paint(&mut rec, &sample(), 1);
+
+        let expected = [
+            ("经办人：", S2_COLS[0], S2_COLS[1]),
+            ("项目牵头部门\n负责人：", S2_COLS[3], S2_COLS[4]),
+            ("项目牵头部门\n分管领导意见：", S2_COLS[6], S2_COLS[7]),
+        ];
+        for (txt, x0, x1) in expected {
+            let p = rec
+                .placed
+                .iter()
+                .find(|(t, _, _)| t.as_str() == txt)
+                .unwrap_or_else(|| panic!("版面上没有这段文字：{txt}"));
+            assert!(
+                (p.1 - (x0 + PAD)).abs() < 0.001,
+                "「{txt}」起点应落在 {x0} 格内，实际 {}",
+                p.1
+            );
+            assert!(
+                (p.2 - (x1 - x0 - PAD * 2.0)).abs() < 0.001,
+                "「{txt}」宽度应为整格减两侧留白，实际 {}",
+                p.2
+            );
+        }
+
+        let mut verticals: Vec<f32> = rec
+            .segs
+            .iter()
+            .filter(|(x1, y1, x2, y2)| {
+                (x1 - x2).abs() < 0.001
+                    && (y1 - S2_ROWS[2]).abs() < 0.001
+                    && (y2 - S2_ROWS[3]).abs() < 0.001
+            })
+            .map(|(x1, _, _, _)| *x1)
+            .collect();
+        verticals.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(
+            verticals,
+            vec![
+                S2_COLS[0], S2_COLS[1], S2_COLS[3], S2_COLS[4], S2_COLS[6], S2_COLS[7], S2_COLS[9],
+            ],
+            "签字行竖线必须按模板的 6 个合并格分界"
+        );
     }
 
     #[test]
