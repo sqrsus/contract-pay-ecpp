@@ -590,7 +590,7 @@ pub struct EditContractForm {
     /// 只读展示，不可修改
     pub contract_no: String,
     pub name: String,
-    /// 项目文本「编码 名称」，与新建页同一套联想与解析规则
+    /// 项目名称（不含编码），与新建时手输的内容一致；编码只在联想候选里作为检索线索
     pub project_text: String,
     pub contractor_text: String,
     pub party_a: String,
@@ -620,6 +620,8 @@ impl EditContractForm {
     /// 用当前合同预填表单。
     ///
     /// 项目 / 承包单位 / 招标代理要转成展示名，否则用户打开看到的是内部 id。
+    /// 项目只填**名称**、不带编码：新建时用户录的就是名称，两处显示保持一致，
+    /// 也避免编码前缀留在框里被误当成「已选定的项目」（R-51）。
     /// `planned_end_auto` 留空：进入修改页时既有交工日期一律视为「已有值」，
     /// 只要用户不改工期与开工日，就不会被自动计算覆盖。
     pub fn from_contract(
@@ -630,7 +632,7 @@ impl EditContractForm {
         let project_text = projects
             .iter()
             .find(|p| p.id == c.project_id)
-            .map(|p| format!("{} {}", p.project_code, p.project_name))
+            .map(|p| p.project_name.clone())
             .unwrap_or_default();
         let contractor_text = contractors
             .iter()
@@ -1054,6 +1056,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         || app.confirm.is_some()
         || app.print_failure.is_some()
         || app.print_success.is_some()
+        || app.edit_done.is_some()
     {
         let alpha = if app.mode.is_dark() { 130 } else { 55 };
         // 画在背景层末尾：盖住主界面，但仍在 Order::Middle 的窗口之下
@@ -1104,6 +1107,10 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         print_failure_dialog(app, ctx);
     } else if app.print_success.is_some() {
         print_success_dialog(app, ctx);
+    }
+    // R-51：主档修改成功后的「本次修改」弹窗，同样是与 Dialog 解耦的叠加层
+    if app.edit_done.is_some() {
+        edit_done_dialog(app, ctx);
     }
 }
 
@@ -1484,6 +1491,54 @@ fn ac_field(
     .inner
 }
 
+/// 带字段标签的联想输入框：点选候选时写入 `pick` 换算出的值。
+// 与 `ac_field` 同一组入参，只是多一个回填换算。
+#[allow(clippy::too_many_arguments)]
+fn ac_field_pick(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    id: &str,
+    text: &mut String,
+    hints: &[String],
+    hint_text: &str,
+    w: f32,
+    mode: widgets::SuggestMode,
+    pick: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        widgets::autocomplete_pick(ui, id, p, text, hints, w, hint_text, mode, pick)
+    })
+    .inner
+}
+
+/// 项目候选对：（列表里显示的「编码 名称」，回填用的「名称」）。
+///
+/// 列表显示带编码是为了能用编码检索；回填只写名称，保证修改窗里看到的内容
+/// 与新建时手输的一致（R-51）。
+fn project_sources(projects: &[ctp_core::project::Project]) -> Vec<(String, String)> {
+    projects
+        .iter()
+        .map(|x| {
+            (
+                format!("{} {}", x.project_code, x.project_name),
+                x.project_name.clone(),
+            )
+        })
+        .collect()
+}
+
+/// 点选项目候选后回填的名称；候选之外的原文原样保留（允许录新项目）。
+fn pick_project_name(sources: &[(String, String)], picked: &str) -> String {
+    sources
+        .iter()
+        .find(|(label, _)| label == picked)
+        .map(|(_, name)| name.clone())
+        .unwrap_or_else(|| picked.to_string())
+}
+
 /// 新建合同专用紧凑卡片：内边距 12（全局卡片为 16），为「一屏不滚动」省高度。
 fn form_card(p: &Palette) -> egui::Frame {
     egui::Frame::none()
@@ -1497,11 +1552,8 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
 
     // 候选先克隆出来：闭包里要可变借用 `app.new_contract`，不能再读 `app.projects`
-    let project_hints: Vec<String> = app
-        .projects
-        .iter()
-        .map(|x| format!("{} {}", x.project_code, x.project_name))
-        .collect();
+    let project_src = project_sources(&app.projects);
+    let project_hints: Vec<String> = project_src.iter().map(|(l, _)| l.clone()).collect();
     let mut unit_hints: Vec<String> = app
         .contractors
         .iter()
@@ -1600,7 +1652,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                     field(ui, &p, "* 合同名称", 218.0, &mut app.new_contract.name);
                                     ac_field(ui, &p, "* 发包人（甲方）", "party_a", &mut app.new_contract.party_a, &owner_hints, "输入名称，可从已有业主中联想", 218.0, widgets::SuggestMode::ShowAllOnEmpty);
                                     ui.end_row();
-                                    ac_field(ui, &p, "* 所属项目", "project", &mut app.new_contract.project_text, &project_hints, "输入编码或名称后联想", 218.0, widgets::SuggestMode::TypedOnly);
+                                    ac_field_pick(ui, &p, "* 所属项目", "project", &mut app.new_contract.project_text, &project_hints, "输入编码或名称后联想", 218.0, widgets::SuggestMode::TypedOnly, &|s| pick_project_name(&project_src, s));
                                     ac_field(ui, &p, "* 承包单位", "contractor", &mut app.new_contract.contractor_text, &unit_hints, "输入名称后联想已有单位", 218.0, widgets::SuggestMode::TypedOnly);
                                     ui.end_row();
                                     field(ui, &p, "项目负责人", 218.0, &mut app.new_contract.project_leader);
@@ -2038,11 +2090,8 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
     }
 
     // 联想候选先克隆：闭包里要可变借用表单，不能再读 `app.projects`
-    let project_hints: Vec<String> = app
-        .projects
-        .iter()
-        .map(|x| format!("{} {}", x.project_code, x.project_name))
-        .collect();
+    let project_src = project_sources(&app.projects);
+    let project_hints: Vec<String> = project_src.iter().map(|(l, _)| l.clone()).collect();
     let mut unit_hints: Vec<String> = app
         .contractors
         .iter()
@@ -2159,7 +2208,7 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                                 });
                                 ui.end_row();
 
-                                ac_field(
+                                ac_field_pick(
                                     ui,
                                     &p,
                                     "* 所属项目",
@@ -2169,6 +2218,7 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                                     "输入编码或名称后联想",
                                     300.0,
                                     widgets::SuggestMode::TypedOnly,
+                                    &|s| pick_project_name(&project_src, s),
                                 );
                                 ac_field(
                                     ui,
@@ -2420,15 +2470,31 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
     }
 
     if let Some((input, reason)) = submit {
+        // 弹窗里要显示原因，但 reason 会被 move 进闭包，先留一份
+        let reason_text = reason.clone();
         match app.exec(move |conn| {
             service::update_contract_master(conn, &contract_id, input, &reason, "界面用户")
         }) {
-            Ok(c) => {
+            Ok(outcome) => {
                 app.dialog = Dialog::None;
                 app.edit_contract = None;
                 app.refresh();
-                app.select(&c.id);
-                app.success(format!("合同 {} 信息已更新", c.contract_no));
+                app.select(&outcome.contract.id);
+                // 成功不再是 6 秒绿条：改成弹窗，把「改了哪些字段、原来是什么」列清楚
+                app.edit_done = Some(EditDoneView {
+                    contract_no: outcome.contract.contract_no.clone(),
+                    contract_name: outcome.contract.contract_name.clone(),
+                    reason: reason_text,
+                    changes: outcome
+                        .changes
+                        .iter()
+                        .map(|c| EditDoneRow {
+                            field: c.field.to_string(),
+                            old: c.old.clone(),
+                            new: c.new.clone(),
+                        })
+                        .collect(),
+                });
             }
             Err(e) => {
                 if let Some(f) = app.edit_contract.as_mut() {
@@ -2438,7 +2504,191 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
         }
     }
 }
-// ---------------------------------------------------------------- 审计价
+/// 「本次修改了什么」弹窗的数据（R-51）。
+///
+/// 与操作日志同源：日志记 `EDIT_CONTRACT`，弹窗把同一份 diff 逐条列给用户看。
+/// 长文本（付款条款 / 备注）在这里显示全文，日志里仍只记「已修改」。
+#[derive(Clone)]
+pub struct EditDoneView {
+    pub contract_no: String,
+    pub contract_name: String,
+    pub reason: String,
+    pub changes: Vec<EditDoneRow>,
+}
+
+/// 弹窗里的一行：字段名 + 原值 + 新值。
+#[derive(Clone)]
+pub struct EditDoneRow {
+    pub field: String,
+    pub old: String,
+    pub new: String,
+}
+
+impl EditDoneView {
+    /// 截图核对用的样例（`CTP_DIALOG=edit_done` 时构造），不参与业务逻辑。
+    ///
+    /// 里面故意放一条长文本备注，用来核对折行与滚动是否正常。
+    pub fn sample(contract_no: &str, contract_name: &str) -> Self {
+        let row = |f: &str, o: &str, n: &str| EditDoneRow {
+            field: f.into(),
+            old: o.into(),
+            new: n.into(),
+        };
+        Self {
+            contract_no: contract_no.into(),
+            contract_name: contract_name.into(),
+            reason: "项目归属更正".into(),
+            changes: vec![
+                row("所属项目", "测试项目", "另一个项目"),
+                row("合同名称", contract_name, "（更名后的合同）"),
+                row("工期", "90 日历天", "120 日历天"),
+                row("计划交工", "2026-05-29", "2026-06-28"),
+                row("备注", "—", "补充说明：本合同为二期扩建配套工程，含场平、管网及临时道路，付款按季度计量，质保金比例 3%，缺陷责任期 24 个月。"),
+            ],
+        }
+    }
+}
+
+/// 保存成功后的「本次修改」弹窗。
+///
+/// 是叠加层，不占用 `Dialog`；只认「关闭」按钮，Esc 与点外部都不关，
+/// 保证用户至少看一眼自己改了什么。
+fn edit_done_dialog(app: &mut App, ctx: &egui::Context) {
+    let Some(view) = app.edit_done.clone() else {
+        return;
+    };
+    let p = app.pal;
+    let mut close = false;
+    egui::Window::new("合同信息已修改")
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(egui::Stroke::new(1.0_f32, p.border))
+                .rounding(egui::Rounding::same(14.0))
+                .inner_margin(egui::Margin::same(20.0)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(660.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} {}", view.contract_no, view.contract_name))
+                        .size(14.5)
+                        .strong()
+                        .color(p.text),
+                );
+                widgets::badge(ui, &p, "已写入操作日志", Tone::Success);
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!(
+                    "本次共修改 {} 个字段，明细如下（原值 → 新值）",
+                    view.changes.len()
+                ))
+                .size(12.0)
+                .color(p.text_muted),
+            );
+            ui.add_space(8.0);
+            widgets::divider(ui, &p);
+            ui.add_space(8.0);
+
+            let head = |ui: &mut egui::Ui, w: f32, text: &str| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_width(w);
+                        ui.set_max_width(w);
+                        ui.label(RichText::new(text).size(11.5).strong().color(p.text_muted));
+                    },
+                );
+            };
+            let (w_field, w_val) = (104.0, 230.0);
+            egui::ScrollArea::vertical()
+                .id_salt("edit_done_scroll")
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("edit_done_grid")
+                        .num_columns(3)
+                        .spacing([12.0, 10.0])
+                        .show(ui, |ui| {
+                            head(ui, w_field, "字段");
+                            head(ui, w_val, "修改前");
+                            head(ui, w_val, "修改后");
+                            ui.end_row();
+                            for row in &view.changes {
+                                cell_text(ui, w_field, &row.field, p.text, true);
+                                // 长文本按列宽换行，不裁切也不撑破表格
+                                cell_text(ui, w_val, &row.old, p.text_muted, false);
+                                cell_text(ui, w_val, &row.new, p.text, false);
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            ui.add_space(10.0);
+            widgets::soft_box(&p, p.primary_soft).show(ui, |ui| {
+                ui.set_width(620.0);
+                ui.label(
+                    RichText::new("修改原因")
+                        .size(11.5)
+                        .strong()
+                        .color(p.primary),
+                );
+                ui.add_space(2.0);
+                ui.label(RichText::new(&view.reason).size(12.5).color(p.text));
+            });
+
+            ui.add_space(10.0);
+            widgets::divider(ui, &p);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "关闭方式：点击下方「关闭」返回台账；按 Esc 或点击弹窗外部不会关闭。修改已留痕，可在「操作日志」按 EDIT_CONTRACT 复查。",
+                )
+                .size(11.0)
+                .color(p.text_muted),
+            );
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::primary_button(ui, &p, "关闭", true).clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if close {
+        app.edit_done = None;
+    }
+}
+
+/// 定宽换行文本单元：值短时只占一行，长文本（付款条款 / 备注）自动折行。
+///
+/// `allocate_ui_with_layout` 默认会把宽度收缩到内容宽度，表格三列就会各按内容
+/// 自适应、列头与数值对不齐；这里显式钉住最小/最大宽度，列宽才是稳定的。
+fn cell_text(ui: &mut egui::Ui, w: f32, text: &str, color: egui::Color32, strong: bool) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_width(w);
+            ui.set_max_width(w);
+            let mut txt = RichText::new(if text.is_empty() { "—" } else { text })
+                .size(12.0)
+                .color(color);
+            if strong {
+                txt = txt.strong();
+            }
+            ui.add(egui::Label::new(txt).wrap());
+        },
+    );
+}
+
+// ---------------------------------------------------------------- 项目交工
 
 /// 项目交工：选一个日期写入该合同的「交工日期」。
 fn delivery_date(app: &mut App, ctx: &egui::Context) {
@@ -4119,5 +4369,45 @@ mod tests {
         assert_eq!(bp_text(0), "0");
         assert_eq!(pct_to_bp(&bp_text(300)), 300);
         assert_eq!(pct_to_bp(&bp_text(125)), 125);
+    }
+
+    fn proj(id: &str, code: &str, name: &str) -> ctp_core::project::Project {
+        ctp_core::project::Project {
+            id: id.into(),
+            project_code: code.into(),
+            project_name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// R-51：修改窗里所属项目只显示名称，不带编码（与新建时录入的一致）。
+    #[test]
+    fn 所属项目预填只写名称() {
+        let c = ctp_core::contract::Contract {
+            project_id: "PJ-1".into(),
+            ..Default::default()
+        };
+        let projects = vec![proj("PJ-1", "XAJT", "测试项目")];
+        let f = EditContractForm::from_contract(&c, &projects, &[]);
+        assert_eq!(f.project_text, "测试项目", "不能把编码也塞进输入框");
+    }
+
+    /// R-51：候选列表仍按「编码 名称」展示（方便用编码检索），
+    /// 但点选后只回填名称，避免编码留在框里被误认为「已选定」。
+    #[test]
+    fn 点选项目候选只回填名称() {
+        let src = project_sources(&[
+            proj("PJ-1", "XAJT", "测试项目"),
+            proj("PJ-2", "PRJ-2026-002", "另一个项目"),
+        ]);
+        let labels: Vec<&str> = src.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["XAJT 测试项目", "PRJ-2026-002 另一个项目"]);
+        assert_eq!(pick_project_name(&src, "XAJT 测试项目"), "测试项目");
+        assert_eq!(
+            pick_project_name(&src, "PRJ-2026-002 另一个项目"),
+            "另一个项目"
+        );
+        // 候选取不到时保留用户原文（允许直接录一个新项目）
+        assert_eq!(pick_project_name(&src, "全新项目"), "全新项目");
     }
 }

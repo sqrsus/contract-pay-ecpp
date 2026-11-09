@@ -51,6 +51,13 @@ pub enum DomainError {
 
     #[error("口径违例：{0}")]
     Invariant(String),
+
+    /// 提交内容与库里的值逐字段相同：不是口径问题，也不需要留痕（R-51）。
+    ///
+    /// 单独成变体是为了让界面提示不再顶「口径违例」的帽子——用户看到的应是
+    /// 「没有修改任何内容，无需留痕」，而不是一句像出错的诊断。
+    #[error("{0}")]
+    NoChange(String),
 }
 
 pub type Result<T> = std::result::Result<T, DomainError>;

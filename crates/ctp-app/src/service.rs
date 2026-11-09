@@ -230,7 +230,18 @@ fn ensure_contractor(
     Ok(c.id)
 }
 
-/// 解析所属项目：`id` 优先；否则按「编码或名称」命中；再不然建档。
+/// 解析所属项目：`id` 优先；否则按名称 / 编码命中；再不然建档。
+///
+/// 匹配顺序是**名称优先**（R-51）：
+/// 1. 整串（用户可能只写了编码，也可能只写了名称）；
+/// 2. 「编码 名称」里空格后的名称段——旧编码不能劫持用户改过的名称；
+/// 3. 空格前的编码，且该项目的名称必须与名称段一致（兼容名称本身带空格）；
+/// 4. 编码命中但名称被改过：按名称段新建档案，不静默回退到旧项目；
+/// 5. 全都没有：按整串新建档案。
+///
+/// 旧实现按「整串 → 编码 → 名称」探测，用户把「XAJT 旧项目」改成
+/// 「XAJT 新项目」时编码先命中、名称被丢掉，界面上表现为「改了个寂寞」，
+/// 保存时报「没有修改任何内容」。
 fn resolve_project(
     conn: &Connection,
     id: &str,
@@ -244,16 +255,36 @@ fn resolve_project(
     if text.is_empty() {
         return Err(DomainError::MissingField("所属项目").into());
     }
-    // 输入框展示的是「编码 名称」，先按整串找，再拆成编码 / 名称分别找
-    let mut probes = vec![text.to_string()];
-    if let Some((head, tail)) = text.split_once(' ') {
-        probes.push(head.trim().to_string());
-        probes.push(tail.trim().to_string());
+    if let Some(p) = repo::find_project_by_text(conn, text)? {
+        return Ok(p.id);
     }
-    for probe in &probes {
-        if let Some(p) = repo::find_project_by_text(conn, probe)? {
+    // 只有出现空白时才拆「编码 / 名称」两段；名称本身可能带空格，故按首个空白切
+    let split = text
+        .find(char::is_whitespace)
+        .map(|i| (text[..i].trim(), text[i..].trim()))
+        .filter(|(head, tail)| !head.is_empty() && !tail.is_empty());
+    if let Some((head, tail)) = split {
+        // 名称段优先：用户改的一定是名称，编码只是沿用下来的前缀
+        if let Some(p) = repo::find_project_by_text(conn, tail)? {
             return Ok(p.id);
         }
+        // 名称段没命中，再看编码；但要求名称段与该档案完全一致，
+        // 否则说明用户改过名称，不能按编码认领（就是这里曾被旧编码劫持）
+        if let Some(p) = repo::find_project_by_text(conn, head)? {
+            if p.project_name == tail {
+                return Ok(p.id);
+            }
+            return create_project(conn, tail, operator);
+        }
+    }
+    create_project(conn, text, operator)
+}
+
+/// 按名称新建项目档案（自动编码）并写审计。
+fn create_project(conn: &Connection, name: &str, operator: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(DomainError::MissingField("所属项目").into());
     }
     let now = now_iso();
     let year = year_of(&now);
@@ -261,8 +292,8 @@ fn resolve_project(
     let p = Project {
         id: ids::new_id("PRJ"),
         project_code: format!("PRJ-{year}-{seq:03}"),
-        project_name: text.to_string(),
-        remark: Some("新建合同时自动建档".into()),
+        project_name: name.to_string(),
+        remark: Some("按合同表单录入的项目名称自动建档".into()),
         is_deleted: false,
         version: 1,
         created_at: now.clone(),
@@ -444,6 +475,37 @@ pub fn create_contract(
     Ok(c)
 }
 
+/// 主档修改中的一个字段变更（R-51：保存成功后要逐条列给用户看）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldChange {
+    /// 字段中文名，如「所属项目」
+    pub field: &'static str,
+    /// 修改前的展示值（空值统一显示为「—」）
+    pub old: String,
+    /// 修改后的展示值
+    pub new: String,
+    /// 长文本（付款条款 / 备注）：审计只记「已修改」，成功弹窗仍显示全文
+    pub long_text: bool,
+}
+
+impl FieldChange {
+    /// 审计日志里的一行：长文本不透传原文，避免日志被整段条款淹没。
+    pub fn audit_text(&self) -> String {
+        if self.long_text {
+            format!("{}：已修改", self.field)
+        } else {
+            format!("{}：{} → {}", self.field, self.old, self.new)
+        }
+    }
+}
+
+/// 主档修改的返回值：改后的合同 + 逐字段变更清单。
+#[derive(Debug, Clone)]
+pub struct ContractEdit {
+    pub contract: Contract,
+    pub changes: Vec<FieldChange>,
+}
+
 /// 修改合同主档信息（R-50）。
 ///
 /// 与「新建」共用同一套档案解析规则（项目 / 承包单位 / 甲方 / 招标代理），
@@ -453,13 +515,16 @@ pub fn create_contract(
 /// 留痕入口，从这里改会绕过历史表，审计链会断。
 ///
 /// `reason` 必填：与「编辑金额」一致，任何主档变更都要能回答「为什么改」。
+///
+/// 返回 `ContractEdit`：界面用它弹「本次修改了什么」，日志用它落同一份 diff，
+/// 两处不会出现两套口径。
 pub fn update_contract_master(
     conn: &mut Connection,
     contract_id: &str,
     input: EditContract,
     reason: &str,
     operator: &str,
-) -> Result<Contract> {
+) -> Result<ContractEdit> {
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(DomainError::MissingField("修改原因").into());
@@ -502,13 +567,31 @@ pub fn update_contract_master(
     };
 
     // 字段级 diff：只记真正变化的项，避免「点保存就多一条流水」
-    let mut changes: Vec<String> = Vec::new();
+    let mut changes: Vec<FieldChange> = Vec::new();
     macro_rules! note {
         ($label:expr, $old:expr, $new:expr) => {{
             let old = $old.to_string();
             let new = $new.to_string();
             if old != new {
-                changes.push(format!("{}：{} → {}", $label, old, new));
+                changes.push(FieldChange {
+                    field: $label,
+                    old,
+                    new,
+                    long_text: false,
+                });
+            }
+        }};
+    }
+    // 长文本单独一支：审计只记「已修改」，成功弹窗仍显示前后全文
+    macro_rules! note_long {
+        ($label:expr, $old:expr, $new:expr) => {{
+            if $old != $new {
+                changes.push(FieldChange {
+                    field: $label,
+                    old: $old,
+                    new: $new,
+                    long_text: true,
+                });
             }
         }};
     }
@@ -517,18 +600,20 @@ pub fn update_contract_master(
     note!("合同名称", c.contract_name, input.contract_name);
     // 档案类字段按 id 判变化：用户可能只改了写法（名称 / 编码），指向同一个档案时不算修改
     if c.project_id != project_id {
-        changes.push(format!(
-            "所属项目：{} → {}",
-            project_label(&tx, &c.project_id),
-            project_label(&tx, &project_id)
-        ));
+        changes.push(FieldChange {
+            field: "所属项目",
+            old: project_name_of(&tx, &c.project_id),
+            new: project_name_of(&tx, &project_id),
+            long_text: false,
+        });
     }
     if c.contractor_id != contractor_id {
-        changes.push(format!(
-            "承包单位：{} → {}",
-            contractor_label(&tx, &c.contractor_id),
-            contractor_label(&tx, &contractor_id)
-        ));
+        changes.push(FieldChange {
+            field: "承包单位",
+            old: contractor_label(&tx, &c.contractor_id),
+            new: contractor_label(&tx, &contractor_id),
+            long_text: false,
+        });
     }
     note!("发包人", c.party_a, party_a);
     note!(
@@ -568,44 +653,33 @@ pub fn update_contract_master(
         bid_agent_label(&tx, c.bid_agent_id.as_deref()),
         bid_agent_label(&tx, bid_agent_id.as_deref())
     );
-    // 长文本只记「改过」，不把整段条款塞进日志
-    if c.payment_terms != input.payment_terms {
-        changes.push("付款条款：已修改".to_string());
-    }
-    if c.remark != input.remark {
-        changes.push("备注：已修改".to_string());
-    }
-    if c.bid_method != input.bid_method {
-        changes.push(format!(
-            "招标方式：{} → {}",
-            c.bid_method.map(|x| x.label()).unwrap_or("—"),
-            input.bid_method.map(|x| x.label()).unwrap_or("—")
-        ));
-    }
-    if c.open_bid_date != input.open_bid_date {
-        changes.push(format!(
-            "开标时间：{} → {}",
-            dash(&c.open_bid_date),
-            dash(&input.open_bid_date)
-        ));
-    }
-    if c.project_leader != input.project_leader {
-        changes.push(format!(
-            "项目负责人：{} → {}",
-            dash(&c.project_leader),
-            dash(&input.project_leader)
-        ));
-    }
-    if c.contact_info != input.contact_info {
-        changes.push(format!(
-            "联系方式：{} → {}",
-            dash(&c.contact_info),
-            dash(&input.contact_info)
-        ));
-    }
+    // 长文本：审计只记「改过」，成功弹窗显示前后全文（`long_text` 标记）
+    note_long!(
+        "付款条款",
+        c.payment_terms.clone(),
+        input.payment_terms.clone()
+    );
+    note_long!("备注", dash(&c.remark), dash(&input.remark));
+    note!(
+        "招标方式",
+        c.bid_method.map(|x| x.label()).unwrap_or("—"),
+        input.bid_method.map(|x| x.label()).unwrap_or("—")
+    );
+    note!(
+        "开标时间",
+        dash(&c.open_bid_date),
+        dash(&input.open_bid_date)
+    );
+    note!(
+        "项目负责人",
+        dash(&c.project_leader),
+        dash(&input.project_leader)
+    );
+    note!("联系方式", dash(&c.contact_info), dash(&input.contact_info));
 
     if changes.is_empty() {
-        return Err(DomainError::Invariant("没有修改任何内容，无需留痕".into()).into());
+        // 不叫「口径违例」：这不是违规，只是提交值与库里一致
+        return Err(DomainError::NoChange("没有修改任何内容，无需留痕".into()).into());
     }
 
     // 只落主档字段；编号 / 金额 / 审计价 / 状态 / 交工日期原样保留
@@ -637,25 +711,38 @@ pub fn update_contract_master(
     // 否则返回值带着旧版本号，调用方再保存一次就会误报冲突。
     c.version += 1;
 
+    let detail = format!(
+        "{}｜{}",
+        reason,
+        changes
+            .iter()
+            .map(FieldChange::audit_text)
+            .collect::<Vec<_>>()
+            .join("；")
+    );
     db::insert_audit_log(
         &tx,
         "ct_contract",
         &c.id,
         Some(&format!("{} {}", c.contract_no, c.contract_name)),
         "EDIT_CONTRACT",
-        Some(&format!("{}｜{}", reason, changes.join("；"))),
+        Some(&detail),
         operator,
     )?;
     tx.commit()?;
-    Ok(c)
+    Ok(ContractEdit {
+        contract: c,
+        changes,
+    })
 }
 
-/// 项目展示名（编码 + 名称），查不到返回空串。
-fn project_label(conn: &Connection, id: &str) -> String {
+/// 项目名称（不含编码）：界面展示与「本次修改」弹窗都用它，
+/// 与修改窗里所属项目的显示口径一致（R-51）。
+fn project_name_of(conn: &Connection, id: &str) -> String {
     repo::list_projects(conn)
         .ok()
         .and_then(|v| v.into_iter().find(|p| p.id == id))
-        .map(|p| format!("{} {}", p.project_code, p.project_name))
+        .map(|p| p.project_name)
         .unwrap_or_default()
 }
 

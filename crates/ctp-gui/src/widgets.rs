@@ -469,6 +469,41 @@ pub fn autocomplete_full(
     hint: &str,
     mode: SuggestMode,
 ) -> AcOutcome {
+    autocomplete_impl(ui, id, p, text, candidates, width, hint, mode, None)
+}
+
+/// 同 `autocomplete`，但点选后写入的是 `pick(候选)` 的结果。
+///
+/// 项目候选要同时具备两种身份：列表里显示「编码 名称」方便按编码检索，
+/// 但回填到输入框时只留名称（与新建合同时手输的名称一致）。
+#[allow(clippy::too_many_arguments)]
+pub fn autocomplete_pick(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    candidates: &[String],
+    width: f32,
+    hint: &str,
+    mode: SuggestMode,
+    pick: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    autocomplete_impl(ui, id, p, text, candidates, width, hint, mode, Some(pick)).picked
+}
+
+// 内部实现：多一个可选的「回填值换算」，其余入参与公开入口一一对应。
+#[allow(clippy::too_many_arguments)]
+fn autocomplete_impl(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    candidates: &[String],
+    width: f32,
+    hint: &str,
+    mode: SuggestMode,
+    pick: Option<&dyn Fn(&str) -> String>,
+) -> AcOutcome {
     let resp = ui.add_sized(
         [width, 26.0],
         egui::TextEdit::singleline(text)
@@ -554,6 +589,7 @@ pub fn autocomplete_full(
     });
 
     if let Some(v) = picked {
+        let v = pick.map(|f| f(&v)).unwrap_or(v);
         *text = v.clone();
         ui.memory_mut(|m| m.surrender_focus(resp.id));
         return AcOutcome {

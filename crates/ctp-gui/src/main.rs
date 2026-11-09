@@ -268,6 +268,8 @@ pub struct App {
     pub export_columns: Option<crate::dialogs::ExportColumnsView>,
     /// 合同信息修改弹窗的数据（R-50，与 `Dialog::EditContract` 配套）
     pub edit_contract: Option<crate::dialogs::EditContractForm>,
+    /// 修改成功后的「本次修改」弹窗（R-51，叠加层，不占 `Dialog`）
+    pub edit_done: Option<crate::dialogs::EditDoneView>,
     pub confirm: Option<Confirm>,
     pub confirm_reason: String,
     pub toast: Option<Toast>,
@@ -402,6 +404,7 @@ impl App {
             import_result: None,
             export_columns: None,
             edit_contract: None,
+            edit_done: None,
             confirm: None,
             confirm_reason: String::new(),
             toast: None,
@@ -530,6 +533,22 @@ impl App {
             "contract_detail" => {
                 if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
                     self.open_contract_detail(&id);
+                }
+            }
+            // R-51：合同信息修改窗与「本次修改」弹窗，供截图核对
+            "edit_contract" => {
+                if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
+                    self.select(&id);
+                    self.screen = Screen::Contracts;
+                    self.open_edit_contract(&id);
+                }
+            }
+            "edit_done" => {
+                if let Some(s) = self.summaries.first() {
+                    let (no, name) = (s.contract_no.clone(), s.contract_name.clone());
+                    self.select(&s.contract_id.clone());
+                    self.screen = Screen::Contracts;
+                    self.edit_done = Some(crate::dialogs::EditDoneView::sample(&no, &name));
                 }
             }
             "material_print" => {
@@ -1221,6 +1240,7 @@ impl App {
             crate::dialogs::dismiss_import_result(&mut self.dialog, &mut self.import_result);
             crate::dialogs::dismiss_export_columns(&mut self.dialog, &mut self.export_columns);
             self.edit_contract = None;
+            self.edit_done = None;
             crate::dialogs::dismiss_print_failure(&mut self.print_failure);
             dismiss_print_success(&mut self.print_success);
             self.print_render_failed = false;

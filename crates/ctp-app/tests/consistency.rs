@@ -1095,12 +1095,12 @@ fn 信息修改只动主档并写审计留痕() {
     let (mut conn, cid) = fixture(1_000_000);
     let before = repo::get_contract(&conn, &cid).unwrap();
 
-    let after = service::update_contract_master(
+    let edited = service::update_contract_master(
         &mut conn,
         &cid,
         EditContract {
             contract_name: "测试合同（更名）".into(),
-            project_text: "XAJT 测试项目".into(),
+            project_text: "XJ 测试项目".into(),
             contractor_text: "某施工单位".into(),
             party_a: "某建设单位".into(),
             contract_type: before.contract_type,
@@ -1124,6 +1124,8 @@ fn 信息修改只动主档并写审计留痕() {
     )
     .unwrap();
 
+    let changes = edited.changes.clone();
+    let after = edited.contract;
     assert_eq!(after.contract_name, "测试合同（更名）");
     assert_eq!(after.duration_days, 120);
     assert_eq!(after.planned_end.as_deref(), Some("2026-06-28"));
@@ -1138,6 +1140,22 @@ fn 信息修改只动主档并写审计留痕() {
     );
     assert_eq!(after.status, before.status, "状态不在此改");
     assert_eq!(after.version, before.version + 1, "乐观锁版本应自增");
+
+    // R-51：返回的变更清单是成功弹窗与审计日志的共同来源
+    assert!(
+        changes.iter().any(|c| c.field == "合同名称"),
+        "变更清单必须含合同名称：{changes:?}"
+    );
+    assert!(
+        !changes.iter().any(|c| c.field == "所属项目"),
+        "指向同一档案时不该记成项目变更：{changes:?}"
+    );
+    let long = changes
+        .iter()
+        .find(|c| c.field == "备注")
+        .expect("备注有变，应在清单里");
+    assert!(long.long_text, "备注属于长文本，审计只记「已修改」");
+    assert_eq!(long.audit_text(), "备注：已修改");
 
     let detail: String = conn
         .query_row(
@@ -1189,6 +1207,10 @@ fn 信息修改拒绝空原因与无改动() {
         format!("{err}").contains("没有修改任何内容"),
         "无改动不应产生流水：{err}"
     );
+    assert!(
+        !format!("{err}").contains("口径违例"),
+        "「没改动」不是口径问题，不该顶违例的帽子：{err}"
+    );
 
     let n: i64 = conn
         .query_row(
@@ -1198,4 +1220,130 @@ fn 信息修改拒绝空原因与无改动() {
         )
         .unwrap();
     assert_eq!(n, 0, "被拒绝的提交不能留审计");
+}
+
+/// 造一份「除了指定字段外全都沿用库里的值」的修改入参。
+fn edit_like(c: &ctp_core::contract::Contract, project_text: &str) -> EditContract {
+    EditContract {
+        contract_name: c.contract_name.clone(),
+        project_text: project_text.into(),
+        contractor_text: "某施工单位".into(),
+        party_a: c.party_a.clone(),
+        contract_type: c.contract_type,
+        contract_category_code: c.contract_category_code.clone(),
+        sign_date: c.sign_date.clone(),
+        duration_days: c.duration_days,
+        planned_start: c.planned_start.clone(),
+        planned_end: c.planned_end.clone(),
+        pricing_method: c.pricing_method,
+        retention_rate_bp: c.retention_rate_bp,
+        payment_terms: c.payment_terms.clone(),
+        remark: c.remark.clone(),
+        bid_method: c.bid_method,
+        open_bid_date: c.open_bid_date.clone(),
+        project_leader: c.project_leader.clone(),
+        contact_info: c.contact_info.clone(),
+        bid_agent_text: None,
+    }
+}
+
+/// 再加一个项目档案：合同改项目时用。
+fn add_project(conn: &Connection, id: &str, code: &str, name: &str) {
+    let now = ctp_core::date::now_iso();
+    repo::insert_project(
+        conn,
+        &Project {
+            id: id.into(),
+            project_code: code.into(),
+            project_name: name.into(),
+            remark: None,
+            is_deleted: false,
+            version: 1,
+            created_at: now.clone(),
+            created_by: Some("t".into()),
+            updated_at: now,
+            updated_by: Some("t".into()),
+        },
+    )
+    .unwrap();
+}
+
+/// R-51：修改所属项目时名称优先。
+///
+/// 用户把「XAJT 测试项目」改成「XAJT 另一个项目」（旧编码留在框里），
+/// 必须解析到名称段指向的项目，而不是退回旧编码对应的项目后报「没有修改任何内容」。
+#[test]
+fn 修改所属项目_名称优先不被旧编码劫持() {
+    let (mut conn, cid) = fixture(1_000_000);
+    add_project(&conn, "PJ-2", "PRJ-2026-002", "另一个项目");
+    let before = repo::get_contract(&conn, &cid).unwrap();
+
+    let edited = service::update_contract_master(
+        &mut conn,
+        &cid,
+        edit_like(&before, "XAJT 另一个项目"),
+        "项目归属更正",
+        "t",
+    )
+    .unwrap();
+
+    assert_eq!(edited.contract.project_id, "PJ-2", "应按名称段解析到新项目");
+    let row = edited
+        .changes
+        .iter()
+        .find(|c| c.field == "所属项目")
+        .expect("项目变了必须进变更清单");
+    assert_eq!(row.old, "测试项目", "弹窗里的原值用项目名称，不带编码");
+    assert_eq!(row.new, "另一个项目");
+
+    // 只写名称、只写编码也都应命中同一条档案
+    for text in ["另一个项目", "PRJ-2026-002", "PRJ-2026-002 另一个项目"] {
+        let before = repo::get_contract(&conn, &cid).unwrap();
+        let edited =
+            service::update_contract_master(&mut conn, &cid, edit_like(&before, text), "核对", "t");
+        match edited {
+            Ok(e) => assert_eq!(e.contract.project_id, "PJ-2", "「{text}」应指向 PJ-2"),
+            // 已经指向 PJ-2 时再提交同值会走「没有修改任何内容」，同样说明解析正确
+            Err(e) => assert!(
+                format!("{e}").contains("没有修改任何内容"),
+                "「{text}」不应报其他错误：{e}"
+            ),
+        }
+    }
+}
+
+/// R-51：编码命中但名称被改成新名字时，按名称段新建档案，不静默回退旧项目。
+#[test]
+fn 修改所属项目_名称改成新名字按新名称建档() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let before = repo::get_contract(&conn, &cid).unwrap();
+
+    let edited = service::update_contract_master(
+        &mut conn,
+        &cid,
+        edit_like(&before, "XAJT 二期工程"),
+        "项目拆分",
+        "t",
+    )
+    .unwrap();
+
+    assert_ne!(
+        edited.contract.project_id, "PJ-1",
+        "不能退回旧编码对应的项目"
+    );
+    let projects = repo::list_projects(&conn).unwrap();
+    let p = projects
+        .iter()
+        .find(|p| p.id == edited.contract.project_id)
+        .expect("应已建档");
+    assert_eq!(p.project_name, "二期工程", "编码前缀不该进项目名称");
+    assert!(p.project_code.starts_with("PRJ-"), "新档案自动编码");
+    assert_eq!(
+        edited
+            .changes
+            .iter()
+            .find(|c| c.field == "所属项目")
+            .map(|c| c.new.as_str()),
+        Some("二期工程")
+    );
 }
