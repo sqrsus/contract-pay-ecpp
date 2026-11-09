@@ -6,6 +6,7 @@
 use crate::theme::Palette;
 use crate::widgets::{self, Tone};
 use crate::App;
+use ctp_app::report::{ReportColumnError, ReportResult};
 use ctp_app::service::{self, NewContract, NewPayment};
 use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::{BidMethod, ContractType};
@@ -38,6 +39,8 @@ pub enum Dialog {
     ContractDetail,
     /// 批量拨款导入结果（R-33）：常驻、真模态，仅「关闭」可退出
     ImportResult,
+    /// 合同台账导出列选择（R-46）：导出前勾选字段并调整顺序
+    ExportColumns,
 }
 
 /// 导入结果弹窗的数据：只保留统计摘要与失败条目，不逐行列明细（R-33 确认口径）。
@@ -59,6 +62,94 @@ pub struct ImportResultView {
 pub fn dismiss_import_result(dialog: &mut Dialog, result: &mut Option<ImportResultView>) {
     *dialog = Dialog::None;
     *result = None;
+}
+
+// ---------------------------------------------------------------- 导出列选择（R-46）
+
+/// 一个可选字段。`label` 是 Excel 里实际的表头文字（金额列含「（元）」），
+/// 让「选择结果」与「生成的列名」逐字一致；`key` 用于投影 `ReportResult`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportColumnChoice {
+    pub key: &'static str,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// 合同台账导出列选择弹窗的状态。
+///
+/// `result` 是点「导出 Excel」那一刻按当前筛选 / 排序构造的完整 9 列结果快照：
+/// 弹窗期间用户改不了后台列表，因此导出的数据范围与列表当时所见严格一致。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportColumnsView {
+    pub result: ReportResult,
+    pub choices: Vec<ExportColumnChoice>,
+    pub error: Option<String>,
+}
+
+impl ExportColumnsView {
+    pub fn new(result: ReportResult) -> Self {
+        let choices = result
+            .columns
+            .iter()
+            .map(|c| ExportColumnChoice {
+                key: c.key,
+                label: c.excel_title(),
+                selected: true,
+            })
+            .collect();
+        ExportColumnsView {
+            result,
+            choices,
+            error: None,
+        }
+    }
+
+    /// 勾选的列 key，按列表当前顺序（即 Excel 列顺序）。
+    pub fn selected_keys(&self) -> Vec<&'static str> {
+        self.choices
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.key)
+            .collect()
+    }
+
+    pub fn set_all(&mut self, on: bool) {
+        for c in &mut self.choices {
+            c.selected = on;
+        }
+        self.error = None;
+    }
+
+    /// 恢复默认：全选 + 原始列序。
+    pub fn reset(&mut self) {
+        let keys: Vec<&'static str> = self.result.columns.iter().map(|c| c.key).collect();
+        self.choices
+            .sort_by_key(|c| keys.iter().position(|k| *k == c.key).unwrap_or(usize::MAX));
+        self.set_all(true);
+    }
+
+    pub fn move_up(&mut self, i: usize) {
+        if i > 0 && i < self.choices.len() {
+            self.choices.swap(i - 1, i);
+        }
+    }
+
+    pub fn move_down(&mut self, i: usize) {
+        if i + 1 < self.choices.len() {
+            self.choices.swap(i, i + 1);
+        }
+    }
+
+    /// 确认导出：按勾选顺序投影出一份只含所选列的 `ReportResult`。
+    pub fn confirm(&self) -> Result<ReportResult, ReportColumnError> {
+        self.result.select_columns(&self.selected_keys())
+    }
+}
+
+/// 关闭导出列选择：与登出共用，避免只清弹窗不清数据导致下次带出旧选择。
+pub fn dismiss_export_columns(dialog: &mut Dialog, view: &mut Option<ExportColumnsView>) {
+    *dialog = Dialog::None;
+    *view = None;
 }
 
 // ---------------------------------------------------------------- 打印失败提示（R-42）
@@ -610,6 +701,148 @@ fn combo(
         });
 }
 
+/// R-46：合同台账导出前的列选择。
+///
+/// 只做「勾选 + 调顺序」，确认后把快照结果投影成只含所选列的 `ReportResult`，
+/// 再交给既有的 `export_report_result` 走原来的保存框 / 审计 / 提示链路。
+fn export_columns(app: &mut App, ctx: &egui::Context) {
+    let Some(mut view) = app.export_columns.clone() else {
+        dismiss_export_columns(&mut app.dialog, &mut app.export_columns);
+        return;
+    };
+    let p = app.pal;
+    let mut cancel = false;
+    let mut submit = false;
+    let mut all_on = false;
+    let mut all_off = false;
+    let mut reset = false;
+    let mut move_up: Option<usize> = None;
+    let mut move_down: Option<usize> = None;
+    let n = view.choices.len();
+    let selected_count = view.choices.iter().filter(|c| c.selected).count();
+    let row_count = view.result.rows.len();
+    let error_text = view.error.clone();
+
+    egui::Window::new("导出合同台账 · 选择列")
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(egui::Stroke::new(1.0_f32, p.border))
+                .rounding(egui::Rounding::same(14.0))
+                .inner_margin(egui::Margin::same(20.0)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.label(
+                RichText::new("选择要导出的字段，用「上移 / 下移」调整 Excel 中的列顺序。")
+                    .size(12.0)
+                    .color(p.text_muted),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "按当前列表筛选与排序导出，共 {row_count} 份合同；已选 {selected_count} / {n} 列"
+                ))
+                .size(11.5)
+                .color(p.text_muted),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if widgets::link(ui, &p, "全选", 11.5).clicked() {
+                    all_on = true;
+                }
+                if widgets::link(ui, &p, "全不选", 11.5).clicked() {
+                    all_off = true;
+                }
+                if widgets::link(ui, &p, "恢复默认", 11.5).clicked() {
+                    reset = true;
+                }
+            });
+            ui.add_space(6.0);
+            widgets::divider(ui, &p);
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("export_columns_list")
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, c) in view.choices.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut c.selected, "");
+                            ui.add_sized(
+                                [250.0, 24.0],
+                                egui::Label::new(
+                                    RichText::new(c.label.as_str()).size(12.5).color(p.text),
+                                ),
+                            );
+                            if widgets::ghost_button_sm_on(ui, &p, "上移", i > 0).clicked()
+                                && i > 0
+                            {
+                                move_up = Some(i);
+                            }
+                            if widgets::ghost_button_sm_on(ui, &p, "下移", i + 1 < n).clicked()
+                                && i + 1 < n
+                            {
+                                move_down = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(err) = &error_text {
+                ui.add_space(6.0);
+                ui.label(RichText::new(err).size(11.5).color(p.danger));
+            }
+            ui.add_space(10.0);
+            widgets::divider(ui, &p);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "确认导出", selected_count > 0).clicked()
+                    && selected_count > 0
+                {
+                    submit = true;
+                }
+                if widgets::ghost_button(ui, &p, "取消").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if all_on {
+        view.set_all(true);
+    }
+    if all_off {
+        view.set_all(false);
+    }
+    if reset {
+        view.reset();
+    }
+    if let Some(i) = move_up {
+        view.move_up(i);
+    }
+    if let Some(i) = move_down {
+        view.move_down(i);
+    }
+    app.export_columns = Some(view.clone());
+
+    if cancel {
+        dismiss_export_columns(&mut app.dialog, &mut app.export_columns);
+        return;
+    }
+    if submit {
+        match view.confirm() {
+            Ok(result) => {
+                dismiss_export_columns(&mut app.dialog, &mut app.export_columns);
+                app.export_report_result(&result);
+            }
+            // 空选择由置灰按钮挡住；其余校验错误沿用原来的「导出失败」提示渠道。
+            Err(e) => app.error(format!("导出失败：{e}")),
+        }
+    }
+}
+
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     // 弹窗打开时压暗底图，把注意力收到弹窗上。
     // 该图层在弹窗图层之前创建，因此始终绘制在弹窗下方；它不参与交互，点击可正常穿透到按钮。
@@ -633,9 +866,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     // Background → Panel → Middle → Foreground → Tooltip → Debug，Tooltip 高于
     // Foreground，若拦截层用 Tooltip 会盖住弹窗，导致「关闭」收不到点击。
     // 拦截层在 Middle（低于弹窗的 Foreground，高于背景主界面）才能既挡背景又可关窗。
-    if app.dialog == Dialog::ImportResult {
+    if matches!(app.dialog, Dialog::ImportResult | Dialog::ExportColumns) {
         let rect = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("import_result_blocker"))
+        egui::Area::new(egui::Id::new("modal_dialog_blocker"))
             .order(egui::Order::Middle)
             .fixed_pos(rect.min)
             .show(ctx, |ui| {
@@ -654,6 +887,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::MaterialPrint => material_print(app, ctx),
         Dialog::ContractDetail => contract_detail(app, ctx),
         Dialog::ImportResult => import_result(app, ctx),
+        Dialog::ExportColumns => export_columns(app, ctx),
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
@@ -3109,5 +3343,63 @@ mod tests {
         assert_eq!(v.title, "打印已提交");
         assert_eq!(v.sheets, 2);
         assert_eq!(v.pages, 4);
+    }
+
+    // ------------------------------------------------------------ R-46 导出列选择
+
+    #[test]
+    fn 导出列选择默认全选且表头文字一致() {
+        let v = ExportColumnsView::new(ReportResult::period(&[]));
+        assert_eq!(v.choices.len(), 4);
+        assert!(v.choices.iter().all(|c| c.selected));
+        assert_eq!(v.choices[2].label, "支付金额（元）");
+        assert_eq!(
+            v.selected_keys(),
+            vec!["period_month", "payment_count", "amount", "share"]
+        );
+        assert_eq!(v.confirm().unwrap().columns.len(), 4);
+    }
+
+    #[test]
+    fn 导出列选择可调序且确认结果顺序与勾选一致() {
+        let mut v = ExportColumnsView::new(ReportResult::period(&[]));
+        v.set_all(false);
+        v.choices[0].selected = true; // 期间
+        v.choices[2].selected = true; // 支付金额
+        assert_eq!(v.selected_keys(), vec!["period_month", "amount"]);
+        // 把「期间」一路挪到「支付金额」之后：调序按列表位置生效
+        v.move_down(0);
+        v.move_down(1);
+        assert_eq!(v.selected_keys(), vec!["amount", "period_month"]);
+        let picked = v.confirm().unwrap();
+        assert_eq!(
+            picked.columns.iter().map(|c| c.title).collect::<Vec<_>>(),
+            vec!["支付金额", "期间"]
+        );
+        assert_eq!(picked.columns.len(), 2);
+        picked.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn 导出列选择空选择被挡住且恢复默认回到原始列序() {
+        let mut v = ExportColumnsView::new(ReportResult::period(&[]));
+        v.set_all(false);
+        assert_eq!(v.confirm(), Err(ReportColumnError::EmptySelection));
+        v.move_down(0);
+        v.reset();
+        assert!(v.choices.iter().all(|c| c.selected));
+        assert_eq!(
+            v.selected_keys(),
+            vec!["period_month", "payment_count", "amount", "share"]
+        );
+    }
+
+    #[test]
+    fn 关闭导出列选择后弹窗与数据都被清除() {
+        let mut dialog = Dialog::ExportColumns;
+        let mut view = Some(ExportColumnsView::new(ReportResult::period(&[])));
+        dismiss_export_columns(&mut dialog, &mut view);
+        assert!(dialog == Dialog::None);
+        assert!(view.is_none());
     }
 }

@@ -150,6 +150,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(s) = app.summaries.iter().find(|s| s.contract_id == cid).cloned() else {
         return;
     };
+    // R-46：明细表与 Excel 导出共用同一份「当前合同的拨款单」与合同标签，
+    // 不再在表格里和导出分支里各过滤一次 app.payments、各拼一次合同名。
+    let payment_rows: Vec<ctp_core::payment::Payment> = app
+        .payments
+        .iter()
+        .filter(|pm| pm.contract_id == cid)
+        .cloned()
+        .collect();
+    let contract_label = format!("{} {}", s.contract_no, s.contract_name);
     // 额度按表单里的开单日期计算，与登记时的校验口径一致。
     // R-39：查询失败不再静默退回缓存值，而是给出可见警告 + 重试入口。
     let quota_res = app
@@ -468,21 +477,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             "作废单保留记录、不计入已付净额",
                         );
                         ui.add_space(6.0);
-                        let rows: Vec<ctp_core::payment::Payment> = app
-                            .payments
-                            .iter()
-                            .filter(|pm| pm.contract_id == cid)
-                            .cloned()
-                            .collect();
                         // R-33：明细表、合计行与 Excel 导出共用同一份 ReportResult
-                        let contract_label = format!("{} {}", s.contract_no, s.contract_name);
-                        let result = ReportResult::payment_ledger(&rows, &contract_label);
+                        let result = ReportResult::payment_ledger(&payment_rows, &contract_label);
                         if result.is_empty() {
                             widgets::empty_state(ui, &p, "该合同还没有拨款记录");
                             return;
                         }
                         // 批量打印：勾选若干条 → 合并成一份，一份一页
-                        let chosen = rows
+                        let chosen = payment_rows
                             .iter()
                             .filter(|pm| app.print_sel.contains(&pm.id))
                             .count();
@@ -534,7 +536,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             });
                         })
                         .body(|mut body| {
-                            for (ri, pm) in rows.iter().enumerate() {
+                            for (ri, pm) in payment_rows.iter().enumerate() {
                                 let cells = &result.rows[ri];
                                 body.row(30.0, |mut row| {
                                     row.col(|ui| {
@@ -805,22 +807,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
-    // R-33：拨款一览导出（按当前合同重新构造一份完整结果，与明细表同源）
+    // R-46：拨款一览导出。数据范围（当前合同的拨款单）、入口按钮与提示链路不变；
+    // 在明细表同源结果上追加「合同名称 / 承包单位」，按每张单据的 contract_id 取值，
+    // 查不到就留空，不跳过行、不影响导出。
     if export_list {
-        let cid = app.pay_contract.clone().unwrap_or_default();
-        let rows: Vec<ctp_core::payment::Payment> = app
-            .payments
-            .iter()
-            .filter(|pm| pm.contract_id == cid)
-            .cloned()
-            .collect();
-        let label = app
-            .summaries
-            .iter()
-            .find(|x| x.contract_id == cid)
-            .map(|x| format!("{} {}", x.contract_no, x.contract_name))
-            .unwrap_or(cid);
-        let result = ReportResult::payment_ledger(&rows, &label);
+        let lookup = ctp_app::report::payment_contract_lookup(&app.summaries);
+        let result = ReportResult::payment_ledger_export(&payment_rows, &contract_label, &lookup);
         app.export_report_result(&result);
     }
 }

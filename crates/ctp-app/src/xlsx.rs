@@ -43,6 +43,9 @@ fn col_letter(col: u16) -> String {
 
 /// 写出报表。返回已写入的行列数，供集成测试断言。
 pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Result<(usize, usize)> {
+    // 先校验形状：列选择 / 追加列之后若行列错位，这里返回可展示的导出错误，
+    // 而不是在下面的 columns[ci] 处越界 panic。
+    result.validate_shape().map_err(xerr)?;
     let mut workbook = Workbook::new();
     let ws = workbook.add_worksheet();
     ws.set_name(result.kind.sheet_name()).map_err(xerr)?;
@@ -82,13 +85,9 @@ pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Resul
     )
     .map_err(xerr)?;
 
-    // 第 3 行：表头（金额列注明单位「元」）
+    // 第 3 行：表头（金额列注明单位「元」，文字由列配置统一给出）
     for (ci, c) in result.columns.iter().enumerate() {
-        let label = if c.kind == ColumnKind::Money {
-            format!("{}（元）", c.title)
-        } else {
-            c.title.to_string()
-        };
+        let label = c.excel_title();
         ws.write_string_with_format(2, ci as u16, label.as_str(), &header_fmt)
             .map_err(xerr)?;
         ws.set_column_width(ci as u16, c.width).map_err(xerr)?;
@@ -177,9 +176,63 @@ mod tests {
     // 12_345_67 = 12,345.67 元，按「元_分」分组便于人工核对导出值。
     #![allow(clippy::inconsistent_digit_grouping)]
     use super::*;
-    use crate::report::ReportResult;
+    use crate::report::{PaymentContractFields, PaymentContractLookup, ReportResult};
     use ctp_core::ledger::PeriodRow;
     use ctp_core::money::Money;
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ctp_r46_{}_{}.xlsx", std::process::id(), tag))
+    }
+
+    /// 读回某个单元格的文字（calamine 在 ctp-app 里本来就是导入依赖）。
+    fn cell_text(v: Option<&calamine::Data>) -> String {
+        match v {
+            Some(calamine::Data::String(s)) => s.clone(),
+            Some(calamine::Data::Float(f)) => f.to_string(),
+            Some(calamine::Data::Int(i)) => i.to_string(),
+            Some(calamine::Data::Empty) | None => String::new(),
+            Some(other) => format!("{other:?}"),
+        }
+    }
+
+    fn period_rows() -> Vec<PeriodRow> {
+        vec![
+            PeriodRow {
+                project_id: "P1".into(),
+                period_month: "2026-06".into(),
+                payment_count: 2,
+                amount: Money::from_cent(30_000_000),
+            },
+            PeriodRow {
+                project_id: "P1".into(),
+                period_month: "2026-07".into(),
+                payment_count: 1,
+                amount: Money::from_cent(10_000_000),
+            },
+        ]
+    }
+
+    fn payment_rows() -> Vec<ctp_core::payment::Payment> {
+        use ctp_core::payment::Payment;
+        vec![
+            Payment {
+                id: "PM-1".into(),
+                payment_no: "BK-0001".into(),
+                contract_id: "CT-1".into(),
+                pay_date: "2026-06-30".into(),
+                amount_cent: Money::from_cent(1_000_000),
+                ..Default::default()
+            },
+            Payment {
+                id: "PM-2".into(),
+                payment_no: "BK-0002".into(),
+                contract_id: "CT-UNKNOWN".into(),
+                pay_date: "2026-07-01".into(),
+                amount_cent: Money::from_cent(500_000),
+                ..Default::default()
+            },
+        ]
+    }
 
     #[test]
     fn 列字母与格式工厂() {
@@ -211,6 +264,67 @@ mod tests {
         // xlsx 是 zip：头两个字节必须是 PK
         let head = std::fs::read(&path).unwrap();
         assert_eq!(&head[0..2], b"PK");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R-46：列选择后写出的 xlsx 只含所选列，表头文字与顺序与选择一致。
+    #[test]
+    fn 列选择导出只写所选列且表头顺序一致() {
+        use calamine::Reader;
+        let result = ReportResult::period(&period_rows());
+        let picked = result.select_columns(&["amount", "period_month"]).unwrap();
+        let path = tmp_path("select");
+        let (nrows, ncols) = write_report(&picked, &path, "测试").unwrap();
+        assert_eq!((nrows, ncols), (2, 2));
+
+        let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+        let range = wb.worksheet_range("期间统计").unwrap();
+        assert_eq!(cell_text(range.get_value((2, 0))), "支付金额（元）");
+        assert_eq!(cell_text(range.get_value((2, 1))), "期间");
+        assert_eq!(cell_text(range.get_value((2, 2))), "", "不应出现第 3 列");
+        assert_eq!(cell_text(range.get_value((3, 0))), "300000");
+        assert_eq!(cell_text(range.get_value((3, 1))), "2026-06");
+        assert_eq!(cell_text(range.get_value((4, 1))), "2026-07");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R-46：拨款一览导出的两列按记录填充，缺失值留空且不丢行。
+    #[test]
+    fn 拨款一览导出带合同字段且缺失为空() {
+        use calamine::Reader;
+        let mut lookup = PaymentContractLookup::new();
+        lookup.insert(
+            "CT-1".into(),
+            PaymentContractFields {
+                contract_name: "测试合同".into(),
+                contractor_name: "某施工单位".into(),
+            },
+        );
+        let result = ReportResult::payment_ledger_export(&payment_rows(), "全部合同", &lookup);
+        let path = tmp_path("payment");
+        let (nrows, ncols) = write_report(&result, &path, "测试").unwrap();
+        assert_eq!((nrows, ncols), (2, 7));
+
+        let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+        let range = wb.worksheet_range("拨款一览").unwrap();
+        assert_eq!(cell_text(range.get_value((2, 5))), "合同名称");
+        assert_eq!(cell_text(range.get_value((2, 6))), "承包单位");
+        assert_eq!(cell_text(range.get_value((3, 5))), "测试合同");
+        assert_eq!(cell_text(range.get_value((3, 6))), "某施工单位");
+        assert_eq!(cell_text(range.get_value((4, 5))), "");
+        assert_eq!(cell_text(range.get_value((4, 6))), "");
+        assert_eq!(cell_text(range.get_value((4, 0))), "BK-0002");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 行列错位的结果在写出前被挡住，而不是在 columns[ci] 处越界。
+    #[test]
+    fn 形状错位写出前返回错误而不是panic() {
+        let mut result = ReportResult::period(&[]);
+        result.rows.push(vec![Cell::Text("只有一个单元格".into())]);
+        let path = tmp_path("bad_shape");
+        let err = write_report(&result, &path, "测试").unwrap_err();
+        assert!(err.to_string().contains("第 1 行"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
 }

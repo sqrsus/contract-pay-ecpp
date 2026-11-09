@@ -982,3 +982,109 @@ fn 汇总统计_四维度合计一致_筛选生效() {
         600_000 * 100
     );
 }
+
+// ---------------------------------------------------------------- R-46 导出回归
+
+/// 读回 xlsx 单元格文字，用来核对真正写进文件的表头 / 值。
+fn xlsx_text(d: Option<&calamine::Data>) -> String {
+    match d {
+        Some(calamine::Data::String(s)) => s.clone(),
+        Some(calamine::Data::Float(f)) => f.to_string(),
+        Some(calamine::Data::Int(i)) => i.to_string(),
+        Some(calamine::Data::Empty) | None => String::new(),
+        Some(other) => format!("{other:?}"),
+    }
+}
+
+/// R-46：合同台账导出选列后，Excel 只含所选字段，列名与顺序与选择一致；
+/// 数据行仍取自同一份 `ReportResult`（筛选 / 排序后的结果）。
+#[test]
+fn 合同台账导出选列只写所选字段且顺序一致() {
+    use calamine::Reader;
+    use ctp_app::report::ReportKind;
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 100_000).unwrap();
+
+    let result = service::report_of(&conn, ReportKind::ContractLedger).unwrap();
+    assert_eq!(result.columns.len(), 9, "完整台账仍是 9 列");
+    let picked = result
+        .select_columns(&["project_status", "contract_name", "paid_amount"])
+        .unwrap();
+    assert_eq!(picked.rows.len(), result.rows.len());
+
+    let path = tmp_xlsx("contract_select");
+    let (rows, cols) = service::export_result(&conn, &picked, &path, "t").unwrap();
+    assert_eq!(rows, 1);
+    assert_eq!(cols, 3);
+
+    let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+    let range = wb.worksheet_range("合同台账").unwrap();
+    assert_eq!(xlsx_text(range.get_value((2, 0))), "项目状态");
+    assert_eq!(xlsx_text(range.get_value((2, 1))), "合同名称");
+    assert_eq!(xlsx_text(range.get_value((2, 2))), "累计已付（元）");
+    assert_eq!(xlsx_text(range.get_value((2, 3))), "", "不应有第 4 列");
+    assert_eq!(xlsx_text(range.get_value((3, 1))), "测试合同");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// R-46：拨款一览导出按 `contract_id` 补齐合同名称 / 承包单位，
+/// 且与原有导出链路（保存结果、审计日志、列数）兼容。
+#[test]
+fn 拨款一览导出补齐合同名称与承包单位() {
+    use calamine::Reader;
+    use ctp_app::report::ReportKind;
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 100_000).unwrap();
+
+    let result = service::report_of(&conn, ReportKind::PaymentLedger).unwrap();
+    assert_eq!(result.columns.len(), 7);
+    assert_eq!(result.columns[5].title, "合同名称");
+    assert_eq!(result.columns[6].title, "承包单位");
+    assert_eq!(result.rows[0][5].display(), "测试合同");
+    assert_eq!(result.rows[0][6].display(), "某施工单位");
+
+    let path = tmp_xlsx("payment_fields");
+    let (rows, cols) =
+        service::export_report(&conn, ReportKind::PaymentLedger, &path, "t").unwrap();
+    assert_eq!((rows, cols), (1, 7));
+    let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+    let range = wb.worksheet_range("拨款一览").unwrap();
+    assert_eq!(xlsx_text(range.get_value((2, 5))), "合同名称");
+    assert_eq!(xlsx_text(range.get_value((2, 6))), "承包单位");
+    assert_eq!(xlsx_text(range.get_value((3, 5))), "测试合同");
+    assert_eq!(xlsx_text(range.get_value((3, 6))), "某施工单位");
+    let _ = std::fs::remove_file(&path);
+
+    // 两个导出入口共用写文件 + 日志实现，EXPORT 留痕次数不变
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action = 'EXPORT' \
+             AND target_id = 'PAYMENT_LEDGER_V1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// R-46：查不到合同信息时，两列留空且导出照常完成。
+#[test]
+fn 拨款一览导出合同字段缺失留空不影响导出() {
+    use ctp_app::report::{PaymentContractLookup, ReportResult};
+    let (conn, _cid) = fixture(1_000_000);
+    let row = ctp_core::payment::Payment {
+        id: "PM-X".into(),
+        payment_no: "BK-X".into(),
+        contract_id: "CT-NOT-IN-LOOKUP".into(),
+        amount_cent: Money::from_cent(123_456),
+        ..Default::default()
+    };
+    let empty: PaymentContractLookup = PaymentContractLookup::new();
+    let result = ReportResult::payment_ledger_export(&[row], "全部合同", &empty);
+    assert_eq!(result.rows[0][5].display(), "");
+    assert_eq!(result.rows[0][6].display(), "");
+    let path = tmp_xlsx("payment_missing");
+    let (rows, cols) = service::export_result(&conn, &result, &path, "t").unwrap();
+    assert_eq!((rows, cols), (1, 7));
+    let _ = std::fs::remove_file(&path);
+}

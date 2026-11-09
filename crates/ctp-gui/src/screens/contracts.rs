@@ -441,11 +441,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
-    // R-33：导出与屏幕同源——按当前筛选构造完整 9 列结果（不受窄屏降列影响）
+    // R-46：导出前先选列。这里按当前搜索词 / 状态筛选后的同一份行序构造完整 9 列结果，
+    // 快照进弹窗；用户在弹窗里勾选与调序后，Excel 只写所选列、顺序与选择一致。
+    // 数据范围、入口按钮、权限与「导出失败」提示链路都沿用原逻辑。
     if export_ledger {
         let rows = filtered_summaries(app);
         let result = ReportResult::contract_ledger(&rows, LedgerColumns::FULL);
-        app.export_report_result(&result);
+        app.open_export_columns(result);
     }
 
     // 浏览用户不许触发写类动作：不置灰，点了直接提示「无权限」

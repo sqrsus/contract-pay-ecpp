@@ -8,8 +8,9 @@
 //! f64——那是 Excel 文件格式要求，不参与任何业务运算。
 
 use ctp_core::date::now_iso;
-use ctp_core::ledger::{CategoryRow, PeriodRow};
+use ctp_core::ledger::{CategoryRow, ContractSummary, PeriodRow};
 use ctp_core::money::Money;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// 已接入导出的报表。
@@ -156,6 +157,80 @@ impl ReportColumn {
             screen_remainder: false,
         }
     }
+
+    /// Excel 表头的实际文字：金额列统一补「（元）」。
+    ///
+    /// 屏幕表头与导出列选择列表也读这里，保证「选择的列名」和「Excel 表头」逐字一致，
+    /// 不再把「（元）」的拼接逻辑散落在写文件的地方。
+    pub fn excel_title(&self) -> String {
+        if self.kind == ColumnKind::Money {
+            format!("{}（元）", self.title)
+        } else {
+            self.title.to_string()
+        }
+    }
+}
+
+/// 列裁剪 / 形状校验的错误。只在导出前构造结果时产生，不碰业务数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportColumnError {
+    NoColumns,
+    EmptySelection,
+    Duplicate(String),
+    Unknown(String),
+    RowShape {
+        row: usize,
+        actual: usize,
+        expected: usize,
+    },
+    TotalsShape {
+        actual: usize,
+        expected: usize,
+    },
+}
+
+impl fmt::Display for ReportColumnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReportColumnError::NoColumns => f.write_str("报表没有任何可导出的列"),
+            ReportColumnError::EmptySelection => f.write_str("未选择任何导出列，请至少选择一列"),
+            ReportColumnError::Duplicate(k) => write!(f, "导出列重复：{k}"),
+            ReportColumnError::Unknown(k) => write!(f, "导出列不在当前字段中：{k}"),
+            ReportColumnError::RowShape {
+                row,
+                actual,
+                expected,
+            } => write!(f, "第 {} 行有 {actual} 个单元格，应为 {expected}", row + 1),
+            ReportColumnError::TotalsShape { actual, expected } => {
+                write!(f, "合计行有 {actual} 个单元格，应为 {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReportColumnError {}
+
+/// 拨款一览导出用的一份合同字段（按 `contract_id` 关联）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaymentContractFields {
+    pub contract_name: String,
+    pub contractor_name: String,
+}
+
+/// `contract_id → 合同字段`。查不到就留空，不阻断导出。
+pub type PaymentContractLookup = BTreeMap<String, PaymentContractFields>;
+
+/// 从 V1 汇总行构造查找表；同一合同 id 只保留首条，避免重复行影响取值。
+pub fn payment_contract_lookup(summaries: &[ContractSummary]) -> PaymentContractLookup {
+    let mut out = PaymentContractLookup::new();
+    for s in summaries {
+        out.entry(s.contract_id.clone())
+            .or_insert_with(|| PaymentContractFields {
+                contract_name: s.contract_name.clone(),
+                contractor_name: s.contractor_name.clone(),
+            });
+    }
+    out
 }
 
 /// 合同台账的可见列（R-33）：窄屏时按宽度逐级降列，与页面原有 9→7→5 列策略一致。
@@ -331,6 +406,74 @@ impl ReportResult {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// 形状校验：列 / 数据行 / 合计行三者长度必须一致，且至少有一列。
+    ///
+    /// 写 Excel 时按 `columns[ci]` 取列语义，若行比列短就会越界；裁剪或追加列之后
+    /// 统一在这里挡一次，把「静默 panic」变成可展示的导出错误。
+    pub fn validate_shape(&self) -> Result<(), ReportColumnError> {
+        let n = self.columns.len();
+        if n == 0 {
+            return Err(ReportColumnError::NoColumns);
+        }
+        for (i, row) in self.rows.iter().enumerate() {
+            if row.len() != n {
+                return Err(ReportColumnError::RowShape {
+                    row: i,
+                    actual: row.len(),
+                    expected: n,
+                });
+            }
+        }
+        if self.totals.len() != n {
+            return Err(ReportColumnError::TotalsShape {
+                actual: self.totals.len(),
+                expected: n,
+            });
+        }
+        Ok(())
+    }
+
+    /// 按用户选择的列 key **顺序**裁剪 / 重排一份新结果（R-46 合同台账导出选列）。
+    ///
+    /// 列名、列宽、单元格类型、数据行、合计行都从原结果按同一组下标取，
+    /// 因此 Excel 只写所选字段、列名与顺序与选择一致，且合计 / 金额格式不会错列。
+    pub fn select_columns(&self, keys: &[&str]) -> Result<Self, ReportColumnError> {
+        self.validate_shape()?;
+        if keys.is_empty() {
+            return Err(ReportColumnError::EmptySelection);
+        }
+        let mut seen = BTreeSet::new();
+        let mut indices = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !seen.insert(*key) {
+                return Err(ReportColumnError::Duplicate((*key).to_string()));
+            }
+            let idx = self
+                .columns
+                .iter()
+                .position(|c| c.key == *key)
+                .ok_or_else(|| ReportColumnError::Unknown((*key).to_string()))?;
+            indices.push(idx);
+        }
+        let columns: Vec<ReportColumn> = indices.iter().map(|&i| self.columns[i].clone()).collect();
+        let rows: Vec<Vec<Cell>> = self
+            .rows
+            .iter()
+            .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+            .collect();
+        let totals: Vec<Cell> = indices.iter().map(|&i| self.totals[i].clone()).collect();
+        Ok(ReportResult {
+            kind: self.kind,
+            title: self.title,
+            subtitle: self.subtitle.clone(),
+            unit_note: self.unit_note,
+            columns,
+            rows,
+            totals,
+            generated_at: self.generated_at.clone(),
+        })
     }
 
     /// 汇总统计：按维度 + 日期区间归集（R-29）。
@@ -592,6 +735,27 @@ impl ReportResult {
     /// 拨款一览（R-33）：按合同筛出的单据；勾选列与操作列属于交互，不进结果。
     /// 合计只累加已实付单据，作废单保留行但不计入金额。
     pub fn payment_ledger(rows: &[ctp_core::payment::Payment], contract_label: &str) -> Self {
+        Self::payment_ledger_impl(rows, contract_label, None)
+    }
+
+    /// 拨款一览 **Excel 导出专用**（R-46）：与明细表共用同一套取数 / 合计逻辑，
+    /// 额外追加「合同名称」「承包单位」两列，按每行 `contract_id` 查表填充。
+    ///
+    /// 查不到对应合同、或字段本身为空时写空串，不跳过行、不报错；
+    /// 屏幕明细表仍走 `payment_ledger`，列数保持 5 列不变。
+    pub fn payment_ledger_export(
+        rows: &[ctp_core::payment::Payment],
+        contract_label: &str,
+        lookup: &PaymentContractLookup,
+    ) -> Self {
+        Self::payment_ledger_impl(rows, contract_label, Some(lookup))
+    }
+
+    fn payment_ledger_impl(
+        rows: &[ctp_core::payment::Payment],
+        contract_label: &str,
+        export_lookup: Option<&PaymentContractLookup>,
+    ) -> Self {
         use ctp_core::payment::PaymentStatus;
         let kind = ReportKind::PaymentLedger;
         let mut columns = vec![
@@ -602,6 +766,22 @@ impl ReportResult {
             ReportColumn::new("status", "状态", ColumnKind::Text, 10.0, 54.0),
         ];
         columns[3].screen_remainder = true;
+        if export_lookup.is_some() {
+            columns.push(ReportColumn::new(
+                "contract_name",
+                "合同名称",
+                ColumnKind::Text,
+                34.0,
+                150.0,
+            ));
+            columns.push(ReportColumn::new(
+                "contractor_name",
+                "承包单位",
+                ColumnKind::Text,
+                22.0,
+                120.0,
+            ));
+        }
 
         let total: i64 = Money::sum_saturating(
             rows.iter()
@@ -612,22 +792,42 @@ impl ReportResult {
             .iter()
             .map(|p| {
                 let voided = p.status == PaymentStatus::Void;
-                vec![
+                let mut cells = vec![
                     Cell::Text(p.payment_no.clone()),
                     Cell::Text(p.pay_date.clone()),
                     Cell::Money(p.amount_cent),
                     Cell::Text(p.reason.clone().unwrap_or_else(|| "—".into())),
                     Cell::Text(if voided { "作废" } else { "已付" }.to_string()),
-                ]
+                ];
+                if let Some(lookup) = export_lookup {
+                    let found = lookup.get(&p.contract_id);
+                    cells.push(Cell::Text(
+                        found
+                            .map(|f| f.contract_name.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ));
+                    cells.push(Cell::Text(
+                        found
+                            .map(|f| f.contractor_name.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ));
+                }
+                cells
             })
             .collect();
-        let totals = vec![
+        let mut totals = vec![
             Cell::Text("合计".to_string()),
             Cell::Text(String::new()),
             Cell::Money(Money::from_cent(total)),
             Cell::Text(String::new()),
             Cell::Text(String::new()),
         ];
+        if export_lookup.is_some() {
+            totals.push(Cell::Text(String::new()));
+            totals.push(Cell::Text(String::new()));
+        }
 
         ReportResult {
             kind,
@@ -788,5 +988,115 @@ mod tests {
                 "ratio_bp({n},{d}) 必须与 Rate::ratio 一致"
             );
         }
+    }
+
+    // ------------------------------------------------------------ R-46 导出列选择
+
+    #[test]
+    fn 列选择按指定顺序裁剪且保留取值与合计() {
+        let r = ReportResult::period(&period_rows());
+        let picked = r.select_columns(&["amount", "period_month"]).unwrap();
+        assert_eq!(
+            picked.columns.iter().map(|c| c.title).collect::<Vec<_>>(),
+            vec!["支付金额", "期间"]
+        );
+        assert_eq!(picked.columns[0].excel_title(), "支付金额（元）");
+        assert_eq!(picked.columns[1].excel_title(), "期间");
+        assert_eq!(picked.rows.len(), r.rows.len());
+        assert_eq!(picked.rows[0][0].yuan(), Some(300_000.0));
+        assert_eq!(picked.rows[0][1].display(), "2026-06");
+        assert_eq!(picked.rows[1][1].display(), "2026-07");
+        assert_eq!(picked.totals[0].yuan(), Some(400_000.0));
+        assert_eq!(picked.totals[1].display(), "合计");
+        assert_eq!(picked.kind, r.kind);
+        assert_eq!(picked.subtitle, r.subtitle);
+        picked.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn 列选择校验挡住空重复未知与行列错位() {
+        let r = ReportResult::period(&period_rows());
+        assert_eq!(
+            r.select_columns(&[]),
+            Err(ReportColumnError::EmptySelection)
+        );
+        assert_eq!(
+            r.select_columns(&["amount", "amount"]),
+            Err(ReportColumnError::Duplicate("amount".into()))
+        );
+        assert_eq!(
+            r.select_columns(&["不存在的列"]),
+            Err(ReportColumnError::Unknown("不存在的列".into()))
+        );
+        let mut short = r.clone();
+        short.rows[0].pop();
+        assert_eq!(
+            short.select_columns(&["amount"]),
+            Err(ReportColumnError::RowShape {
+                row: 0,
+                actual: 3,
+                expected: 4
+            })
+        );
+        let mut bad_totals = r.clone();
+        bad_totals.totals.pop();
+        assert_eq!(
+            bad_totals.select_columns(&["amount"]),
+            Err(ReportColumnError::TotalsShape {
+                actual: 3,
+                expected: 4
+            })
+        );
+    }
+
+    fn payment_rows() -> Vec<ctp_core::payment::Payment> {
+        use ctp_core::payment::Payment;
+        vec![
+            Payment {
+                id: "PM-1".into(),
+                payment_no: "BK-0001".into(),
+                contract_id: "CT-1".into(),
+                pay_date: "2026-06-30".into(),
+                amount_cent: Money::from_cent(1_000_000),
+                ..Default::default()
+            },
+            Payment {
+                id: "PM-2".into(),
+                payment_no: "BK-0002".into(),
+                // 查找表里没有这份合同：两列都应留空，且不影响本行其他字段
+                contract_id: "CT-UNKNOWN".into(),
+                pay_date: "2026-07-01".into(),
+                amount_cent: Money::from_cent(500_000),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn 拨款一览导出补齐合同字段且缺失留空() {
+        let rows = payment_rows();
+        let mut lookup = PaymentContractLookup::new();
+        lookup.insert(
+            "CT-1".into(),
+            PaymentContractFields {
+                contract_name: "测试合同".into(),
+                contractor_name: "某施工单位".into(),
+            },
+        );
+        let screen = ReportResult::payment_ledger(&rows, "全部合同");
+        assert_eq!(screen.columns.len(), 5, "屏幕明细表仍保持 5 列");
+        let exported = ReportResult::payment_ledger_export(&rows, "全部合同", &lookup);
+        assert_eq!(exported.columns.len(), 7);
+        assert_eq!(exported.columns[5].title, "合同名称");
+        assert_eq!(exported.columns[6].title, "承包单位");
+        assert_eq!(exported.rows[0][5].display(), "测试合同");
+        assert_eq!(exported.rows[0][6].display(), "某施工单位");
+        assert_eq!(exported.rows[1][5].display(), "", "查不到合同应留空");
+        assert_eq!(exported.rows[1][6].display(), "", "查不到合同应留空");
+        assert_eq!(exported.rows[1][0].display(), "BK-0002");
+        assert_eq!(exported.totals.len(), 7);
+        assert_eq!(exported.totals[2].yuan(), Some(15_000.0));
+        screen.validate_shape().unwrap();
+        exported.validate_shape().unwrap();
     }
 }

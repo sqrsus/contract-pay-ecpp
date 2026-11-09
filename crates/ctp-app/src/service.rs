@@ -975,15 +975,22 @@ pub fn report_of(
             SummaryDim::ContractType,
             &range_filter(default_summary_range()),
         ),
-        // 台账 / 一览：命令行与默认导出口径取全量；界面按筛选与窄屏列自己构造结果
+        // 台账：CLI 与默认导出口径取全量；界面按筛选 / 选列自己构造结果
         ReportKind::ContractLedger => Ok(crate::report::ReportResult::contract_ledger(
             &repo::summaries(conn)?,
             crate::report::LedgerColumns::FULL,
         )),
-        ReportKind::PaymentLedger => Ok(crate::report::ReportResult::payment_ledger(
-            &repo::list_payments(conn, None)?,
-            "全部合同",
-        )),
+        // 拨款一览：导出要带「合同名称 / 承包单位」，按 contract_id 关联 V1 汇总行；
+        // 查不到的记录留空，不影响导出。
+        ReportKind::PaymentLedger => {
+            let payments = repo::list_payments(conn, None)?;
+            let lookup = crate::report::payment_contract_lookup(&repo::summaries(conn)?);
+            Ok(crate::report::ReportResult::payment_ledger_export(
+                &payments,
+                "全部合同",
+                &lookup,
+            ))
+        }
     }
 }
 
@@ -1013,24 +1020,7 @@ pub fn export_report(
     operator: &str,
 ) -> Result<(usize, usize)> {
     let result = report_of(conn, kind)?;
-    let (rows, cols) = crate::xlsx::write_report(&result, path, operator)?;
-    let detail = serde_json::json!({
-        "report": kind.code(),
-        "file": path.to_string_lossy(),
-        "rows": rows,
-        "columns": cols,
-    })
-    .to_string();
-    db::insert_audit_log(
-        conn,
-        "report",
-        kind.code(),
-        Some(kind.title()),
-        "EXPORT",
-        Some(&detail),
-        operator,
-    )?;
-    Ok((rows, cols))
+    write_and_log(conn, &result, path, operator, None)
 }
 
 /// 导出**已经算好**的报表结果。
@@ -1043,22 +1033,37 @@ pub fn export_result(
     path: &std::path::Path,
     operator: &str,
 ) -> Result<(usize, usize)> {
+    write_and_log(conn, result, path, operator, Some(&result.subtitle))
+}
+
+/// 两个导出入口共用的「写 .xlsx + 落审计日志」。
+///
+/// `subtitle` 只影响审计 detail 里是否多记一句口径说明，保持两个入口原有的日志内容不变；
+/// 写文件、行列数、日志字段、操作者都只有这一处实现。
+fn write_and_log(
+    conn: &Connection,
+    result: &crate::report::ReportResult,
+    path: &std::path::Path,
+    operator: &str,
+    subtitle: Option<&str>,
+) -> Result<(usize, usize)> {
     let (rows, cols) = crate::xlsx::write_report(result, path, operator)?;
-    let detail = serde_json::json!({
+    let mut detail = serde_json::json!({
         "report": result.kind.code(),
         "file": path.to_string_lossy(),
         "rows": rows,
         "columns": cols,
-        "subtitle": result.subtitle,
-    })
-    .to_string();
+    });
+    if let Some(s) = subtitle {
+        detail["subtitle"] = serde_json::Value::String(s.to_string());
+    }
     db::insert_audit_log(
         conn,
         "report",
         result.kind.code(),
         Some(result.kind.title()),
         "EXPORT",
-        Some(&detail),
+        Some(&detail.to_string()),
         operator,
     )?;
     Ok((rows, cols))

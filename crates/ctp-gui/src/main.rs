@@ -264,6 +264,8 @@ pub struct App {
     pub dialog: Dialog,
     /// 批量导入结果弹窗的数据（与 `Dialog::ImportResult` 配套，保持 Dialog 可 Copy）
     pub import_result: Option<crate::dialogs::ImportResultView>,
+    /// 合同台账导出列选择弹窗的数据（R-46，与 `Dialog::ExportColumns` 配套）
+    pub export_columns: Option<crate::dialogs::ExportColumnsView>,
     pub confirm: Option<Confirm>,
     pub confirm_reason: String,
     pub toast: Option<Toast>,
@@ -396,6 +398,7 @@ impl App {
             log_clear: None,
             dialog: Dialog::None,
             import_result: None,
+            export_columns: None,
             confirm: None,
             confirm_reason: String::new(),
             toast: None,
@@ -871,37 +874,21 @@ impl App {
         }
     }
 
-    /// 报表导出：弹保存框 → 从视图构造 `ReportResult` → 写 .xlsx → 落 EXPORT 审计日志。
+    /// 报表导出：弹保存框 → 写 .xlsx → 落 EXPORT 审计日志。
     ///
     /// 屏幕表格与导出读的是同一份 `ReportResult` 构造逻辑（文档 4.4.2）。
     pub fn export_report(&mut self, kind: ReportKind) {
-        // 闭包把不可变借用限制在内部，结束后才能安全地写 toast。
-        let outcome: Result<(usize, std::path::PathBuf), String> = (|| {
-            let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
-            let file_name = ctp_app::service::report_of(conn, kind)
-                .map(|r| r.default_file_name())
-                .unwrap_or_else(|_| format!("{}.xlsx", kind.file_stem()));
-            let path = rfd::FileDialog::new()
-                .set_file_name(&file_name)
-                .add_filter("Excel 工作簿", &["xlsx"])
-                .save_file()
-                // 用户取消保存框：用空串标记，不弹错误提示
-                .ok_or_else(String::new)?;
-            let (rows, _) = ctp_app::service::export_report(conn, kind, &path, "界面用户")
-                .map_err(|e| e.to_string())?;
-            Ok((rows, path))
-        })();
-
-        match outcome {
-            Ok((rows, path)) => self.success(format!(
-                "已导出「{}」{} 行 → {}",
-                kind.title(),
-                rows,
-                path.display()
-            )),
-            Err(e) if e.is_empty() => {}
-            Err(e) => self.error(format!("导出失败：{e}")),
-        }
+        // 默认文件名仍由 report_of 给出；查询失败时沿用原来的「{报表名}.xlsx」兜底，
+        // 真正的错误交给保存框之后的导出链路提示。
+        let file_name = self
+            .db
+            .as_ref()
+            .and_then(|conn| ctp_app::service::report_of(conn, kind).ok())
+            .map(|r| r.default_file_name())
+            .unwrap_or_else(|| format!("{}.xlsx", kind.file_stem()));
+        self.save_report(kind.title(), &file_name, |conn, path| {
+            ctp_app::service::export_report(conn, kind, path, "界面用户")
+        });
     }
 
     /// 导出当前汇总结果（区间由界面决定，不能走 `report_of` 的默认区间）。
@@ -916,27 +903,47 @@ impl App {
     /// 导出任意一份已构造好的 `ReportResult`（汇总统计 / 合同台账 / 拨款一览通用）。
     /// 屏幕与 Excel 读同一个结果对象，不重新查库、不重算合计。
     pub fn export_report_result(&mut self, result: &ctp_app::report::ReportResult) {
-        let outcome: Result<(usize, std::path::PathBuf), String> = (|| {
+        let file_name = result.default_file_name();
+        self.save_report(result.title, &file_name, |conn, path| {
+            ctp_app::service::export_result(conn, result, path, "界面用户")
+        });
+    }
+
+    /// 所有导出入口共用的「保存框 → 写出 → 成功 / 失败提示」。
+    ///
+    /// 取消保存框用空串静默返回，失败统一走 `导出失败：{e}`，
+    /// 成功提示文案保持「已导出「{标题}」{行数} 行 → {路径}」不变。
+    fn save_report(
+        &mut self,
+        title: &str,
+        file_name: &str,
+        write: impl FnOnce(&Connection, &std::path::Path) -> ctp_store::Result<(usize, usize)>,
+    ) {
+        let outcome: Result<(usize, PathBuf), String> = (|| {
             let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
             let path = rfd::FileDialog::new()
-                .set_file_name(result.default_file_name())
+                .set_file_name(file_name)
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .save_file()
+                // 用户取消保存框：用空串标记，不弹错误提示
                 .ok_or_else(String::new)?;
-            let (rows, _) = ctp_app::service::export_result(conn, result, &path, "界面用户")
-                .map_err(|e| e.to_string())?;
+            let (rows, _) = write(conn, &path).map_err(|e| e.to_string())?;
             Ok((rows, path))
         })();
         match outcome {
-            Ok((rows, path)) => self.success(format!(
-                "已导出「{}」{} 行 → {}",
-                result.title,
-                rows,
-                path.display()
-            )),
+            Ok((rows, path)) => {
+                self.success(format!("已导出「{title}」{rows} 行 → {}", path.display()))
+            }
             Err(e) if e.is_empty() => {}
             Err(e) => self.error(format!("导出失败：{e}")),
         }
+    }
+
+    /// 合同台账「导出 Excel」：先把当前筛选 / 排序下的完整结果快照进列选择弹窗，
+    /// 用户确认后才投影列并进入保存框，数据范围不会再重算。
+    pub fn open_export_columns(&mut self, result: ctp_app::report::ReportResult) {
+        self.export_columns = Some(crate::dialogs::ExportColumnsView::new(result));
+        self.dialog = Dialog::ExportColumns;
     }
 
     /// 打开常驻的导入结果弹窗（成功 / 部分失败 / 全部失败 / 整份拒绝都走这里）。
@@ -1190,6 +1197,7 @@ impl App {
         if logout {
             self.role = None;
             crate::dialogs::dismiss_import_result(&mut self.dialog, &mut self.import_result);
+            crate::dialogs::dismiss_export_columns(&mut self.dialog, &mut self.export_columns);
             crate::dialogs::dismiss_print_failure(&mut self.print_failure);
             dismiss_print_success(&mut self.print_success);
             self.print_render_failed = false;
