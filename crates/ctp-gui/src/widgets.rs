@@ -641,16 +641,36 @@ fn suggestion_row(ui: &mut Ui, p: &Palette, text: &str, width: f32) -> Response 
 /// 合同下拉一次最多画多少行：几百份合同一次铺开既卡帧也看不清，超出靠筛选收敛。
 const MAX_CONTRACT_ROWS: usize = 200;
 
-/// 合同在列表里的显示串：`编号 · 名称`。编号由系统生成、全局唯一，放前面便于对号。
-fn contract_option_label(s: &ctp_core::ledger::ContractSummary) -> String {
-    format!("{} · {}", s.contract_no, s.contract_name)
+/// 合同名称字号，收起态按钮与下拉行共用。
+const NAME_SIZE: f32 = 12.5;
+/// 行左内缩；选中行要让开主色竖条，多缩 4 px。
+const ROW_LEFT_PAD: f32 = 8.0;
+const ROW_LEFT_PAD_SELECTED: f32 = 12.0;
+/// 名称与右侧承包单位列之间的最小间距。
+const ROW_RIGHT_GAP: f32 = 6.0;
+/// 同名时右侧承包单位列的宽度。
+const DUP_ORG_W: f32 = 128.0;
+/// 名称溢出时右侧 `›` 提示预留的宽度。
+const OVERFLOW_HINT_W: f32 = 12.0;
+
+/// 名称的排版宽度（与绘制同字体同字号）：判断是否需要横向滚动的唯一依据。
+fn name_width(ui: &Ui, name: &str) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(
+            name.to_owned(),
+            egui::FontId::proportional(NAME_SIZE),
+            Color32::WHITE,
+        )
+        .size()
+        .x
+    })
 }
 
 /// 按筛选词过滤合同：空格分隔多个词，**全部**命中才算（AND）。
 ///
-/// 每个词在「编号 / 名称 / 承包单位」任一字段出现即可，因此
-/// 「道路 监理」能同时缩小到道路类的监理合同，输入单位名也能直接定位。
-/// 空筛选返回全部——下拉要能看到数据库里的所有合同（R-53）。
+/// R-54 起**只看合同名称**：编号与承包单位都不再参与匹配，
+/// 与「下拉项只显示名称」保持一致——看得见什么就能搜什么。
+/// 空筛选返回全部，下拉要能看到数据库里的所有合同（R-53）。
 fn contract_hits<'a>(
     items: &'a [ctp_core::ledger::ContractSummary],
     filter: &str,
@@ -663,13 +683,91 @@ fn contract_hits<'a>(
     items
         .iter()
         .filter(|s| {
-            words.iter().all(|w| {
-                s.contract_no.to_lowercase().contains(w.as_str())
-                    || s.contract_name.to_lowercase().contains(w.as_str())
-                    || s.contractor_name.to_lowercase().contains(w.as_str())
-            })
+            words
+                .iter()
+                .all(|w| s.contract_name.to_lowercase().contains(w.as_str()))
         })
         .collect()
+}
+
+/// 弹层内容宽度：按本屏最长的合同名称撑开，夹在「按钮宽度」与「屏幕可用宽度」之间。
+///
+/// 默认态是名称完整可见；只有达到屏幕上限后才出现横向滚动（R-54）。
+fn popup_inner_width(longest_name: f32, right_w: f32, base: f32, cap: f32) -> f32 {
+    let needed = ROW_LEFT_PAD_SELECTED + longest_name + ROW_RIGHT_GAP + right_w + OVERFLOW_HINT_W;
+    needed.clamp(base, cap.max(base))
+}
+
+/// 横向滚动的记忆键：按用途 + 合同 id 分桶，换一份合同自然回到最左。
+fn hscroll_id(widget: &str, scope: &str, key: &str) -> egui::Id {
+    egui::Id::new((widget, scope, key))
+}
+
+/// 处理「Shift + 滚轮」的横向滚动（egui 已把 Shift+纵向滚轮折算成横向 delta），
+/// 返回本帧的偏移量。只有 `content_w > view_w` 时才可能非 0。
+fn hscroll_offset(ui: &Ui, key: egui::Id, hovered: bool, content_w: f32, view_w: f32) -> f32 {
+    let max_off = (content_w - view_w).max(0.0);
+    let mut off = ui
+        .memory(|m| m.data.get_temp::<f32>(key))
+        .unwrap_or(0.0)
+        .clamp(0.0, max_off);
+    if max_off <= 0.0 {
+        ui.memory_mut(|m| m.data.insert_temp(key, 0.0));
+        return 0.0;
+    }
+    if hovered {
+        let dx = ui.input(|i| i.smooth_scroll_delta.x);
+        if dx != 0.0 {
+            off = (off - dx).clamp(0.0, max_off);
+            // 吃掉横向分量，避免同一帧里再被别的滚动区消费一次
+            ui.ctx().input_mut(|i| i.smooth_scroll_delta.x = 0.0);
+        }
+    }
+    ui.memory_mut(|m| m.data.insert_temp(key, off));
+    off
+}
+
+/// 在 `area` 内画合同名称：放不下时按住 Shift 滚轮左右滚动查看，
+/// 右侧常驻 `›` 提示还有内容，滚到末尾提示消失（R-54）。
+fn scrollable_name(
+    ui: &Ui,
+    p: &Palette,
+    text: &str,
+    area: egui::Rect,
+    key: egui::Id,
+    hovered: bool,
+    color: Color32,
+) {
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(NAME_SIZE),
+            color,
+        )
+    });
+    let text_w = galley.size().x;
+    let overflow = text_w > area.width() + 0.5;
+    // 溢出时右侧让出 12 px 给 `›`，避免提示压在字上
+    let view_w = if overflow {
+        (area.width() - OVERFLOW_HINT_W).max(1.0)
+    } else {
+        area.width()
+    };
+    let off = hscroll_offset(ui, key, hovered && overflow, text_w, view_w);
+    let view = egui::Rect::from_min_max(area.min, egui::pos2(area.left() + view_w, area.bottom()));
+    let y = area.center().y - galley.size().y / 2.0;
+    ui.painter()
+        .with_clip_rect(view)
+        .galley(egui::pos2(view.left() - off, y), galley, color);
+    if overflow && off < text_w - view_w - 0.5 {
+        ui.painter().text(
+            egui::pos2(area.right(), area.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "›",
+            egui::FontId::proportional(14.0),
+            p.text_muted,
+        );
+    }
 }
 
 /// 可搜索的合同下拉框：按钮显示当前合同，展开后列出全部合同，顶部可输入筛选。
@@ -700,29 +798,42 @@ pub fn contract_select(
         },
         Stroke::new(1.0_f32, if *open { p.primary } else { p.border }),
     );
+    // 收起态只显示名称（R-54）：放不下时同样按住 Shift 滚轮左右看，不再拼编号
     let (label, label_color) = match current {
-        Some(s) => (contract_option_label(s), p.text),
-        None => ("请选择合同".to_string(), p.text_muted),
+        Some(s) => (s.contract_name.as_str(), p.text),
+        None => ("请选择合同", p.text_muted),
     };
-    // 文字区右侧给箭头留 24 px，长名称在框内截断，不压缩箭头
+    // 文字区右侧给箭头留 24 px，名称再长也不压缩箭头
     let label_clip = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 8.0, rect.top()),
         egui::pos2(rect.right() - 24.0, rect.bottom()),
     );
-    ui.painter().with_clip_rect(label_clip).text(
-        egui::pos2(rect.left() + 8.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
+    scrollable_name(
+        ui,
+        p,
         label,
-        egui::FontId::proportional(12.5),
+        label_clip,
+        hscroll_id(id, "cs_btn", selected.unwrap_or("-")),
+        resp.hovered(),
         label_color,
     );
-    ui.painter().text(
-        egui::pos2(rect.right() - 10.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        "▾",
-        egui::FontId::proportional(12.0),
-        p.text_muted,
+    // 字体里没有 ▾ 的字形（会画成空心方块），下拉箭头直接用两条线画
+    let arrow = egui::pos2(rect.right() - 14.0, rect.center().y - 2.0);
+    let arrow_stroke = Stroke::new(1.4_f32, p.text_muted);
+    ui.painter().line_segment(
+        [arrow + egui::vec2(-4.0, 0.0), arrow + egui::vec2(0.0, 4.0)],
+        arrow_stroke,
     );
+    ui.painter().line_segment(
+        [arrow + egui::vec2(0.0, 4.0), arrow + egui::vec2(4.0, 0.0)],
+        arrow_stroke,
+    );
+    // 名称超出按钮宽度时给出滚动提示，正常情况下不打扰
+    let resp = if name_width(ui, label) > label_clip.width() {
+        resp.on_hover_text("按住 Shift + 滚轮左右查看完整名称")
+    } else {
+        resp
+    };
 
     if resp.clicked() {
         *open = !*open;
@@ -771,9 +882,41 @@ pub fn contract_select(
 
     if *open {
         let mut hl: usize = ui.memory(|m| m.data.get_temp::<usize>(hl_id)).unwrap_or(0);
+        let hits = contract_hits(items, filter);
+        // 同名时光看名称分不清，右侧才补承包单位；这里同时决定整列预留的宽度
+        let mut name_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for s in &hits {
+            *name_count.entry(s.contract_name.as_str()).or_insert(0) += 1;
+        }
+        let right_w = if name_count.values().any(|&n| n > 1) {
+            DUP_ORG_W
+        } else {
+            0.0
+        };
+
+        // 弹层默认按本屏最长的名称撑开，名称完整可见；达到窗口上限才退化为横向滚动
+        let longest = hits
+            .iter()
+            .map(|s| name_width(ui, &s.contract_name))
+            .fold(0.0_f32, f32::max);
+        let base_inner = (width - 16.0).max(200.0);
+        let cap = (ui.ctx().screen_rect().width() - 64.0).max(base_inner);
+        let inner_w = popup_inner_width(longest, right_w, base_inner, cap);
+        let name_cut = ROW_LEFT_PAD_SELECTED + longest + ROW_RIGHT_GAP + right_w + OVERFLOW_HINT_W
+            > inner_w + 0.5;
+
+        // 弹层比按钮宽时向右撑会被窗口切掉，先把整体位置往左挪
+        let total_w = inner_w + 18.0;
+        let screen = ui.ctx().screen_rect();
+        let left = rect
+            .left()
+            .min((screen.right() - total_w - 12.0).max(8.0))
+            .max(8.0);
+
         let area = egui::Area::new(egui::Id::new((id, "cs_area")))
             .order(egui::Order::Foreground)
-            .fixed_pos(rect.left_bottom() + egui::vec2(0.0, 4.0))
+            .fixed_pos(egui::pos2(left, rect.bottom() + 4.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::none()
                     .fill(p.surface)
@@ -781,13 +924,12 @@ pub fn contract_select(
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::symmetric(8.0, 8.0))
                     .show(ui, |ui| {
-                        let inner_w = (width - 16.0).max(200.0);
                         ui.set_width(inner_w);
                         let fresp = ui.add_sized(
                             [inner_w, 26.0],
                             egui::TextEdit::singleline(filter)
                                 .hint_text(
-                                    RichText::new("输入编号 / 名称 / 承包单位筛选")
+                                    RichText::new("输入合同名称筛选")
                                         .size(11.5)
                                         .color(p.text_muted),
                                 )
@@ -804,7 +946,6 @@ pub fn contract_select(
                             .hline(l..=(l + inner_w), rule_y, Stroke::new(1.0_f32, p.border));
                         ui.add_space(6.0);
 
-                        let hits = contract_hits(items, filter);
                         if just_opened {
                             hl = hits
                                 .iter()
@@ -819,12 +960,6 @@ pub fn contract_select(
                         }
                         if key_up {
                             hl = hl.saturating_sub(1);
-                        }
-                        // 同名合同光看「编号 · 名称」一样，右侧补承包单位才能分清
-                        let mut name_count: std::collections::HashMap<&str, usize> =
-                            std::collections::HashMap::new();
-                        for s in &hits {
-                            *name_count.entry(s.contract_name.as_str()).or_insert(0) += 1;
                         }
 
                         let shown = hits.len().min(MAX_CONTRACT_ROWS);
@@ -861,6 +996,7 @@ pub fn contract_select(
                                             selected == Some(s.contract_id.as_str()),
                                             i == hl,
                                             inner_w,
+                                            id,
                                         );
                                         if row.hovered() {
                                             hl = i;
@@ -887,6 +1023,11 @@ pub fn contract_select(
                         } else {
                             format!("匹配 {} / 共 {total} 份", hits.len())
                         };
+                        let tip = if name_cut {
+                            format!("{tip} · 名称过长时按住 Shift 滚轮左右查看")
+                        } else {
+                            tip
+                        };
                         ui.label(RichText::new(tip).size(10.5).color(p.text_muted));
                     });
             });
@@ -910,6 +1051,10 @@ pub fn contract_select(
 }
 
 /// 下拉里的一行：整行可点，悬停/高亮有底色，当前选中项左侧带主色竖条。
+///
+/// 只画合同名称（R-54）；名称超出可用宽度时按 Shift+滚轮横向滚动，
+/// 同名时右侧补承包单位小字，否则两行一模一样无从分辨。
+#[allow(clippy::too_many_arguments)]
 fn contract_row(
     ui: &mut Ui,
     p: &Palette,
@@ -918,6 +1063,7 @@ fn contract_row(
     selected: bool,
     highlight: bool,
     width: f32,
+    widget: &str,
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
     if selected {
@@ -936,17 +1082,23 @@ fn contract_row(
             .rect_filled(rect, Rounding::same(5.0), p.surface_alt);
     }
 
-    let left_pad = if selected { 12.0 } else { 8.0 };
-    let right_w = if right.is_some() { 128.0 } else { 0.0 };
-    let text_clip = egui::Rect::from_min_max(
+    let left_pad = if selected {
+        ROW_LEFT_PAD_SELECTED
+    } else {
+        ROW_LEFT_PAD
+    };
+    let right_w = if right.is_some() { DUP_ORG_W } else { 0.0 };
+    let name_area = egui::Rect::from_min_max(
         egui::pos2(rect.left() + left_pad, rect.top()),
-        egui::pos2(rect.right() - right_w - 6.0, rect.bottom()),
+        egui::pos2(rect.right() - right_w - ROW_RIGHT_GAP, rect.bottom()),
     );
-    ui.painter().with_clip_rect(text_clip).text(
-        egui::pos2(rect.left() + left_pad, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        contract_option_label(s),
-        egui::FontId::proportional(12.5),
+    scrollable_name(
+        ui,
+        p,
+        &s.contract_name,
+        name_area,
+        hscroll_id(widget, "cs_row", &s.contract_id),
+        resp.hovered(),
         p.text,
     );
     if let Some(t) = right {
@@ -1341,8 +1493,10 @@ mod tests {
         );
     }
 
+    /// R-54：筛选只看合同名称——编号与承包单位都不再参与，
+    /// 保证「看得见什么就能搜什么」，不出现搜到了却看不出原因的命中。
     #[test]
-    fn 合同下拉_多词与承包单位都能命中() {
+    fn 合同下拉_只按名称筛选() {
         let list = vec![
             合同(
                 "C1",
@@ -1353,27 +1507,22 @@ mod tests {
             合同("C2", "HT-2026-002", "道路工程施工监理服务", "某监理公司"),
             合同("C3", "HT-2026-003", "沥青混合料采购", "某材料公司"),
         ];
-        // 两个词都落在名称上，AND 之后只剩监理合同
+        assert_eq!(
+            编号们(&contract_hits(&list, "道路")),
+            ["HT-2026-001", "HT-2026-002"]
+        );
+        // 多词 AND：都落在名称上，只剩监理合同
         assert_eq!(编号们(&contract_hits(&list, "道路 监理")), ["HT-2026-002"]);
-        // 关键词落在承包单位上也能定位
-        assert_eq!(编号们(&contract_hits(&list, "材料")), ["HT-2026-003"]);
-        // 编号片段 + 名称词混合
-        assert_eq!(
-            编号们(&contract_hits(&list, "HT-2026-001 总承包")),
-            ["HT-2026-001"]
-        );
-        // 忽略大小写
-        assert_eq!(
-            编号们(&contract_hits(&list, "ht-2026-002")),
-            ["HT-2026-002"]
-        );
+        // 系统编号、承包单位都不再命中
+        assert!(contract_hits(&list, "HT-2026-001").is_empty());
+        assert!(contract_hits(&list, "某材料公司").is_empty());
         assert!(contract_hits(&list, "不存在的关键字").is_empty());
     }
 
-    /// 名称里带外部标段号（真实库 HT-2026-005 的情形）不影响检索，
-    /// 也不会把「输入到一半的编号」当成已选中——列表只是过滤，选中靠点选。
+    /// 名称里带外部标段号（真实库 HT-2026-005 的情形）仍按名称原文命中；
+    /// 系统编号本身不再参与检索，半截编号也不会再「唯一命中就替你选」。
     #[test]
-    fn 合同下拉_名称带外部编号仍按自身编号检索() {
+    fn 合同下拉_名称里的编号串按名称命中() {
         let list = vec![
             合同(
                 "C5",
@@ -1389,11 +1538,28 @@ mod tests {
             ),
         ];
         assert_eq!(编号们(&contract_hits(&list, "SC-NLTD")), ["HT-2026-005"]);
-        assert_eq!(
-            编号们(&contract_hits(&list, "HT-2026-001")),
-            ["HT-2026-001"]
+        assert!(contract_hits(&list, "HT-2026-001").is_empty());
+        assert!(contract_hits(&list, "HT-2026-00").is_empty());
+    }
+
+    /// 弹层宽度：默认按最长名称撑开（名称完整可见），到屏幕上限才停住，
+    /// 停住之后才轮到横向滚动。
+    #[test]
+    fn 合同下拉_弹层宽度按名称自适应且不超上限() {
+        let base = 356.0;
+        let cap = 1200.0;
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        // 短名称：保持按钮宽度，不跟着缩
+        assert!(close(popup_inner_width(80.0, 0.0, base, cap), base));
+        // 长名称：撑到刚好放下（左内缩 + 名称 + 间距 + 溢出提示）
+        let wide = popup_inner_width(600.0, 0.0, base, cap);
+        assert!(wide > 600.0 && wide < 660.0, "实际 {wide}");
+        // 超过屏幕上限：停在 cap，剩余内容靠横向滚动
+        assert!(close(popup_inner_width(4000.0, 0.0, base, cap), cap));
+        // 同名时要额外给右侧承包单位列留位
+        assert!(
+            popup_inner_width(300.0, DUP_ORG_W, base, cap)
+                > popup_inner_width(300.0, 0.0, base, cap)
         );
-        // 半截编号同时匹配两份：都列出来让用户挑，不再「唯一命中就替你选」
-        assert_eq!(contract_hits(&list, "HT-2026-00").len(), 2);
     }
 }
