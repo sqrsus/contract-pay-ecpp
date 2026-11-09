@@ -1469,3 +1469,28 @@ fn 承包单位写成编码加名称不重复建档() {
     assert_eq!(made.contractor_name, "新单位", "编码前缀不该进单位名称");
     assert_eq!(orgs.len(), org_count + 1, "只应新增一条");
 }
+
+// ---------------------------------------------------------------- R-56
+
+/// R-56：变更明细里的合同类别用中文名，不把 GC / SB 编码直接递给用户。
+///
+/// 比较口径沿用现有实现（表单输入值 vs 库中旧值），本测试只校验展示层转换：
+/// 旧值应为「工程款」、新值应为「设备款」，与界面下拉显示一致。
+#[test]
+fn 修改合同类别_变更明细显示中文名() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let before = repo::get_contract(&conn, &cid).unwrap();
+    assert_eq!(before.contract_category_code, "GC", "样例库应为工程款");
+
+    let mut input = edit_like(&before, "测试项目");
+    input.contract_category_code = "SB".into();
+
+    let edited = service::update_contract_master(&mut conn, &cid, input, "类别更正", "t").unwrap();
+    let row = edited
+        .changes
+        .iter()
+        .find(|c| c.field == "合同类别")
+        .expect("类别变了必须进变更清单");
+    assert_eq!(row.old, "工程款", "修改前用中文名");
+    assert_eq!(row.new, "设备款", "修改后用中文名");
+}

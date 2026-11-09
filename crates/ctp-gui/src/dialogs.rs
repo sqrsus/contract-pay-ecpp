@@ -670,11 +670,7 @@ impl EditContractForm {
         projects: &[ctp_core::project::Project],
         contractors: &[ctp_core::project::Contractor],
     ) -> Self {
-        let project_text = projects
-            .iter()
-            .find(|p| p.id == c.project_id)
-            .map(|p| p.project_name.clone())
-            .unwrap_or_default();
+        let project_text = project_name_by_id(projects, &c.project_id).unwrap_or_default();
         let contractor_text = contractors
             .iter()
             .find(|x| x.id == c.contractor_id)
@@ -1547,6 +1543,17 @@ fn ac_field_pick(
         widgets::autocomplete_pick(ui, id, p, text, hints, w, hint_text, mode, pick)
     })
     .inner
+}
+
+/// 按 id 取项目名称：合同详情与修改窗预填共用，保证两处口径一致（R-56）。
+///
+/// 只返回 `project_name`，不拼 `project_code`——新建合同录入的就是名称，
+/// 因此任何展示位都不应额外加编号；查不到返回 `None`，由调用方决定兜底文案。
+fn project_name_by_id(projects: &[ctp_core::project::Project], id: &str) -> Option<String> {
+    projects
+        .iter()
+        .find(|x| x.id == id)
+        .map(|x| x.project_name.clone())
 }
 
 /// 项目候选对：（列表里显示的「编码 名称」，回填用的「名称」）。
@@ -3405,12 +3412,9 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
         return;
     };
 
-    let project_text = app
-        .projects
-        .iter()
-        .find(|x| x.id == c.project_id)
-        .map(|x| format!("{} {}", x.project_code, x.project_name))
-        .unwrap_or_else(|| "—".into());
+    // R-56：与新建时录入、修改窗预填同口径——只显示项目名称，不拼项目编号
+    let project_text =
+        project_name_by_id(&app.projects, &c.project_id).unwrap_or_else(|| "—".into());
     let contractor = app
         .contractors
         .iter()
@@ -4489,6 +4493,27 @@ mod tests {
         let projects = vec![proj("PJ-1", "XAJT", "测试项目")];
         let f = EditContractForm::from_contract(&c, &projects, &[]);
         assert_eq!(f.project_text, "测试项目", "不能把编码也塞进输入框");
+    }
+
+    /// R-56：合同详情与修改窗预填共用同一取值口径——只给名称，不带项目编号；
+    /// 详情查不到时兜底「—」，修改窗兜底空串。
+    #[test]
+    fn 所属项目展示名不带编号() {
+        let projects = vec![proj("PJ-1", "XAJT", "测试项目")];
+        assert_eq!(
+            project_name_by_id(&projects, "PJ-1").as_deref(),
+            Some("测试项目"),
+            "详情弹窗也不能拼编号"
+        );
+        assert_eq!(project_name_by_id(&projects, "PJ-9"), None);
+        assert_eq!(
+            project_name_by_id(&projects, "PJ-9").unwrap_or_else(|| "—".into()),
+            "—"
+        );
+        assert_eq!(
+            project_name_by_id(&projects, "PJ-9").unwrap_or_default(),
+            ""
+        );
     }
 
     /// R-51：候选列表仍按「编码 名称」展示（方便用编码检索），

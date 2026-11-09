@@ -2,6 +2,7 @@ use crate::history;
 use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::{BidMethod, Contract, ContractStatus, ContractType, PricingMethod};
 use ctp_core::date::{now_iso, validate_iso_date};
+use ctp_core::dict;
 use ctp_core::digest;
 use ctp_core::error::DomainError;
 use ctp_core::ids;
@@ -661,10 +662,17 @@ pub fn update_contract_master(
         c.contract_type.label(),
         input.contract_type.label()
     );
+    // R-56：与界面下拉同口径显示中文名（工程款 / 设备款…），
+    // 不把 GC / SB 这类内部编码直接递给用户
+    let category_label = |code: &str| -> String {
+        dict::contract_category_name(code)
+            .unwrap_or(code)
+            .to_string()
+    };
     note!(
         "合同类别",
-        c.contract_category_code,
-        input.contract_category_code.trim()
+        category_label(&c.contract_category_code),
+        category_label(input.contract_category_code.trim())
     );
     note!("签订日期", c.sign_date, input.sign_date.trim());
     note!(

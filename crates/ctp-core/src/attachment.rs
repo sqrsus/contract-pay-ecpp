@@ -1,6 +1,6 @@
 //! 合同附件（`ct_contract_attachment`）。
 //!
-//! 本期四类：中标通知书、合同、中期结算材料、审计报告。合同为正本必传项，
+//! 本期四类：中标通知书、合同、验收材料、审计报告。合同为正本必传项，
 //! 其余三类可选；每类仅保留一份，替换即覆盖原件元数据。
 //!
 //! 文件本体以 BLOB 存在库里，因此这里的「元数据」结构刻意不带 `content`：
@@ -14,7 +14,7 @@ pub enum AttachmentKind {
     BidNotice,
     /// 合同（正本，必传）
     Contract,
-    /// 中期结算材料
+    /// 验收材料（落库码 `PROGRESS_SETTLEMENT` 保持不变，仅界面文案变更）
     ProgressSettlement,
     /// 审计报告
     AuditReport,
@@ -41,7 +41,7 @@ impl AttachmentKind {
         match self {
             AttachmentKind::BidNotice => "中标通知书",
             AttachmentKind::Contract => "合同",
-            AttachmentKind::ProgressSettlement => "中期结算材料",
+            AttachmentKind::ProgressSettlement => "验收材料",
             AttachmentKind::AuditReport => "审计报告",
         }
     }
@@ -119,6 +119,25 @@ mod tests {
             assert!(!k.label().is_empty());
         }
         assert_eq!(AttachmentKind::from_code("UNKNOWN"), None);
+    }
+
+    /// R-56：界面文案改为「验收材料」，落库码保持 `PROGRESS_SETTLEMENT` 不变。
+    #[test]
+    fn 验收材料文案与落库码解耦() {
+        assert_eq!(
+            AttachmentKind::ProgressSettlement.label(),
+            "验收材料",
+            "界面文案已统一为验收材料"
+        );
+        assert_eq!(
+            AttachmentKind::ProgressSettlement.code(),
+            "PROGRESS_SETTLEMENT",
+            "落库码不能跟着改，否则存量附件会取不到"
+        );
+        assert_eq!(
+            AttachmentKind::from_code("PROGRESS_SETTLEMENT"),
+            Some(AttachmentKind::ProgressSettlement)
+        );
     }
 
     #[test]

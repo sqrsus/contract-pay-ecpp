@@ -299,12 +299,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                     .color(p.text_muted),
                                                 );
                                                 let cname = text_of("contract_name");
+                                                // R-56：草稿视为「未生效」，名称用警示色；
+                                                // 选中态仍用主色（交互反馈优先），其余状态不变。
+                                                let name_color = if selected {
+                                                    p.primary
+                                                } else if s.status == ContractStatus::Draft.code() {
+                                                    p.danger
+                                                } else {
+                                                    p.text
+                                                };
                                                 let r = widgets::clipped_text(
                                                     ui,
                                                     &cname,
                                                     (name_w - 22.0).max(20.0),
                                                     12.5,
-                                                    if selected { p.primary } else { p.text },
+                                                    name_color,
                                                     egui::Sense::click(),
                                                 )
                                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
