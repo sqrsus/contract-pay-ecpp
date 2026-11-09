@@ -520,7 +520,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(Act::ToPayments(id)) => {
             app.pay_contract = Some(id);
-            app.sync_pay_text();
             app.screen = crate::Screen::Payments;
         }
         None => {}

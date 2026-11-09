@@ -427,8 +427,6 @@ pub enum SuggestMode {
 pub struct AcOutcome {
     /// 用户点选了某一项时的回填值
     pub picked: Option<String>,
-    /// 本帧输入内容是否被用户编辑（用于「边输边匹配」的场景）
-    pub changed: bool,
 }
 
 /// 联想输入框：输入时在下方浮出候选，点选即回填，未点选则保留用户原文。
@@ -592,15 +590,9 @@ fn autocomplete_impl(
         let v = pick.map(|f| f(&v)).unwrap_or(v);
         *text = v.clone();
         ui.memory_mut(|m| m.surrender_focus(resp.id));
-        return AcOutcome {
-            picked: Some(v),
-            changed: true,
-        };
+        return AcOutcome { picked: Some(v) };
     }
-    AcOutcome {
-        picked: None,
-        changed: resp.changed(),
-    }
+    AcOutcome { picked: None }
 }
 
 /// 候选上限：避免浮层盖住整个表单。
@@ -643,6 +635,333 @@ fn suggestion_row(ui: &mut Ui, p: &Palette, text: &str, width: f32) -> Response 
         egui::FontId::proportional(12.5),
         p.text,
     );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 合同下拉一次最多画多少行：几百份合同一次铺开既卡帧也看不清，超出靠筛选收敛。
+const MAX_CONTRACT_ROWS: usize = 200;
+
+/// 合同在列表里的显示串：`编号 · 名称`。编号由系统生成、全局唯一，放前面便于对号。
+fn contract_option_label(s: &ctp_core::ledger::ContractSummary) -> String {
+    format!("{} · {}", s.contract_no, s.contract_name)
+}
+
+/// 按筛选词过滤合同：空格分隔多个词，**全部**命中才算（AND）。
+///
+/// 每个词在「编号 / 名称 / 承包单位」任一字段出现即可，因此
+/// 「道路 监理」能同时缩小到道路类的监理合同，输入单位名也能直接定位。
+/// 空筛选返回全部——下拉要能看到数据库里的所有合同（R-53）。
+fn contract_hits<'a>(
+    items: &'a [ctp_core::ledger::ContractSummary],
+    filter: &str,
+) -> Vec<&'a ctp_core::ledger::ContractSummary> {
+    let words: Vec<String> = filter
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    items
+        .iter()
+        .filter(|s| {
+            words.iter().all(|w| {
+                s.contract_no.to_lowercase().contains(w.as_str())
+                    || s.contract_name.to_lowercase().contains(w.as_str())
+                    || s.contractor_name.to_lowercase().contains(w.as_str())
+            })
+        })
+        .collect()
+}
+
+/// 可搜索的合同下拉框：按钮显示当前合同，展开后列出全部合同，顶部可输入筛选。
+///
+/// 与联想框的关键差异是「真值」：这里选中的是**合同 id**，输入框只是筛选词，
+/// 因此不存在「文字对不上合同」这种中间态——选谁就是谁（R-53）。
+/// `open` 由调用方持有，截图与回归核对时可直接置为展开。
+#[allow(clippy::too_many_arguments)]
+pub fn contract_select(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    items: &[ctp_core::ledger::ContractSummary],
+    selected: Option<&str>,
+    filter: &mut String,
+    open: &mut bool,
+    width: f32,
+) -> Option<String> {
+    let current = selected.and_then(|sid| items.iter().find(|s| s.contract_id == sid));
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 26.0), egui::Sense::click());
+    ui.painter().rect(
+        rect,
+        Rounding::same(6.0),
+        if resp.hovered() || *open {
+            p.surface_alt
+        } else {
+            p.surface
+        },
+        Stroke::new(1.0_f32, if *open { p.primary } else { p.border }),
+    );
+    let (label, label_color) = match current {
+        Some(s) => (contract_option_label(s), p.text),
+        None => ("请选择合同".to_string(), p.text_muted),
+    };
+    // 文字区右侧给箭头留 24 px，长名称在框内截断，不压缩箭头
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 8.0, rect.top()),
+        egui::pos2(rect.right() - 24.0, rect.bottom()),
+    );
+    ui.painter().with_clip_rect(label_clip).text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        label_color,
+    );
+    ui.painter().text(
+        egui::pos2(rect.right() - 10.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        "▾",
+        egui::FontId::proportional(12.0),
+        p.text_muted,
+    );
+
+    if resp.clicked() {
+        *open = !*open;
+    }
+
+    let prev_open_id = egui::Id::new((id, "cs_prev"));
+    let rect_id = egui::Id::new((id, "cs_rect"));
+    let hl_id = egui::Id::new((id, "cs_hl"));
+    let prev_open = ui
+        .memory(|m| m.data.get_temp::<bool>(prev_open_id))
+        .unwrap_or(false);
+    let just_opened = *open && !prev_open;
+
+    // 点击弹层外面收起。用上一帧的弹层矩形判断，避免点列表项时当帧已被销毁。
+    let last_rect: Option<egui::Rect> = ui
+        .memory(|m| m.data.get_temp::<Option<egui::Rect>>(rect_id))
+        .flatten();
+    if *open && ui.input(|i| i.pointer.any_pressed()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            let in_button = rect.contains(pos);
+            let in_popup = last_rect.is_some_and(|r| r.contains(pos));
+            if !in_button && !in_popup {
+                *open = false;
+            }
+        }
+    }
+    if *open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *open = false;
+    }
+
+    // 上下键与回车先在筛选框之前吃掉，否则单行文本框会把方向键当成光标移动。
+    let (key_up, key_down, key_enter) = if *open {
+        (
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)),
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)),
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)),
+        )
+    } else {
+        (false, false, false)
+    };
+
+    // 筛选词不随展开重置：用户上次筛到一半就关掉时，再点开还在原处；
+    // 选中合同后由调用方清空，所以正常流程下次展开仍是全部合同。
+
+    let mut picked: Option<String> = None;
+
+    if *open {
+        let mut hl: usize = ui.memory(|m| m.data.get_temp::<usize>(hl_id)).unwrap_or(0);
+        let area = egui::Area::new(egui::Id::new((id, "cs_area")))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.left_bottom() + egui::vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0_f32, p.border_strong))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(8.0, 8.0))
+                    .show(ui, |ui| {
+                        let inner_w = (width - 16.0).max(200.0);
+                        ui.set_width(inner_w);
+                        let fresp = ui.add_sized(
+                            [inner_w, 26.0],
+                            egui::TextEdit::singleline(filter)
+                                .hint_text(
+                                    RichText::new("输入编号 / 名称 / 承包单位筛选")
+                                        .size(11.5)
+                                        .color(p.text_muted),
+                                )
+                                .margin(Margin::symmetric(8.0, 4.0)),
+                        );
+                        if just_opened {
+                            fresp.request_focus();
+                        }
+
+                        ui.add_space(6.0);
+                        let rule_y = ui.cursor().top();
+                        let l = ui.min_rect().left();
+                        ui.painter()
+                            .hline(l..=(l + inner_w), rule_y, Stroke::new(1.0_f32, p.border));
+                        ui.add_space(6.0);
+
+                        let hits = contract_hits(items, filter);
+                        if just_opened {
+                            hl = hits
+                                .iter()
+                                .position(|s| Some(s.contract_id.as_str()) == selected)
+                                .unwrap_or(0);
+                        }
+                        if hl >= hits.len() {
+                            hl = hits.len().saturating_sub(1);
+                        }
+                        if key_down {
+                            hl = (hl + 1).min(hits.len().saturating_sub(1));
+                        }
+                        if key_up {
+                            hl = hl.saturating_sub(1);
+                        }
+                        // 同名合同光看「编号 · 名称」一样，右侧补承包单位才能分清
+                        let mut name_count: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::new();
+                        for s in &hits {
+                            *name_count.entry(s.contract_name.as_str()).or_insert(0) += 1;
+                        }
+
+                        let shown = hits.len().min(MAX_CONTRACT_ROWS);
+                        if hits.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("没有匹配的合同，换个关键字试试")
+                                    .size(11.5)
+                                    .color(p.text_muted),
+                            );
+                            ui.add_space(6.0);
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.set_width(inner_w);
+                                    for (i, s) in hits.iter().take(shown).enumerate() {
+                                        let dup = name_count
+                                            .get(s.contract_name.as_str())
+                                            .copied()
+                                            .unwrap_or(0)
+                                            > 1;
+                                        let right = if dup {
+                                            Some(s.contractor_name.as_str())
+                                        } else {
+                                            None
+                                        };
+                                        let row = contract_row(
+                                            ui,
+                                            p,
+                                            s,
+                                            right,
+                                            selected == Some(s.contract_id.as_str()),
+                                            i == hl,
+                                            inner_w,
+                                        );
+                                        if row.hovered() {
+                                            hl = i;
+                                        }
+                                        if row.clicked() {
+                                            picked = Some(s.contract_id.clone());
+                                        }
+                                    }
+                                });
+                            if key_enter {
+                                picked = hits.get(hl).map(|s| s.contract_id.clone());
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        let total = items.len();
+                        let tip = if hits.len() > shown {
+                            format!(
+                                "共 {total} 份 · 匹配 {} 份，仅显示前 {MAX_CONTRACT_ROWS} 份，请继续输入缩小范围",
+                                hits.len()
+                            )
+                        } else if filter.trim().is_empty() {
+                            format!("共 {total} 份合同")
+                        } else {
+                            format!("匹配 {} / 共 {total} 份", hits.len())
+                        };
+                        ui.label(RichText::new(tip).size(10.5).color(p.text_muted));
+                    });
+            });
+        let popup_rect = Some(area.response.rect);
+        ui.memory_mut(|m| {
+            m.data.insert_temp(hl_id, hl);
+            m.data.insert_temp(rect_id, popup_rect);
+            m.data.insert_temp(prev_open_id, *open);
+        });
+    } else {
+        ui.memory_mut(|m| {
+            m.data.insert_temp(rect_id, None::<egui::Rect>);
+            m.data.insert_temp(prev_open_id, false);
+        });
+    }
+
+    if picked.is_some() {
+        *open = false;
+    }
+    picked
+}
+
+/// 下拉里的一行：整行可点，悬停/高亮有底色，当前选中项左侧带主色竖条。
+fn contract_row(
+    ui: &mut Ui,
+    p: &Palette,
+    s: &ctp_core::ledger::ContractSummary,
+    right: Option<&str>,
+    selected: bool,
+    highlight: bool,
+    width: f32,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(5.0), p.primary_soft);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 2.0, rect.top() + 5.0),
+                egui::vec2(2.5, rect.height() - 10.0),
+            ),
+            Rounding::same(1.0),
+            p.primary,
+        );
+    } else if highlight || resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(5.0), p.surface_alt);
+    }
+
+    let left_pad = if selected { 12.0 } else { 8.0 };
+    let right_w = if right.is_some() { 128.0 } else { 0.0 };
+    let text_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + left_pad, rect.top()),
+        egui::pos2(rect.right() - right_w - 6.0, rect.bottom()),
+    );
+    ui.painter().with_clip_rect(text_clip).text(
+        egui::pos2(rect.left() + left_pad, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        contract_option_label(s),
+        egui::FontId::proportional(12.5),
+        p.text,
+    );
+    if let Some(t) = right {
+        let clip = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - right_w, rect.top()),
+            egui::pos2(rect.right() - 6.0, rect.bottom()),
+        );
+        ui.painter().with_clip_rect(clip).text(
+            egui::pos2(rect.right() - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            t,
+            egui::FontId::proportional(10.5),
+            p.text_muted,
+        );
+    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -958,5 +1277,123 @@ mod tests {
             matched_candidates(&样例(), "", SuggestMode::ShowAllOnEmpty).len(),
             3
         );
+    }
+
+    fn 合同(
+        id: &str,
+        no: &str,
+        name: &str,
+        contractor: &str,
+    ) -> ctp_core::ledger::ContractSummary {
+        use ctp_core::money::Money;
+        use ctp_core::rate::Rate;
+        ctp_core::ledger::ContractSummary {
+            contract_id: id.into(),
+            project_id: "P".into(),
+            contract_no: no.into(),
+            contract_name: name.into(),
+            status: "PERFORMING".into(),
+            contractor_name: contractor.into(),
+            contract_type: "CONSTRUCT".into(),
+            contract_category_code: "GC".into(),
+            category_code: None,
+            category_name: None,
+            total_amount: Money::from_cent(1_000),
+            audit_price: None,
+            is_audited: false,
+            base_amount: Money::from_cent(1_000),
+            audit_reduction: Money::ZERO,
+            paid_amount: Money::ZERO,
+            inflight_amount: Money::ZERO,
+            occupied_amount: Money::ZERO,
+            available_amount: Money::from_cent(1_000),
+            pay_rate: Rate::from_bp(0),
+            is_inverted: false,
+            planned_end: None,
+            duration_days: 0,
+            delivery_date: None,
+        }
+    }
+
+    fn 编号们(hits: &[&ctp_core::ledger::ContractSummary]) -> Vec<String> {
+        hits.iter().map(|s| s.contract_no.clone()).collect()
+    }
+
+    /// R-53：空筛选必须列出全部合同，否则「涵盖数据库全部合同」这条要求落空。
+    #[test]
+    fn 合同下拉_空筛选列出全部() {
+        let list = vec![
+            合同(
+                "C1",
+                "HT-2026-001",
+                "道路工程（一标段）施工总承包",
+                "某建工集团",
+            ),
+            合同("C2", "HT-2026-002", "道路工程施工监理服务", "某监理公司"),
+        ];
+        assert_eq!(
+            编号们(&contract_hits(&list, "")),
+            ["HT-2026-001", "HT-2026-002"]
+        );
+        assert_eq!(
+            编号们(&contract_hits(&list, "   ")),
+            ["HT-2026-001", "HT-2026-002"]
+        );
+    }
+
+    #[test]
+    fn 合同下拉_多词与承包单位都能命中() {
+        let list = vec![
+            合同(
+                "C1",
+                "HT-2026-001",
+                "道路工程（一标段）施工总承包",
+                "某建工集团",
+            ),
+            合同("C2", "HT-2026-002", "道路工程施工监理服务", "某监理公司"),
+            合同("C3", "HT-2026-003", "沥青混合料采购", "某材料公司"),
+        ];
+        // 两个词都落在名称上，AND 之后只剩监理合同
+        assert_eq!(编号们(&contract_hits(&list, "道路 监理")), ["HT-2026-002"]);
+        // 关键词落在承包单位上也能定位
+        assert_eq!(编号们(&contract_hits(&list, "材料")), ["HT-2026-003"]);
+        // 编号片段 + 名称词混合
+        assert_eq!(
+            编号们(&contract_hits(&list, "HT-2026-001 总承包")),
+            ["HT-2026-001"]
+        );
+        // 忽略大小写
+        assert_eq!(
+            编号们(&contract_hits(&list, "ht-2026-002")),
+            ["HT-2026-002"]
+        );
+        assert!(contract_hits(&list, "不存在的关键字").is_empty());
+    }
+
+    /// 名称里带外部标段号（真实库 HT-2026-005 的情形）不影响检索，
+    /// 也不会把「输入到一半的编号」当成已选中——列表只是过滤，选中靠点选。
+    #[test]
+    fn 合同下拉_名称带外部编号仍按自身编号检索() {
+        let list = vec![
+            合同(
+                "C5",
+                "HT-2026-005",
+                "2022年宿城区农村公路提档升级工程SC-NLTD-2022-SG1",
+                "某路桥",
+            ),
+            合同(
+                "C1",
+                "HT-2026-001",
+                "道路工程（一标段）施工总承包",
+                "某建工集团",
+            ),
+        ];
+        assert_eq!(编号们(&contract_hits(&list, "SC-NLTD")), ["HT-2026-005"]);
+        assert_eq!(
+            编号们(&contract_hits(&list, "HT-2026-001")),
+            ["HT-2026-001"]
+        );
+        // 半截编号同时匹配两份：都列出来让用户挑，不再「唯一命中就替你选」
+        assert_eq!(contract_hits(&list, "HT-2026-00").len(), 2);
     }
 }

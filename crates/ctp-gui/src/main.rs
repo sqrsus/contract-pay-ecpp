@@ -170,8 +170,10 @@ pub struct App {
     pub expanded_contract: Option<String>,
 
     pub pay_contract: Option<String>,
-    /// 拨款管理页合同搜索框的文本（可输入编号或名称，实时匹配切换）
-    pub pay_contract_text: String,
+    /// 拨款管理页合同下拉的筛选词。它只是过滤条件，选中哪份合同以 `pay_contract` 为准（R-53）
+    pub pay_filter: String,
+    /// 合同下拉是否展开（截图与回归核对时可直接置为展开）
+    pub pay_open: bool,
     pub pay_form: PayForm,
     /// 正在查看的拨款单（`Dialog::PaymentDetail`）。
     pub pay_detail: Option<Payment>,
@@ -356,7 +358,8 @@ impl App {
             detail: None,
             expanded_contract: None,
             pay_contract: None,
-            pay_contract_text: String::new(),
+            pay_filter: String::new(),
+            pay_open: false,
             pay_form: PayForm::default(),
             pay_detail: None,
             print_vouchers: Vec::new(),
@@ -491,16 +494,16 @@ impl App {
         if let Ok(no) = std::env::var("CTP_PAY_NO") {
             if let Some(s) = self.summaries.iter().find(|s| s.contract_no == no).cloned() {
                 self.pay_contract = Some(s.contract_id.clone());
-                self.sync_pay_text();
                 self.screen = Screen::Payments;
             }
         }
-        // `CTP_PAY_TEXT=...` 模拟「输入框内容与选中合同不一致」，用于核对未匹配提示（R-52）
-        if let Ok(t) = std::env::var("CTP_PAY_TEXT") {
+        // `CTP_PAY_FILTER=...` 预填筛选词并展开合同下拉，用于核对筛选结果与列表（R-53）
+        if let Ok(t) = std::env::var("CTP_PAY_FILTER") {
             if self.pay_contract.is_none() {
                 self.pay_contract = self.summaries.first().map(|s| s.contract_id.clone());
             }
-            self.pay_contract_text = t;
+            self.pay_filter = t;
+            self.pay_open = true;
             self.screen = Screen::Payments;
         }
         match std::env::var("CTP_DIALOG").unwrap_or_default().as_str() {
@@ -582,7 +585,6 @@ impl App {
                     .cloned()
                 {
                     self.pay_contract = Some(pm.contract_id.clone());
-                    self.sync_pay_text();
                     self.screen = Screen::Payments;
                     self.open_print_preview(&pm);
                 }
@@ -596,7 +598,6 @@ impl App {
                     .cloned()
                 {
                     self.pay_contract = Some(pm.contract_id.clone());
-                    self.sync_pay_text();
                     self.screen = Screen::Payments;
                     let ids: Vec<String> = self
                         .payments
@@ -660,7 +661,6 @@ impl App {
         if self.pay_contract.is_none() {
             self.pay_contract = self.summaries.first().map(|s| s.contract_id.clone());
         }
-        self.sync_pay_text();
         if errs.is_empty() {
             self.data_warning = None;
         } else {
@@ -686,20 +686,6 @@ impl App {
         if self.data_warning.is_none() {
             self.success("数据已重新读取");
         }
-    }
-
-    /// 合同在搜索框里的展示文本：`编号 名称`。
-    pub fn pay_contract_label(&self) -> Option<String> {
-        let id = self.pay_contract.as_ref()?;
-        self.summaries
-            .iter()
-            .find(|s| &s.contract_id == id)
-            .map(|s| format!("{} {}", s.contract_no, s.contract_name))
-    }
-
-    /// 把当前选中合同回填到搜索框（切换合同 / 刷新数据后调用）。
-    pub fn sync_pay_text(&mut self) {
-        self.pay_contract_text = self.pay_contract_label().unwrap_or_default();
     }
 
     /// 选中合同。
@@ -766,7 +752,6 @@ impl App {
         } else if self.pay_contract.is_none() {
             self.pay_contract = self.summaries.first().map(|s| s.contract_id.clone());
         }
-        self.sync_pay_text();
         self.screen = Screen::Payments;
     }
 
