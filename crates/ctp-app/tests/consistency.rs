@@ -12,7 +12,7 @@
 //! | `会计分类与合同类别分离` | H4 |
 //! | `业务表审计列齐全` | M4 / DB-06 |
 
-use ctp_app::service::{self, NewContract, NewPayment};
+use ctp_app::service::{self, EditContract, NewContract, NewPayment};
 use ctp_core::attachment::AttachmentKind;
 use ctp_core::contract::ContractStatus;
 use ctp_core::error::DomainError;
@@ -1087,4 +1087,115 @@ fn 拨款一览导出合同字段缺失留空不影响导出() {
     let (rows, cols) = service::export_result(&conn, &result, &path, "t").unwrap();
     assert_eq!((rows, cols), (1, 7));
     let _ = std::fs::remove_file(&path);
+}
+
+/// R-50：信息修改只落主档字段，编号 / 金额 / 状态保持不动，版本自增并写审计。
+#[test]
+fn 信息修改只动主档并写审计留痕() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let before = repo::get_contract(&conn, &cid).unwrap();
+
+    let after = service::update_contract_master(
+        &mut conn,
+        &cid,
+        EditContract {
+            contract_name: "测试合同（更名）".into(),
+            project_text: "XAJT 测试项目".into(),
+            contractor_text: "某施工单位".into(),
+            party_a: "某建设单位".into(),
+            contract_type: before.contract_type,
+            contract_category_code: "GC".into(),
+            sign_date: "2026-01-10".into(),
+            duration_days: 120,
+            planned_start: Some("2026-03-01".into()),
+            planned_end: Some("2026-06-28".into()),
+            pricing_method: before.pricing_method,
+            retention_rate_bp: 500,
+            payment_terms: "按月计量支付".into(),
+            remark: Some("补充备注".into()),
+            bid_method: None,
+            open_bid_date: None,
+            project_leader: Some("张三".into()),
+            contact_info: None,
+            bid_agent_text: None,
+        },
+        "合同名称笔误更正",
+        "t",
+    )
+    .unwrap();
+
+    assert_eq!(after.contract_name, "测试合同（更名）");
+    assert_eq!(after.duration_days, 120);
+    assert_eq!(after.planned_end.as_deref(), Some("2026-06-28"));
+    assert_eq!(after.retention_rate_bp, 500);
+    assert_eq!(after.project_id, "PJ-1", "按文本回解析到同一档案");
+    assert_eq!(after.contractor_id, "ORG-1");
+    // 不在修改范围的字段一律原样
+    assert_eq!(after.contract_no, before.contract_no, "编号不可变");
+    assert_eq!(
+        after.original_amount_cent, before.original_amount_cent,
+        "金额不在此改"
+    );
+    assert_eq!(after.status, before.status, "状态不在此改");
+    assert_eq!(after.version, before.version + 1, "乐观锁版本应自增");
+
+    let detail: String = conn
+        .query_row(
+            "SELECT detail FROM sys_audit_log WHERE action='EDIT_CONTRACT' ORDER BY created_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(detail.contains("合同名称笔误更正"), "必须带原因：{detail}");
+    assert!(detail.contains("合同名称"), "必须记字段级变化：{detail}");
+    assert!(detail.contains("工期"), "必须记字段级变化：{detail}");
+}
+
+/// R-50：空原因、原样提交都要被拒绝，且不留审计噪声。
+#[test]
+fn 信息修改拒绝空原因与无改动() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let c = repo::get_contract(&conn, &cid).unwrap();
+    let same = || EditContract {
+        contract_name: c.contract_name.clone(),
+        project_text: "XAJT".into(),
+        contractor_text: "某施工单位".into(),
+        party_a: c.party_a.clone(),
+        contract_type: c.contract_type,
+        contract_category_code: c.contract_category_code.clone(),
+        sign_date: c.sign_date.clone(),
+        duration_days: c.duration_days,
+        planned_start: c.planned_start.clone(),
+        planned_end: c.planned_end.clone(),
+        pricing_method: c.pricing_method,
+        retention_rate_bp: c.retention_rate_bp,
+        payment_terms: c.payment_terms.clone(),
+        remark: c.remark.clone(),
+        bid_method: c.bid_method,
+        open_bid_date: c.open_bid_date.clone(),
+        project_leader: c.project_leader.clone(),
+        contact_info: c.contact_info.clone(),
+        bid_agent_text: None,
+    };
+
+    let err = service::update_contract_master(&mut conn, &cid, same(), "   ", "t").unwrap_err();
+    assert!(
+        format!("{err}").contains("修改原因"),
+        "空原因必须拒绝：{err}"
+    );
+
+    let err = service::update_contract_master(&mut conn, &cid, same(), "检查", "t").unwrap_err();
+    assert!(
+        format!("{err}").contains("没有修改任何内容"),
+        "无改动不应产生流水：{err}"
+    );
+
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='EDIT_CONTRACT'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "被拒绝的提交不能留审计");
 }

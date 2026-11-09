@@ -91,6 +91,39 @@ fn unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 由公历年月日得到 Unix 天数（Howard Hinnant days_from_civil，`civil_from_days` 的逆运算）。
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = i64::from(y);
+    let m = i64::from(m);
+    let d = i64::from(d);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// 日期加减自然日：`2026-03-01` 加 89 天 → `2026-05-29`。
+///
+/// 入参不是合法日期、或用四位年份表示不下结果时返回 `None`，
+/// 由调用方决定降级（界面侧一律「不触发计算」）。
+pub fn plus_days(date: &str, days: i64) -> Option<String> {
+    if !is_iso_date(date) {
+        return None;
+    }
+    let y: i32 = date[0..4].parse().ok()?;
+    let m: u32 = date[5..7].parse().ok()?;
+    let d: u32 = date[8..10].parse().ok()?;
+    let total = days_from_civil(y, m, d).checked_add(days)?;
+    let (ny, nm, nd) = civil_from_days(total);
+    if !(1..=9999).contains(&ny) {
+        return None;
+    }
+    Some(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
 /// 由 Unix 天数还原公历年月日（Howard Hinnant civil_from_days）。
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
@@ -184,6 +217,25 @@ mod tests {
     fn 公历还原基准点() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
+    }
+
+    #[test]
+    fn 自然日加减与还原互逆() {
+        // 基准点往返
+        for (y, m, d) in [(1970, 1, 1), (2024, 2, 29), (2026, 11, 9), (9999, 12, 31)] {
+            let days = days_from_civil(y, m, d);
+            assert_eq!(civil_from_days(days), (y, m, d), "{y}-{m}-{d} 往返不一致");
+        }
+        assert_eq!(plus_days("2026-03-01", 0).as_deref(), Some("2026-03-01"));
+        assert_eq!(plus_days("2026-03-01", 89).as_deref(), Some("2026-05-29"));
+        // 跨闰日、跨年
+        assert_eq!(plus_days("2024-02-28", 1).as_deref(), Some("2024-02-29"));
+        assert_eq!(plus_days("2024-02-28", 2).as_deref(), Some("2024-03-01"));
+        assert_eq!(plus_days("2026-12-31", 1).as_deref(), Some("2027-01-01"));
+        assert_eq!(plus_days("2026-01-01", -1).as_deref(), Some("2025-12-31"));
+        // 非法输入与溢出
+        assert_eq!(plus_days("2026-02-30", 1), None);
+        assert_eq!(plus_days("2026-03-01", i64::MAX), None);
     }
 
     #[test]

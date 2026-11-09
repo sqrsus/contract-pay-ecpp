@@ -266,6 +266,8 @@ pub struct App {
     pub import_result: Option<crate::dialogs::ImportResultView>,
     /// 合同台账导出列选择弹窗的数据（R-46，与 `Dialog::ExportColumns` 配套）
     pub export_columns: Option<crate::dialogs::ExportColumnsView>,
+    /// 合同信息修改弹窗的数据（R-50，与 `Dialog::EditContract` 配套）
+    pub edit_contract: Option<crate::dialogs::EditContractForm>,
     pub confirm: Option<Confirm>,
     pub confirm_reason: String,
     pub toast: Option<Toast>,
@@ -399,6 +401,7 @@ impl App {
             dialog: Dialog::None,
             import_result: None,
             export_columns: None,
+            edit_contract: None,
             confirm: None,
             confirm_reason: String::new(),
             toast: None,
@@ -692,6 +695,25 @@ impl App {
             .as_ref()
             .and_then(|c| repo::get_contract(c, id).ok());
         self.dialog = Dialog::ContractDetail;
+    }
+
+    /// 打开「合同信息修改」弹窗（R-50，右侧栏第 5 个按钮）。
+    ///
+    /// 预填读的是库里**整条**合同，而不是列表摘要：摘要不含 `payment_terms`、
+    /// `bid_agent_id` 等字段，用摘要预填会把内容清空。读不到就只提示，不打开空表单。
+    pub fn open_edit_contract(&mut self, id: &str) {
+        let Some(c) = self
+            .db
+            .as_ref()
+            .and_then(|conn| repo::get_contract(conn, id).ok())
+        else {
+            self.error("读取合同失败，请刷新后重试");
+            return;
+        };
+        let form =
+            crate::dialogs::EditContractForm::from_contract(&c, &self.projects, &self.contractors);
+        self.edit_contract = Some(form);
+        self.dialog = Dialog::EditContract;
     }
 
     /// 合同台账点击名称：展开 / 收起该合同的拨款明细。
@@ -1198,6 +1220,7 @@ impl App {
             self.role = None;
             crate::dialogs::dismiss_import_result(&mut self.dialog, &mut self.import_result);
             crate::dialogs::dismiss_export_columns(&mut self.dialog, &mut self.export_columns);
+            self.edit_contract = None;
             crate::dialogs::dismiss_print_failure(&mut self.print_failure);
             dismiss_print_success(&mut self.print_success);
             self.print_render_failed = false;

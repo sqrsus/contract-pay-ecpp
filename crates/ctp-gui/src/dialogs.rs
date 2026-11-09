@@ -7,9 +7,9 @@ use crate::theme::Palette;
 use crate::widgets::{self, Tone};
 use crate::App;
 use ctp_app::report::{ReportColumnError, ReportResult};
-use ctp_app::service::{self, NewContract, NewPayment};
+use ctp_app::service::{self, EditContract, NewContract, NewPayment};
 use ctp_core::attachment::{Attachment, AttachmentKind};
-use ctp_core::contract::{BidMethod, ContractType};
+use ctp_core::contract::{BidMethod, Contract, ContractType, PricingMethod};
 use ctp_core::date::{is_iso_date, today_iso};
 use ctp_core::dict;
 use ctp_core::money::Money;
@@ -41,6 +41,8 @@ pub enum Dialog {
     ImportResult,
     /// 合同台账导出列选择（R-46）：导出前勾选字段并调整顺序
     ExportColumns,
+    /// 合同信息修改（R-50）：右侧栏第 5 个按钮进入，只改主档字段
+    EditContract,
 }
 
 /// 导入结果弹窗的数据：只保留统计摘要与失败条目，不逐行列明细（R-33 确认口径）。
@@ -516,6 +518,12 @@ pub struct ContractForm {
     pub duration: String,
     pub planned_start: String,
     pub planned_end: String,
+    /// R-50：上一次由「工期 + 计划开工」自动写入的值。
+    /// 与当前 `planned_end` 一致 = 仍在自动状态；不一致 = 用户手改过，停止同步。
+    pub planned_end_auto: Option<String>,
+    /// R-50：用户是否在本次弹窗里动过「计划交工」。
+    /// 只影响提示文案——打开弹窗时既有的旧值不该被标成「已手动修改」。
+    pub planned_end_dirty: bool,
     /// 交工日期（YYYY-MM-DD），选填。
     pub delivery_date: String,
     pub pricing_idx: usize,
@@ -553,6 +561,8 @@ impl Default for ContractForm {
             duration: String::new(),
             planned_start: String::new(),
             planned_end: String::new(),
+            planned_end_auto: None,
+            planned_end_dirty: false,
             delivery_date: String::new(),
             pricing_idx: 1,
             retention: "3".into(),
@@ -566,6 +576,138 @@ impl Default for ContractForm {
             activate: true,
             attachments: Vec::new(),
         }
+    }
+}
+
+// ---------------------------------------------------------------- 合同信息修改（R-50）
+
+/// 合同主档修改表单。
+///
+/// 字段范围与 `service::EditContract` 一致：**金额、编号、审计价、状态、交工日期
+/// 都不在这里**，它们各有专门的留痕入口，从这里改会绕过历史表。
+pub struct EditContractForm {
+    pub contract_id: String,
+    /// 只读展示，不可修改
+    pub contract_no: String,
+    pub name: String,
+    /// 项目文本「编码 名称」，与新建页同一套联想与解析规则
+    pub project_text: String,
+    pub contractor_text: String,
+    pub party_a: String,
+    pub ctype_idx: usize,
+    pub category_idx: usize,
+    pub sign_date: String,
+    pub duration: String,
+    pub planned_start: String,
+    pub planned_end: String,
+    pub planned_end_auto: Option<String>,
+    pub planned_end_dirty: bool,
+    pub pricing_idx: usize,
+    pub retention: String,
+    pub terms: String,
+    pub remark: String,
+    pub bid_method_idx: usize,
+    pub open_bid_date: String,
+    pub project_leader: String,
+    pub contact_info: String,
+    pub bid_agent_text: String,
+    /// 必填：任何主档变更都要能回答「为什么改」
+    pub reason: String,
+    pub error: Option<String>,
+}
+
+impl EditContractForm {
+    /// 用当前合同预填表单。
+    ///
+    /// 项目 / 承包单位 / 招标代理要转成展示名，否则用户打开看到的是内部 id。
+    /// `planned_end_auto` 留空：进入修改页时既有交工日期一律视为「已有值」，
+    /// 只要用户不改工期与开工日，就不会被自动计算覆盖。
+    pub fn from_contract(
+        c: &Contract,
+        projects: &[ctp_core::project::Project],
+        contractors: &[ctp_core::project::Contractor],
+    ) -> Self {
+        let project_text = projects
+            .iter()
+            .find(|p| p.id == c.project_id)
+            .map(|p| format!("{} {}", p.project_code, p.project_name))
+            .unwrap_or_default();
+        let contractor_text = contractors
+            .iter()
+            .find(|x| x.id == c.contractor_id)
+            .map(|x| x.contractor_name.clone())
+            .unwrap_or_default();
+        let bid_agent_text = c
+            .bid_agent_id
+            .as_ref()
+            .and_then(|id| contractors.iter().find(|x| &x.id == id))
+            .map(|x| x.contractor_name.clone())
+            .unwrap_or_default();
+
+        let ctype_idx = CONTRACT_TYPES
+            .iter()
+            .position(|t| *t == c.contract_type)
+            .unwrap_or(0);
+        let category_idx = dict::CONTRACT_CATEGORIES
+            .iter()
+            .position(|(code, _)| *code == c.contract_category_code)
+            .unwrap_or(0);
+        let pricing_idx = match c.pricing_method {
+            None => 0,
+            Some(PricingMethod::LumpSum) => 1,
+            Some(PricingMethod::UnitPrice) => 2,
+            Some(PricingMethod::CostPlus) => 3,
+        };
+        let bid_method_idx = match c.bid_method {
+            None => 0,
+            Some(BidMethod::Open) => 1,
+            Some(BidMethod::Government) => 2,
+            Some(BidMethod::Direct) => 3,
+        };
+
+        Self {
+            contract_id: c.id.clone(),
+            contract_no: c.contract_no.clone(),
+            name: c.contract_name.clone(),
+            project_text,
+            contractor_text,
+            party_a: c.party_a.clone(),
+            ctype_idx,
+            category_idx,
+            sign_date: c.sign_date.clone(),
+            duration: if c.duration_days > 0 {
+                c.duration_days.to_string()
+            } else {
+                String::new()
+            },
+            planned_start: c.planned_start.clone().unwrap_or_default(),
+            planned_end: c.planned_end.clone().unwrap_or_default(),
+            planned_end_auto: None,
+            planned_end_dirty: false,
+            pricing_idx,
+            retention: bp_text(c.retention_rate_bp),
+            terms: c.payment_terms.clone(),
+            remark: c.remark.clone().unwrap_or_default(),
+            bid_method_idx,
+            open_bid_date: c.open_bid_date.clone().unwrap_or_default(),
+            project_leader: c.project_leader.clone().unwrap_or_default(),
+            contact_info: c.contact_info.clone().unwrap_or_default(),
+            bid_agent_text,
+            reason: String::new(),
+            error: None,
+        }
+    }
+}
+
+/// 万分比 → 百分比文本（300 → "3"，350 → "3.5"）。
+fn bp_text(bp: i32) -> String {
+    let v = f64::from(bp) / 100.0;
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() {
+        "0".to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -671,11 +813,73 @@ fn field(ui: &mut egui::Ui, p: &Palette, label: &str, w: f32, value: &mut String
 
 /// 带标签的日期输入框：点击输入框弹出月历，选中回填。
 fn date_field(ui: &mut egui::Ui, p: &Palette, label: &str, id: &str, w: f32, value: &mut String) {
+    let _ = date_field_note(ui, p, label, id, w, value, None);
+}
+
+/// 日期输入框 + 字段下方的灰色小字提示（R-50 用来标「已手动修改」）。
+///
+/// 返回 `true` 表示本帧用户改了这个字段（用于区分「用户手改」与「打开时就有的旧值」）。
+fn date_field_note(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    id: &str,
+    w: f32,
+    value: &mut String,
+    note: Option<&str>,
+) -> bool {
+    let before = value.clone();
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         widgets::field_label(ui, p, label);
         widgets::date_input(ui, id, p, value, w);
+        if let Some(n) = note {
+            ui.label(RichText::new(n).size(10.5).color(p.text_muted));
+        }
     });
+    *value != before
+}
+
+// ---------------------------------------------------------------- 计划交工自动计算（R-50）
+
+/// 按「计划开工 + 工期 = 计划交工」自动回填（**含开工当日**）。
+///
+/// 触发条件：工期是正整数、计划开工是合法日期，两者**都**成立才计算；
+/// 任一不成立就原样返回 `false`，绝不改动用户已填的内容。
+///
+/// 写入规则（对应「手改后停止同步」口径）：
+/// * `end` 为空 → 视为未填，直接写入；
+/// * `end` 仍等于上次自动写入的值（`last_auto`）→ 视为仍在自动状态，更新为新结果；
+/// * `end` 既非空又不同于 `last_auto` → 用户手改过，**不再覆盖**。
+///
+/// 返回 `true` 表示本帧确实写入了新值。
+pub fn auto_planned_end(
+    planned_start: &str,
+    duration: &str,
+    end: &mut String,
+    last_auto: &mut Option<String>,
+) -> bool {
+    let days = duration.trim().parse::<i64>().unwrap_or(0);
+    let Some(want) = ctp_core::contract::planned_end_for(planned_start.trim(), days) else {
+        return false;
+    };
+    let still_auto = last_auto.as_deref() == Some(end.as_str());
+    if !(end.trim().is_empty() || still_auto) {
+        return false;
+    }
+    if end.as_str() == want.as_str() {
+        return false;
+    }
+    *end = want.clone();
+    *last_auto = Some(want);
+    true
+}
+
+/// 计划交工是否已被人工修改（用于字段下方提示）。
+///
+/// 空字段算「未填」，不算手改；一旦填了且与自动值不同，就是手改。
+pub fn planned_end_is_manual(end: &str, last_auto: &Option<String>) -> bool {
+    !end.trim().is_empty() && last_auto.as_deref() != Some(end)
 }
 
 /// 下拉框（索引式）。
@@ -888,6 +1092,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         Dialog::ContractDetail => contract_detail(app, ctx),
         Dialog::ImportResult => import_result(app, ctx),
         Dialog::ExportColumns => export_columns(app, ctx),
+        Dialog::EditContract => edit_contract(app, ctx),
     }
     if app.confirm.is_some() {
         confirm_void(app, ctx);
@@ -1428,7 +1633,36 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                     field(ui, &p, "工期（日历天）", 218.0, &mut app.new_contract.duration);
                                     ui.end_row();
                                     date_field(ui, &p, "计划开工", "planned_start", 218.0, &mut app.new_contract.planned_start);
-                                    date_field(ui, &p, "计划交工", "planned_end", 218.0, &mut app.new_contract.planned_end);
+                                    // R-50：工期与开工日都有效时，自动算「计划交工」（含开工当日）。
+                                    // 用户手改过就不再覆盖，只在字段下方提示。
+                                    auto_planned_end(
+                                        &app.new_contract.planned_start,
+                                        &app.new_contract.duration,
+                                        &mut app.new_contract.planned_end,
+                                        &mut app.new_contract.planned_end_auto,
+                                    );
+                                    let end_manual = planned_end_is_manual(
+                                        &app.new_contract.planned_end,
+                                        &app.new_contract.planned_end_auto,
+                                    );
+                                    let show_note =
+                                        app.new_contract.planned_end_dirty && end_manual;
+                                    let end_changed = date_field_note(
+                                        ui,
+                                        &p,
+                                        "计划交工",
+                                        "planned_end",
+                                        218.0,
+                                        &mut app.new_contract.planned_end,
+                                        if show_note {
+                                            Some("已手动修改，不再随工期自动同步")
+                                        } else {
+                                            None
+                                        },
+                                    );
+                                    if end_changed {
+                                        app.new_contract.planned_end_dirty = true;
+                                    }
                                     ui.end_row();
                                 });
                         });
@@ -1786,6 +2020,421 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                 }
             }
             Err(e) => app.error(format!("新建合同失败：{e}")),
+        }
+    }
+}
+// ---------------------------------------------------------------- 合同信息修改（R-50）
+
+/// 合同台账右侧栏「信息修改」：改主档字段，保存时写审计日志。
+///
+/// 刻意与「新建合同」分成两套表单：新建要一次填齐、分两步、可带附件；
+/// 修改是局部订正，一屏平铺更快，也避免误改到金额 / 编号这类敏感字段。
+fn edit_contract(app: &mut App, ctx: &egui::Context) {
+    let p = app.pal;
+
+    if app.edit_contract.is_none() {
+        app.dialog = Dialog::None;
+        return;
+    }
+
+    // 联想候选先克隆：闭包里要可变借用表单，不能再读 `app.projects`
+    let project_hints: Vec<String> = app
+        .projects
+        .iter()
+        .map(|x| format!("{} {}", x.project_code, x.project_name))
+        .collect();
+    let mut unit_hints: Vec<String> = app
+        .contractors
+        .iter()
+        .filter(|c| c.role_type != ContractorRole::Owner)
+        .map(|c| c.contractor_name.clone())
+        .collect();
+    unit_hints.sort();
+    unit_hints.dedup();
+    let mut owner_hints: Vec<String> = app
+        .contractors
+        .iter()
+        .filter(|c| c.role_type == ContractorRole::Owner)
+        .map(|c| c.contractor_name.clone())
+        .collect();
+    owner_hints.extend(app.party_a_names.iter().cloned());
+    owner_hints.sort();
+    owner_hints.dedup();
+    let mut agent_hints: Vec<String> = app
+        .contractors
+        .iter()
+        .filter(|c| c.role_type == ContractorRole::Agent)
+        .map(|c| c.contractor_name.clone())
+        .collect();
+    if agent_hints.is_empty() {
+        agent_hints = app
+            .contractors
+            .iter()
+            .map(|c| c.contractor_name.clone())
+            .collect();
+    }
+    agent_hints.sort();
+    agent_hints.dedup();
+
+    let contract_no = app
+        .edit_contract
+        .as_ref()
+        .map(|f| f.contract_no.clone())
+        .unwrap_or_default();
+    let contract_id = app
+        .edit_contract
+        .as_ref()
+        .map(|f| f.contract_id.clone())
+        .unwrap_or_default();
+
+    // 保存按钮的可用性：与保存时的校验共用同一套条件
+    let can_save = {
+        let f = app.edit_contract.as_ref().expect("上面已判空");
+        !f.name.trim().is_empty()
+            && !f.project_text.trim().is_empty()
+            && !f.contractor_text.trim().is_empty()
+            && !f.party_a.trim().is_empty()
+            && is_iso_date(&f.sign_date)
+            && !f.terms.trim().is_empty()
+            && !f.reason.trim().is_empty()
+    };
+
+    let mut submit: Option<(EditContract, String)> = None;
+    let mut cancel = false;
+
+    let Some(form) = app.edit_contract.as_mut() else {
+        app.dialog = Dialog::None;
+        return;
+    };
+
+    modal("修改合同信息", &p)
+        .default_width(720.0)
+        .min_width(720.0)
+        .show(ctx, |ui| {
+            ui.set_width(700.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("合同编号 {contract_no}"))
+                        .size(12.0)
+                        .color(p.text_muted),
+                );
+                ui.label(
+                    RichText::new(
+                        "编号与金额不在此修改；金额请用「编辑金额」，审计价请用「登记审计价」",
+                    )
+                    .size(10.5)
+                    .color(p.text_muted),
+                );
+            });
+            ui.add_space(8.0);
+
+            egui::ScrollArea::vertical()
+                .id_salt("edit_contract_scroll")
+                .max_height(520.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    form_card(&p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        widgets::section_title(ui, &p, "基本信息", "");
+                        egui::Grid::new("edit_contract_base")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                field(ui, &p, "* 合同名称", 300.0, &mut form.name);
+                                ui.vertical(|ui| {
+                                    widgets::field_label(ui, &p, "合同类别");
+                                    let labels: Vec<String> = dict::CONTRACT_CATEGORIES
+                                        .iter()
+                                        .map(|(_, n)| n.to_string())
+                                        .collect();
+                                    combo(
+                                        ui,
+                                        "edit_category",
+                                        300.0,
+                                        form.category_idx,
+                                        labels,
+                                        &mut form.category_idx,
+                                    );
+                                });
+                                ui.end_row();
+
+                                ac_field(
+                                    ui,
+                                    &p,
+                                    "* 所属项目",
+                                    "edit_project",
+                                    &mut form.project_text,
+                                    &project_hints,
+                                    "输入编码或名称后联想",
+                                    300.0,
+                                    widgets::SuggestMode::TypedOnly,
+                                );
+                                ac_field(
+                                    ui,
+                                    &p,
+                                    "* 承包单位",
+                                    "edit_contractor",
+                                    &mut form.contractor_text,
+                                    &unit_hints,
+                                    "输入名称后联想已有单位",
+                                    300.0,
+                                    widgets::SuggestMode::TypedOnly,
+                                );
+                                ui.end_row();
+
+                                ac_field(
+                                    ui,
+                                    &p,
+                                    "* 发包人（甲方）",
+                                    "edit_party_a",
+                                    &mut form.party_a,
+                                    &owner_hints,
+                                    "输入名称后联想已有单位",
+                                    300.0,
+                                    widgets::SuggestMode::TypedOnly,
+                                );
+                                ui.vertical(|ui| {
+                                    widgets::field_label(ui, &p, "合同类型");
+                                    let labels: Vec<String> = CONTRACT_TYPES
+                                        .iter()
+                                        .map(|t| t.label().to_string())
+                                        .collect();
+                                    combo(
+                                        ui,
+                                        "edit_ctype",
+                                        300.0,
+                                        form.ctype_idx,
+                                        labels,
+                                        &mut form.ctype_idx,
+                                    );
+                                });
+                                ui.end_row();
+
+                                date_field(
+                                    ui,
+                                    &p,
+                                    "* 签订日期",
+                                    "edit_sign_date",
+                                    300.0,
+                                    &mut form.sign_date,
+                                );
+                                field(ui, &p, "工期（日历天）", 300.0, &mut form.duration);
+                                ui.end_row();
+
+                                date_field(
+                                    ui,
+                                    &p,
+                                    "计划开工",
+                                    "edit_planned_start",
+                                    300.0,
+                                    &mut form.planned_start,
+                                );
+                                // R-50：与新建页同一套规则（含开工当日、手改后停止同步）
+                                auto_planned_end(
+                                    &form.planned_start,
+                                    &form.duration,
+                                    &mut form.planned_end,
+                                    &mut form.planned_end_auto,
+                                );
+                                let end_manual = planned_end_is_manual(
+                                    &form.planned_end,
+                                    &form.planned_end_auto,
+                                );
+                                let show_note = form.planned_end_dirty && end_manual;
+                                let end_changed = date_field_note(
+                                    ui,
+                                    &p,
+                                    "计划交工",
+                                    "edit_planned_end",
+                                    300.0,
+                                    &mut form.planned_end,
+                                    if show_note {
+                                        Some("已手动修改，不再随工期自动同步")
+                                    } else {
+                                        None
+                                    },
+                                );
+                                if end_changed {
+                                    form.planned_end_dirty = true;
+                                }
+                                ui.end_row();
+                            });
+
+                        ui.add_space(8.0);
+                        widgets::section_title(ui, &p, "招标与条款", "");
+                        egui::Grid::new("edit_contract_bid")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    widgets::field_label(ui, &p, "招标方式");
+                                    let labels: Vec<String> = vec![
+                                        "（未选）".into(),
+                                        "公开招标".into(),
+                                        "政府采购".into(),
+                                        "直接发包".into(),
+                                    ];
+                                    combo(
+                                        ui,
+                                        "edit_bid_method",
+                                        300.0,
+                                        form.bid_method_idx,
+                                        labels,
+                                        &mut form.bid_method_idx,
+                                    );
+                                });
+                                date_field(
+                                    ui,
+                                    &p,
+                                    "开标时间",
+                                    "edit_open_bid",
+                                    300.0,
+                                    &mut form.open_bid_date,
+                                );
+                                ui.end_row();
+
+                                ac_field(
+                                    ui,
+                                    &p,
+                                    "招标代理",
+                                    "edit_agent",
+                                    &mut form.bid_agent_text,
+                                    &agent_hints,
+                                    "留空表示清空代理",
+                                    300.0,
+                                    widgets::SuggestMode::TypedOnly,
+                                );
+                                ui.vertical(|ui| {
+                                    widgets::field_label(ui, &p, "计价方式");
+                                    let labels: Vec<String> =
+                                        PRICING.iter().map(|x| x.to_string()).collect();
+                                    combo(
+                                        ui,
+                                        "edit_pricing",
+                                        300.0,
+                                        form.pricing_idx,
+                                        labels,
+                                        &mut form.pricing_idx,
+                                    );
+                                });
+                                ui.end_row();
+
+                                field(ui, &p, "质保金率 %", 300.0, &mut form.retention);
+                                field(ui, &p, "项目负责人", 300.0, &mut form.project_leader);
+                                ui.end_row();
+
+                                field(ui, &p, "联系方式", 300.0, &mut form.contact_info);
+                                field(ui, &p, "备注", 300.0, &mut form.remark);
+                                ui.end_row();
+                            });
+
+                        ui.add_space(6.0);
+                        widgets::field_label(ui, &p, "付款条款");
+                        ui.add_sized(
+                            [ui.available_width(), 56.0],
+                            egui::TextEdit::multiline(&mut form.terms)
+                                .margin(egui::Margin::symmetric(8.0, 6.0)),
+                        );
+                    });
+
+                    ui.add_space(10.0);
+                    // 修改原因必填：与「编辑金额」口径一致
+                    form_card(&p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.vertical(|ui| {
+                            widgets::field_label(ui, &p, "* 修改原因（写入操作日志）");
+                            ui.add_sized(
+                                [ui.available_width(), 26.0],
+                                egui::TextEdit::singleline(&mut form.reason)
+                                    .hint_text("例如：合同名称笔误更正")
+                                    .margin(egui::Margin::symmetric(8.0, 4.0)),
+                            );
+                        });
+                    });
+
+                    if let Some(err) = &form.error {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(err).size(11.5).color(p.danger));
+                    }
+                });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &p, "保存修改", can_save).clicked() && can_save {
+                    let ctype = CONTRACT_TYPES
+                        .get(form.ctype_idx)
+                        .copied()
+                        .unwrap_or(ContractType::Construct);
+                    let cat_code = dict::CONTRACT_CATEGORIES
+                        .get(form.category_idx)
+                        .map(|(c, _)| c.to_string())
+                        .unwrap_or_default();
+                    let pricing = match form.pricing_idx {
+                        0 => None,
+                        1 => Some(PricingMethod::LumpSum),
+                        2 => Some(PricingMethod::UnitPrice),
+                        _ => Some(PricingMethod::CostPlus),
+                    };
+                    let bid_method = match form.bid_method_idx {
+                        1 => Some(BidMethod::Open),
+                        2 => Some(BidMethod::Government),
+                        3 => Some(BidMethod::Direct),
+                        _ => None,
+                    };
+                    submit = Some((
+                        EditContract {
+                            contract_name: form.name.trim().to_string(),
+                            project_text: form.project_text.trim().to_string(),
+                            contractor_text: form.contractor_text.trim().to_string(),
+                            party_a: form.party_a.trim().to_string(),
+                            contract_type: ctype,
+                            contract_category_code: cat_code,
+                            sign_date: form.sign_date.trim().to_string(),
+                            duration_days: form.duration.trim().parse::<i64>().unwrap_or(0),
+                            planned_start: opt(&form.planned_start),
+                            planned_end: opt(&form.planned_end),
+                            pricing_method: pricing,
+                            retention_rate_bp: pct_to_bp(&form.retention),
+                            payment_terms: form.terms.trim().to_string(),
+                            remark: opt(&form.remark),
+                            bid_method,
+                            open_bid_date: opt(&form.open_bid_date),
+                            project_leader: opt(&form.project_leader),
+                            contact_info: opt(&form.contact_info),
+                            bid_agent_text: opt(&form.bid_agent_text),
+                        },
+                        form.reason.trim().to_string(),
+                    ));
+                }
+                if widgets::ghost_button(ui, &p, "取消").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if cancel {
+        app.dialog = Dialog::None;
+        app.edit_contract = None;
+        return;
+    }
+
+    if let Some((input, reason)) = submit {
+        match app.exec(move |conn| {
+            service::update_contract_master(conn, &contract_id, input, &reason, "界面用户")
+        }) {
+            Ok(c) => {
+                app.dialog = Dialog::None;
+                app.edit_contract = None;
+                app.refresh();
+                app.select(&c.id);
+                app.success(format!("合同 {} 信息已更新", c.contract_no));
+            }
+            Err(e) => {
+                if let Some(f) = app.edit_contract.as_mut() {
+                    f.error = Some(e);
+                }
+            }
         }
     }
 }
@@ -3401,5 +4050,74 @@ mod tests {
         dismiss_export_columns(&mut dialog, &mut view);
         assert!(dialog == Dialog::None);
         assert!(view.is_none());
+    }
+
+    // ------------------------------------------------ 计划交工自动计算（R-50）
+
+    #[test]
+    fn 计划交工按含开工当日自动填充() {
+        let mut end = String::new();
+        let mut auto = None;
+        assert!(auto_planned_end("2026-03-01", "90", &mut end, &mut auto));
+        assert_eq!(end, "2026-05-29", "90 日历天含开工当日 → 开工 + 89 天");
+        assert!(!planned_end_is_manual(&end, &auto), "自动值不算手改");
+
+        // 仍在自动状态时，改工期应跟着更新
+        assert!(auto_planned_end("2026-03-01", "91", &mut end, &mut auto));
+        assert_eq!(end, "2026-05-30");
+        // 改开工日同样跟随
+        assert!(auto_planned_end("2026-04-01", "91", &mut end, &mut auto));
+        assert_eq!(end, "2026-06-30");
+    }
+
+    #[test]
+    fn 工期或开工日不完整时不触发计算() {
+        // 任一不同时成立：开工日为空/非法、工期为空/0/负数/非数字
+        for (start, days) in [
+            ("", "90"),
+            ("2026-03-01", ""),
+            ("2026-03-01", "0"),
+            ("2026-03-01", "-5"),
+            ("2026-03-01", "九十万"),
+            ("2026-02-30", "90"),
+        ] {
+            let mut end = "2026-06-01".to_string();
+            let mut auto = None;
+            assert!(
+                !auto_planned_end(start, days, &mut end, &mut auto),
+                "[{start} / {days}] 不应触发计算"
+            );
+            assert_eq!(end, "2026-06-01", "不触发时原值必须保持不变");
+            assert!(auto.is_none());
+        }
+    }
+
+    #[test]
+    fn 手改计划交工后停止同步且清空可恢复() {
+        let mut end = String::new();
+        let mut auto = None;
+        auto_planned_end("2026-03-01", "90", &mut end, &mut auto);
+        assert_eq!(end, "2026-05-29");
+
+        // 用户手改 → 标记为手改，后续改工期不再覆盖
+        end = "2026-06-30".to_string();
+        assert!(planned_end_is_manual(&end, &auto));
+        assert!(!auto_planned_end("2026-03-01", "120", &mut end, &mut auto));
+        assert_eq!(end, "2026-06-30", "手改值必须被保留");
+
+        // 清空 → 回到未填状态，恢复自动
+        end.clear();
+        assert!(!planned_end_is_manual(&end, &auto), "空值不算手改");
+        assert!(auto_planned_end("2026-03-01", "120", &mut end, &mut auto));
+        assert_eq!(end, "2026-06-28");
+    }
+
+    #[test]
+    fn 质保金率文本与万分比互转() {
+        assert_eq!(bp_text(300), "3");
+        assert_eq!(bp_text(350), "3.5");
+        assert_eq!(bp_text(0), "0");
+        assert_eq!(pct_to_bp(&bp_text(300)), 300);
+        assert_eq!(pct_to_bp(&bp_text(125)), 125);
     }
 }

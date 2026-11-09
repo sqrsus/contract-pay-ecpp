@@ -94,6 +94,40 @@ impl Default for NewContract {
     }
 }
 
+/// 合同信息修改入参（R-50）。
+///
+/// 只覆盖**主档字段**。以下字段刻意不在其中，各自有专门的留痕入口：
+/// * 合同编号——唯一索引 + 已出报表/纸质单据的引用，改动会让历史对不上；
+/// * 合同金额——走「编辑金额」（必填原因 + 写入金额变更历史）；
+/// * 审计价——走「登记审计价」（写审计价历史）；
+/// * 状态——走「设为生效 / 作废」；
+/// * 交工日期——走「项目交工」。
+#[derive(Debug, Clone)]
+pub struct EditContract {
+    pub contract_name: String,
+    /// 项目文本（编码或名称），空则拒绝
+    pub project_text: String,
+    /// 承包单位名称，空则拒绝
+    pub contractor_text: String,
+    pub party_a: String,
+    pub contract_type: ContractType,
+    pub contract_category_code: String,
+    pub sign_date: String,
+    pub duration_days: i64,
+    pub planned_start: Option<String>,
+    pub planned_end: Option<String>,
+    pub pricing_method: Option<PricingMethod>,
+    pub retention_rate_bp: i32,
+    pub payment_terms: String,
+    pub remark: Option<String>,
+    pub bid_method: Option<BidMethod>,
+    pub open_bid_date: Option<String>,
+    pub project_leader: Option<String>,
+    pub contact_info: Option<String>,
+    /// 招标代理名称：空表示清空代理关系
+    pub bid_agent_text: Option<String>,
+}
+
 /// 拨款单登记入参（FR-PAY-06，单级登记、无申请单）。
 #[derive(Debug, Clone)]
 pub struct NewPayment {
@@ -408,6 +442,244 @@ pub fn create_contract(
     )?;
     tx.commit()?;
     Ok(c)
+}
+
+/// 修改合同主档信息（R-50）。
+///
+/// 与「新建」共用同一套档案解析规则（项目 / 承包单位 / 甲方 / 招标代理），
+/// 保存时做三件事：字段级 diff → 写审计日志 → 乐观锁更新（`version` 不匹配即报冲突）。
+///
+/// **不碰**合同编号、合同金额、审计价、状态、交工日期：这些字段各有专门的
+/// 留痕入口，从这里改会绕过历史表，审计链会断。
+///
+/// `reason` 必填：与「编辑金额」一致，任何主档变更都要能回答「为什么改」。
+pub fn update_contract_master(
+    conn: &mut Connection,
+    contract_id: &str,
+    input: EditContract,
+    reason: &str,
+    operator: &str,
+) -> Result<Contract> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(DomainError::MissingField("修改原因").into());
+    }
+    if input.contract_name.trim().is_empty() {
+        return Err(DomainError::MissingField("合同名称").into());
+    }
+    if input.payment_terms.trim().is_empty() {
+        return Err(DomainError::MissingField("付款条款").into());
+    }
+    if input.contract_category_code.trim().is_empty() {
+        return Err(DomainError::MissingField("合同类别").into());
+    }
+    validate_iso_date(&input.sign_date)?;
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut c = repo::get_contract(&tx, contract_id)?;
+    if c.status == ContractStatus::Void {
+        return Err(DomainError::IllegalState("作废合同不可修改信息".into()).into());
+    }
+
+    // 三个文本档案与新建同路径：命中就复用，未命中就自动建档
+    let project_id = resolve_project(&tx, "", Some(&input.project_text), operator)?;
+    let contractor_id = resolve_contractor(
+        &tx,
+        "",
+        Some(&input.contractor_text),
+        input.contract_type,
+        operator,
+    )?;
+    let party_a = resolve_owner(&tx, &input.party_a, operator)?;
+    let bid_agent_id = match input.bid_agent_text.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => Some(ensure_contractor(
+            &tx,
+            name,
+            ContractorRole::Agent,
+            operator,
+        )?),
+        _ => None,
+    };
+
+    // 字段级 diff：只记真正变化的项，避免「点保存就多一条流水」
+    let mut changes: Vec<String> = Vec::new();
+    macro_rules! note {
+        ($label:expr, $old:expr, $new:expr) => {{
+            let old = $old.to_string();
+            let new = $new.to_string();
+            if old != new {
+                changes.push(format!("{}：{} → {}", $label, old, new));
+            }
+        }};
+    }
+    let dash = |s: &Option<String>| s.clone().unwrap_or_else(|| "—".into());
+
+    note!("合同名称", c.contract_name, input.contract_name);
+    // 档案类字段按 id 判变化：用户可能只改了写法（名称 / 编码），指向同一个档案时不算修改
+    if c.project_id != project_id {
+        changes.push(format!(
+            "所属项目：{} → {}",
+            project_label(&tx, &c.project_id),
+            project_label(&tx, &project_id)
+        ));
+    }
+    if c.contractor_id != contractor_id {
+        changes.push(format!(
+            "承包单位：{} → {}",
+            contractor_label(&tx, &c.contractor_id),
+            contractor_label(&tx, &contractor_id)
+        ));
+    }
+    note!("发包人", c.party_a, party_a);
+    note!(
+        "合同类型",
+        c.contract_type.label(),
+        input.contract_type.label()
+    );
+    note!(
+        "合同类别",
+        c.contract_category_code,
+        input.contract_category_code.trim()
+    );
+    note!("签订日期", c.sign_date, input.sign_date.trim());
+    note!(
+        "工期",
+        format!("{} 日历天", c.duration_days),
+        format!("{} 日历天", input.duration_days)
+    );
+    note!(
+        "计划开工",
+        dash(&c.planned_start),
+        dash(&input.planned_start)
+    );
+    note!("计划交工", dash(&c.planned_end), dash(&input.planned_end));
+    note!(
+        "计价方式",
+        c.pricing_method.map(|x| x.label()).unwrap_or("—"),
+        input.pricing_method.map(|x| x.label()).unwrap_or("—")
+    );
+    note!(
+        "质保金率",
+        format!("{} bp", c.retention_rate_bp),
+        format!("{} bp", input.retention_rate_bp)
+    );
+    note!(
+        "招标代理",
+        bid_agent_label(&tx, c.bid_agent_id.as_deref()),
+        bid_agent_label(&tx, bid_agent_id.as_deref())
+    );
+    // 长文本只记「改过」，不把整段条款塞进日志
+    if c.payment_terms != input.payment_terms {
+        changes.push("付款条款：已修改".to_string());
+    }
+    if c.remark != input.remark {
+        changes.push("备注：已修改".to_string());
+    }
+    if c.bid_method != input.bid_method {
+        changes.push(format!(
+            "招标方式：{} → {}",
+            c.bid_method.map(|x| x.label()).unwrap_or("—"),
+            input.bid_method.map(|x| x.label()).unwrap_or("—")
+        ));
+    }
+    if c.open_bid_date != input.open_bid_date {
+        changes.push(format!(
+            "开标时间：{} → {}",
+            dash(&c.open_bid_date),
+            dash(&input.open_bid_date)
+        ));
+    }
+    if c.project_leader != input.project_leader {
+        changes.push(format!(
+            "项目负责人：{} → {}",
+            dash(&c.project_leader),
+            dash(&input.project_leader)
+        ));
+    }
+    if c.contact_info != input.contact_info {
+        changes.push(format!(
+            "联系方式：{} → {}",
+            dash(&c.contact_info),
+            dash(&input.contact_info)
+        ));
+    }
+
+    if changes.is_empty() {
+        return Err(DomainError::Invariant("没有修改任何内容，无需留痕".into()).into());
+    }
+
+    // 只落主档字段；编号 / 金额 / 审计价 / 状态 / 交工日期原样保留
+    c.contract_name = input.contract_name.trim().to_string();
+    c.project_id = project_id;
+    c.contractor_id = contractor_id;
+    c.party_a = party_a;
+    c.contract_type = input.contract_type;
+    c.contract_category_code = input.contract_category_code.trim().to_string();
+    c.sign_date = input.sign_date.trim().to_string();
+    c.duration_days = input.duration_days;
+    c.planned_start = input.planned_start;
+    c.planned_end = input.planned_end;
+    c.pricing_method = input.pricing_method;
+    c.retention_rate_bp = input.retention_rate_bp;
+    c.payment_terms = input.payment_terms;
+    c.remark = input.remark;
+    c.bid_method = input.bid_method;
+    c.open_bid_date = input.open_bid_date;
+    c.project_leader = input.project_leader;
+    c.contact_info = input.contact_info;
+    c.bid_agent_id = bid_agent_id;
+    c.updated_at = now_iso();
+    c.updated_by = Some(operator.to_string());
+
+    // 乐观锁在这里生效：version 不匹配会返回「已被并发修改」，不会静默覆盖
+    repo::update_contract(&tx, &c)?;
+    // 库里是 `version = version + 1`，内存里的快照要跟上，
+    // 否则返回值带着旧版本号，调用方再保存一次就会误报冲突。
+    c.version += 1;
+
+    db::insert_audit_log(
+        &tx,
+        "ct_contract",
+        &c.id,
+        Some(&format!("{} {}", c.contract_no, c.contract_name)),
+        "EDIT_CONTRACT",
+        Some(&format!("{}｜{}", reason, changes.join("；"))),
+        operator,
+    )?;
+    tx.commit()?;
+    Ok(c)
+}
+
+/// 项目展示名（编码 + 名称），查不到返回空串。
+fn project_label(conn: &Connection, id: &str) -> String {
+    repo::list_projects(conn)
+        .ok()
+        .and_then(|v| v.into_iter().find(|p| p.id == id))
+        .map(|p| format!("{} {}", p.project_code, p.project_name))
+        .unwrap_or_default()
+}
+
+/// 单位展示名，查不到返回空串。
+fn contractor_label(conn: &Connection, id: &str) -> String {
+    repo::list_contractors(conn)
+        .ok()
+        .and_then(|v| v.into_iter().find(|x| x.id == id))
+        .map(|x| x.contractor_name)
+        .unwrap_or_default()
+}
+
+fn bid_agent_label(conn: &Connection, id: Option<&str>) -> String {
+    match id {
+        Some(id) => {
+            let name = contractor_label(conn, id);
+            if name.is_empty() {
+                "—".to_string()
+            } else {
+                name
+            }
+        }
+        None => "—".to_string(),
+    }
 }
 
 /// 合同生效（草稿 → 生效）。本期无审批环节，由登记人直接生效。

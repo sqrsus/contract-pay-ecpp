@@ -461,6 +461,22 @@ impl Contract {
     }
 }
 
+/// 计划交工日 = 计划开工日 + 工期（**含开工当日**，R-50）。
+///
+/// 例：`2026-03-01` 开工、工期 90 日历天 → `2026-05-29`（开工当天算第 1 天）。
+///
+/// 工期 `<= 0`、开工日期不是合法 `YYYY-MM-DD`、或结果超出四位年份时返回 `None`；
+/// 界面据此「不触发自动计算」，保持用户已填的值不动。
+///
+/// 与 `Contract::validate` 的 `planned_end >= planned_start` 天然相容：
+/// 工期 1 天时交工日等于开工日。
+pub fn planned_end_for(planned_start: &str, duration_days: i64) -> Option<String> {
+    if duration_days <= 0 {
+        return None;
+    }
+    crate::date::plus_days(planned_start.trim(), duration_days - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +584,40 @@ mod tests {
         c.retention_rate_bp = 12_000;
         assert!(matches!(c.validate(), Err(DomainError::Invariant(_))));
         c.retention_rate_bp = 300;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn 计划交工按含开工当日推算() {
+        // 90 日历天：开工当天算第 1 天，故交工 = 开工 + 89 天
+        assert_eq!(
+            planned_end_for("2026-03-01", 90).as_deref(),
+            Some("2026-05-29")
+        );
+        // 工期 1 天 → 交工日等于开工日，与 validate 的「不早于」相容
+        assert_eq!(
+            planned_end_for("2026-03-01", 1).as_deref(),
+            Some("2026-03-01")
+        );
+        // 跨闰日与跨年
+        assert_eq!(
+            planned_end_for("2024-02-01", 29).as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(
+            planned_end_for("2026-12-01", 31).as_deref(),
+            Some("2026-12-31")
+        );
+        // 任一条件不成立都不触发
+        assert_eq!(planned_end_for("2026-03-01", 0), None, "工期为 0 不计算");
+        assert_eq!(planned_end_for("2026-03-01", -5), None, "负工期不计算");
+        assert_eq!(planned_end_for("", 90), None, "开工日为空不计算");
+        assert_eq!(planned_end_for("2026-02-30", 90), None, "开工日非法不计算");
+        // 推算结果必须能通过合同校验（交工不早于开工）
+        let mut c = sample();
+        c.planned_start = Some("2026-03-01".into());
+        c.planned_end = planned_end_for("2026-03-01", 90);
+        c.duration_days = 90;
         assert!(c.validate().is_ok());
     }
 }

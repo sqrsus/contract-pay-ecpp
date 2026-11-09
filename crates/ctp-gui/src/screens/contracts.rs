@@ -25,6 +25,8 @@ enum Act {
     ToPayments(String),
     /// 打开附件管理弹窗
     Attachments,
+    /// 合同信息修改（R-50）：只改主档字段
+    EditContract,
 }
 
 const STATUSES: [ContractStatus; 2] = [ContractStatus::Performing, ContractStatus::Closed];
@@ -116,9 +118,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     // ---------------- 列表 + 详情
     let avail_w = ui.available_width();
-    let detail_w = 300.0_f32;
-    // 详情卡要占 300 + 12，窗口太窄时先保证列表不被挤压：不显示详情卡
-    let show_detail = app.selected.is_some() && !app.narrow && avail_w > 1060.0;
+    // R-50：详情卡放了 5 个操作按钮（附件 / 审计价 / 交工 / 信息修改 / 拨款），
+    // 300 放不下，加宽到 344；列表最小宽按 748 反推阈值。
+    let detail_w = 344.0_f32;
+    // 详情卡要占 344 + 12，窗口太窄时先保证列表不被挤压：不显示详情卡
+    let show_detail = app.selected.is_some() && !app.narrow && avail_w > 1104.0;
     let table_w = if show_detail {
         avail_w - detail_w - 12.0
     } else {
@@ -453,7 +457,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // 浏览用户不许触发写类动作：不置灰，点了直接提示「无权限」
     let writes = matches!(
         action,
-        Some(Act::New) | Some(Act::Activate) | Some(Act::Audit) | Some(Act::Delivery)
+        Some(Act::New)
+            | Some(Act::Activate)
+            | Some(Act::Audit)
+            | Some(Act::Delivery)
+            | Some(Act::EditContract)
     );
     if writes && !app.require_write() {
         return;
@@ -485,6 +493,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         Some(Act::Attachments) => {
             if let Some(id) = app.selected.clone() {
                 app.open_attachments(&id);
+            }
+        }
+        Some(Act::EditContract) => {
+            if let Some(id) = app.selected.clone() {
+                app.open_edit_contract(&id);
             }
         }
         Some(Act::Audit) => {
@@ -906,6 +919,15 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
             }
             if widgets::ghost_button_sm(ui, &p, "项目交工").clicked() {
                 *action = Some(Act::Delivery);
+            }
+            // R-50：第 5 个按钮，与上面 4 个同一行（详情卡已加宽到 344 容纳）。
+            // 浏览用户不显示：写类入口对只读身份没有意义，露出来只会点一次报一次无权限。
+            if app.can_write()
+                && widgets::ghost_button_sm(ui, &p, "信息修改")
+                    .on_hover_text("修改合同名称、单位、工期等主档信息；金额与编号不在此改")
+                    .clicked()
+            {
+                *action = Some(Act::EditContract);
             }
             let pay = widgets::ghost_button_sm_on(ui, &p, "去拨款", can_pay);
             let pay = if can_pay {
