@@ -127,6 +127,30 @@ pub fn now_iso() -> String {
     )
 }
 
+/// 本地时区（东八区）相对 UTC 的偏移秒数。
+const LOCAL_OFFSET_SECS: i64 = 8 * 3600;
+
+/// 当前本地时点（东八区），`YYYY-MM-DD HH:MM:SS`，供界面直接展示。
+///
+/// 审计列仍写 UTC 的 [`now_iso`]；这里只负责「显示」，与操作日志列表里
+/// `datetime(created_at, '+8 hours')` 的换算口径保持一致，避免把差 8 小时的
+/// UTC 时刻直接摆到用户面前。
+pub fn now_local_text() -> String {
+    local_text_from_unix(unix_secs())
+}
+
+fn local_text_from_unix(utc_secs: i64) -> String {
+    let secs = utc_secs + LOCAL_OFFSET_SECS;
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
 /// 期间键 `YYYY-MM`（报表按期间统计用）。
 pub fn period_of(date: &str) -> String {
     date.get(0..7).unwrap_or("").to_string()
@@ -160,6 +184,13 @@ mod tests {
     fn 公历还原基准点() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
+    }
+
+    #[test]
+    fn 本地时间按东八区换算且能正确跨日() {
+        assert_eq!(local_text_from_unix(0), "1970-01-01 08:00:00");
+        assert_eq!(local_text_from_unix(16 * 3600), "1970-01-02 00:00:00");
+        assert_eq!(now_local_text().len(), 19);
     }
 
     #[test]

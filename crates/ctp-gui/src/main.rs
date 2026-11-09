@@ -28,8 +28,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use dialogs::{
-    classify_print_failure, failure_for_outcome, offer_print_failure, AmountForm, AuditForm,
-    ContractForm, Dialog, PayForm, PrintStage,
+    classify_print_failure, dismiss_print_success, failure_for_outcome,
+    offer_print_failure_exclusive, offer_print_success, print_busy, print_success_expired,
+    success_for_outcome, AmountForm, AuditForm, ContractForm, Dialog, PayForm, PrintStage,
 };
 use theme::{Palette, ThemeMode};
 use widgets::Tone;
@@ -185,6 +186,9 @@ pub struct App {
     /// R-42：打印失败弹窗的数据。它是不改变 `dialog` 的叠加层，
     /// 关闭后预览窗、单据、页码、位图全部保留。
     pub print_failure: Option<crate::dialogs::PrintFailureView>,
+    /// R-44：打印成功提示的数据。作业成功提交后显示、5 秒自动关闭，
+    /// 是与失败弹窗互斥的另一个叠加层，同样不改变 `dialog`。
+    pub print_success: Option<crate::dialogs::PrintSuccessView>,
     /// R-42：当前页预览渲染已失败，不再每帧重试，避免重复报错 / 重复弹窗。
     /// 翻页或重新打开预览时清零。
     pub print_render_failed: bool,
@@ -354,6 +358,7 @@ impl App {
             print_page: 0,
             print_tex: None,
             print_failure: None,
+            print_success: None,
             print_render_failed: false,
             hwnd: 0,
             print_sel: std::collections::BTreeSet::new(),
@@ -817,8 +822,8 @@ impl App {
 
     /// 解析版面数据并打开预览。取数与打印同一入口，不存在第二套口径。
     fn load_print_vouchers(&mut self) {
-        // R-42：失败弹窗未关闭期间忽略新的打开预览请求，避免重复弹出。
-        if self.print_failure.is_some() {
+        // R-42/R-44：任一打印提示未关闭期间忽略新的打开预览请求，避免重复弹出。
+        if print_busy(&self.print_failure, &self.print_success) {
             return;
         }
         let ids = self.print_ids.clone();
@@ -844,10 +849,12 @@ impl App {
 
     /// 打印：直接弹系统「打印」对话框并出纸，不经过 Word / PDF。
     ///
-    /// 用户取消对话框不算错误（`Ok(0)`）；只有 `Err` 才展示统一失败弹窗。
+    /// R-44：结果三分支互斥且顺序固定——`Err` 走 R-42 统一失败弹窗（展示行为不变）；
+    /// `Ok(0)` 用户取消保持静默；`Ok(pages > 0)` 只显示含本次打印信息的成功弹窗，
+    /// 5 秒后自动关闭，不再发绿色提示条，避免同一结果出现两处提示。
     pub fn print_now(&mut self) {
-        // R-42：失败弹窗未关闭期间忽略重复点击，不再发起第二次出纸。
-        if self.print_failure.is_some() {
+        // 任一打印提示未关闭期间忽略重复点击，不再发起第二次出纸。
+        if print_busy(&self.print_failure, &self.print_success) {
             return;
         }
         if self.print_vouchers.is_empty() {
@@ -859,15 +866,8 @@ impl App {
         let outcome = ctp_app::print_vouchers_now(self.hwnd, &vs, &name);
         if let Some(view) = failure_for_outcome(PrintStage::Print, &outcome) {
             self.show_print_failure(view);
-        } else if let Ok(pages) = outcome {
-            // Ok(0) = 用户主动取消，保持静默；成功才发绿色提示条。
-            if pages > 0 {
-                self.success(format!(
-                    "已向打印机发送 {} 张单据、共 {} 页",
-                    vs.len(),
-                    pages
-                ));
-            }
+        } else if let Some(view) = success_for_outcome(&outcome, name, vs.len()) {
+            self.show_print_success(view);
         }
     }
 
@@ -945,10 +945,21 @@ impl App {
         self.dialog = Dialog::ImportResult;
     }
 
-    /// R-42：打印失败的唯一入口。只弹统一卡片弹窗，不再发红色提示条；
+    /// R-42/R-44：打印失败的唯一入口。展示前先清掉可能还在倒计时的成功提示，
+    /// 保证成功与失败互不叠加；失败侧仍只弹统一卡片弹窗、不发红色提示条，
     /// 已有未关闭的失败弹窗时忽略后续失败，保留首次原因，避免重复弹出。
     pub fn show_print_failure(&mut self, view: crate::dialogs::PrintFailureView) {
-        let _ = offer_print_failure(&mut self.print_failure, view);
+        let _ =
+            offer_print_failure_exclusive(&mut self.print_failure, &mut self.print_success, view);
+    }
+
+    /// R-44：打印成功的唯一入口。失败弹窗在场时不展示成功提示；
+    /// 已有未关闭的成功提示时忽略后续成功，避免覆盖或重复弹出。
+    pub fn show_print_success(&mut self, view: crate::dialogs::PrintSuccessView) {
+        if self.print_failure.is_some() {
+            return;
+        }
+        let _ = offer_print_success(&mut self.print_success, view);
     }
 
     /// 上一帧登记的批量导入，在这一帧真正执行（R-39「处理中」状态的落地）。
@@ -1180,6 +1191,7 @@ impl App {
             self.role = None;
             crate::dialogs::dismiss_import_result(&mut self.dialog, &mut self.import_result);
             crate::dialogs::dismiss_print_failure(&mut self.print_failure);
+            dismiss_print_success(&mut self.print_success);
             self.print_render_failed = false;
             self.confirm = None;
             self.modal_contract = None;
@@ -1425,6 +1437,17 @@ impl eframe::App for App {
             } else {
                 ctx.request_repaint_after(Duration::from_millis(400));
             }
+        }
+        // R-44：打印成功提示 5 秒后自动关闭。request_repaint_after 让倒计时与
+        // 自动关闭不依赖鼠标输入或窗口焦点，窗口静止时也会按时重绘。
+        if self
+            .print_success
+            .as_ref()
+            .is_some_and(print_success_expired)
+        {
+            dismiss_print_success(&mut self.print_success);
+        } else if self.print_success.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.narrow = ctx.screen_rect().width() < 1100.0;
 

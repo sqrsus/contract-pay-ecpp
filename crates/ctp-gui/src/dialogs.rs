@@ -17,6 +17,7 @@ use ctp_core::project::ContractorRole;
 use ctp_core::rate::Rate;
 use ctp_store::repo;
 use eframe::egui::{self, RichText};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Dialog {
@@ -241,6 +242,100 @@ pub fn offer_print_failure(slot: &mut Option<PrintFailureView>, v: PrintFailureV
 /// 让用户关掉提示就能直接再点「打印」。
 pub fn dismiss_print_failure(view: &mut Option<PrintFailureView>) {
     *view = None;
+}
+
+// ---------------------------------------------------------------- 打印成功提示（R-44）
+
+/// 打印成功提示的自动关闭时长（秒）。
+pub const PRINT_SUCCESS_SECS: u64 = 5;
+const PRINT_SUCCESS_TITLE: &str = "打印已提交";
+
+/// 打印成功弹窗的全部内容（确认口径 2a）。
+///
+/// `Ok(pages > 0)` 只代表打印作业已成功提交到 Windows 打印队列（`EndDoc` 成功），
+/// 不代表纸张已物理出完；标题与文案因此一律用「已提交 / 已发送」，不写「已完成」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrintSuccessView {
+    pub title: &'static str,
+    /// 打印件名称，来自 `ctp_app::print::doc_name`。
+    pub doc_name: String,
+    pub sheets: usize,
+    pub pages: usize,
+    /// 本地时间 `YYYY-MM-DD HH:MM:SS`，仅用于展示。
+    pub submitted_at: String,
+    /// 弹窗创建时刻，用于 5 秒自动关闭与倒计时。
+    pub at: Instant,
+}
+
+impl PrintSuccessView {
+    pub fn new(doc_name: String, sheets: usize, pages: usize) -> Self {
+        Self {
+            title: PRINT_SUCCESS_TITLE,
+            doc_name,
+            sheets,
+            pages,
+            submitted_at: ctp_core::date::now_local_text(),
+            at: Instant::now(),
+        }
+    }
+}
+
+/// 是否已到 5 秒自动关闭时点。
+pub fn print_success_expired(v: &PrintSuccessView) -> bool {
+    v.at.elapsed() >= Duration::from_secs(PRINT_SUCCESS_SECS)
+}
+
+/// 剩余秒数（向上取整、展示时恒 >= 1），用于弹窗里的倒计时文案。
+pub fn print_success_remaining_secs(v: &PrintSuccessView) -> u64 {
+    let left = Duration::from_secs(PRINT_SUCCESS_SECS).saturating_sub(v.at.elapsed());
+    let secs = left.as_millis().div_ceil(1000);
+    u64::try_from(secs).unwrap_or(1).max(1)
+}
+
+/// 同一时间只允许一个成功提示；已有未关闭的提示时忽略后续成功，避免覆盖 / 重复弹出。
+pub fn offer_print_success(slot: &mut Option<PrintSuccessView>, v: PrintSuccessView) -> bool {
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(v);
+    true
+}
+
+/// 关闭成功提示：手动「关闭」按钮、5 秒到期、关闭预览窗、登出共用。
+pub fn dismiss_print_success(slot: &mut Option<PrintSuccessView>) {
+    *slot = None;
+}
+
+/// 任一打印提示在场时禁止再次发起打印 / 打开预览（确认口径 4a）。
+/// 失败弹窗需手动关闭，成功弹窗 5 秒后自动关闭，两者期间都算「忙」。
+pub fn print_busy(failure: &Option<PrintFailureView>, success: &Option<PrintSuccessView>) -> bool {
+    failure.is_some() || success.is_some()
+}
+
+/// 展示失败提示（确认口径 5a）：先清掉可能还在倒计时的成功提示，
+/// 再沿用 R-42 既有的「保留首次原因、不重复弹出」去重逻辑。
+pub fn offer_print_failure_exclusive(
+    failure: &mut Option<PrintFailureView>,
+    success: &mut Option<PrintSuccessView>,
+    v: PrintFailureView,
+) -> bool {
+    dismiss_print_success(success);
+    offer_print_failure(failure, v)
+}
+
+/// 只有 `Ok(pages > 0)` 才生成成功提示；`Ok(0)`（用户取消）与 `Err` 一律返回 None。
+///
+/// 与 [`failure_for_outcome`] 对称：打印完成后的三种结果由这两个纯函数分流，
+/// 调用方不会漏判，也不必自己记「取消要静默」。
+pub fn success_for_outcome(
+    outcome: &std::result::Result<usize, ctp_app::print::PrintError>,
+    doc_name: String,
+    sheets: usize,
+) -> Option<PrintSuccessView> {
+    match outcome {
+        Ok(pages) if *pages > 0 => Some(PrintSuccessView::new(doc_name, sheets, *pages)),
+        _ => None,
+    }
 }
 
 impl ImportResultView {
@@ -518,7 +613,11 @@ fn combo(
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     // 弹窗打开时压暗底图，把注意力收到弹窗上。
     // 该图层在弹窗图层之前创建，因此始终绘制在弹窗下方；它不参与交互，点击可正常穿透到按钮。
-    if app.dialog != Dialog::None || app.confirm.is_some() || app.print_failure.is_some() {
+    if app.dialog != Dialog::None
+        || app.confirm.is_some()
+        || app.print_failure.is_some()
+        || app.print_success.is_some()
+    {
         let alpha = if app.mode.is_dark() { 130 } else { 55 };
         // 画在背景层末尾：盖住主界面，但仍在 Order::Middle 的窗口之下
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
@@ -561,8 +660,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     }
     // R-42：打印失败弹窗是叠加层，不改变 `app.dialog`。预览窗仍在下面，
     // 关掉提示即可回到原来的单据与页码；用 Foreground 保证它盖在预览窗之上。
+    // R-44：成功提示是并列的另一个叠加层，失败优先，二者不会同时绘制。
     if app.print_failure.is_some() {
         print_failure_dialog(app, ctx);
+    } else if app.print_success.is_some() {
+        print_success_dialog(app, ctx);
     }
 }
 
@@ -644,6 +746,100 @@ fn print_failure_dialog(app: &mut App, ctx: &egui::Context) {
 
     if close {
         dismiss_print_failure(&mut app.print_failure);
+    }
+}
+
+/// 打印成功：作业成功提交后展示本次打印信息，5 秒后自动关闭（R-44）。
+///
+/// 与失败弹窗同款卡片外观，同样不占用 `Dialog`，关掉后预览单据 / 页码 / 位图全部保留。
+/// 提供「关闭」可提前关，并显示剩余秒数；失败弹窗出现时会先清掉本提示，二者不叠加。
+fn print_success_dialog(app: &mut App, ctx: &egui::Context) {
+    let Some(view) = app.print_success.clone() else {
+        return;
+    };
+    let p = app.pal;
+    let mut close = false;
+    let left = print_success_remaining_secs(&view);
+    egui::Window::new(view.title)
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::none()
+                .fill(p.surface)
+                .stroke(egui::Stroke::new(1.0_f32, p.border))
+                .rounding(egui::Rounding::same(14.0))
+                .inner_margin(egui::Margin::same(20.0)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(view.title)
+                        .size(17.0)
+                        .strong()
+                        .color(p.success),
+                );
+                widgets::badge(ui, &p, "已发送至打印机", Tone::Success);
+            });
+            ui.add_space(10.0);
+            widgets::divider(ui, &p);
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new("本次打印信息")
+                    .size(12.5)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.add_space(4.0);
+            let rows = [
+                ("打印件", view.doc_name.clone()),
+                ("单据张数", format!("{} 张", view.sheets)),
+                ("输出页数", format!("{} 页", view.pages)),
+                ("提交时间", view.submitted_at.clone()),
+            ];
+            for (k, v) in rows {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(k).size(12.5).color(p.text_muted));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(v).size(12.5).color(p.text));
+                });
+            }
+            ui.add_space(10.0);
+
+            widgets::soft_box(&p, p.success_soft).show(ui, |ui| {
+                ui.set_width(440.0);
+                ui.label(
+                    RichText::new(
+                        "作业已发送至打印队列，请到打印机取件并核对纸张为 A4 横向。\
+                         若队列卡住或缺纸，请以打印机实际出纸为准，不要重复点击「打印」。",
+                    )
+                    .size(12.0)
+                    .color(p.text),
+                );
+            });
+
+            ui.add_space(10.0);
+            widgets::divider(ui, &p);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("本提示将在 {left} 秒后自动关闭"))
+                        .size(11.0)
+                        .color(p.text_muted),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::ghost_button(ui, &p, "关闭").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        });
+
+    if close {
+        dismiss_print_success(&mut app.print_success);
     }
 }
 
@@ -1748,6 +1944,8 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
     if app.print_vouchers.is_empty() {
         app.dialog = Dialog::None;
+        // R-44：预览意外关闭时一并清掉成功提示，避免留下孤立的倒计时弹窗。
+        dismiss_print_success(&mut app.print_success);
         return;
     }
     let sheets = app.print_vouchers.len();
@@ -1878,10 +2076,16 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
         });
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            // 失败弹窗未关闭时禁掉「打印」，与 print_now 里的守卫一起挡住重复提交。
-            if widgets::primary_button(ui, &p, "打印", app.print_failure.is_none())
-                .on_hover_text("弹系统打印对话框并输出")
-                .clicked()
+            // R-42/R-44：任一打印提示未关闭时禁掉「打印」，
+            // 与 print_now 里的守卫一起挡住 5 秒内的重复提交。
+            if widgets::primary_button(
+                ui,
+                &p,
+                "打印",
+                !print_busy(&app.print_failure, &app.print_success),
+            )
+            .on_hover_text("弹系统打印对话框并输出")
+            .clicked()
             {
                 do_print = true;
             }
@@ -1904,6 +2108,7 @@ fn print_preview(app: &mut App, ctx: &egui::Context) {
         app.print_page = 0;
         app.print_render_failed = false;
         dismiss_print_failure(&mut app.print_failure);
+        dismiss_print_success(&mut app.print_success);
     }
 }
 
@@ -2679,6 +2884,7 @@ pub fn new_payment_input(
 mod tests {
     use super::*;
     use ctp_app::print::PrintError;
+    use std::time::{Duration, Instant};
 
     fn pv(stage: PrintStage, msg: &str) -> PrintFailureView {
         classify_print_failure(stage, &PrintError::Print(msg.into()))
@@ -2805,5 +3011,103 @@ mod tests {
         assert!(slot.is_none(), "关闭只清提示，预览单据与页码由调用方保留");
         assert!(offer_print_failure(&mut slot, second), "关闭后可再次弹出");
         assert_eq!(slot.as_ref().map(|v| v.kind), Some("作业未正常结束"));
+    }
+
+    // ------------------------------------------------------------ R-44 打印成功提示
+
+    #[test]
+    fn 成功视图包含本次打印信息且标题固定() {
+        let v = PrintSuccessView::new("拨款单 PM-2026-001 等 3 张".into(), 3, 6);
+        assert_eq!(v.title, "打印已提交");
+        assert!(v.doc_name.contains("PM-2026-001"));
+        assert_eq!(v.sheets, 3);
+        assert_eq!(v.pages, 6);
+        assert_eq!(v.submitted_at.len(), 19, "提交时间须为本地时间格式");
+        assert!(!print_success_expired(&v), "刚创建不能立即过期");
+        assert_eq!(print_success_remaining_secs(&v), PRINT_SUCCESS_SECS);
+    }
+
+    #[test]
+    fn 成功提示五秒后自动关闭且倒计时不为零() {
+        let mut v = PrintSuccessView::new("拨款单 PM-2026-001".into(), 1, 2);
+        v.at = Instant::now() - Duration::from_millis(4_900);
+        assert!(!print_success_expired(&v), "4.9 秒时仍在显示");
+        assert_eq!(print_success_remaining_secs(&v), 1);
+        v.at = Instant::now() - Duration::from_secs(6);
+        assert!(print_success_expired(&v), "满 5 秒必须自动关闭");
+        assert_eq!(
+            print_success_remaining_secs(&v),
+            1,
+            "即使已过期，倒计时文案也不得显示 0 秒"
+        );
+    }
+
+    #[test]
+    fn 成功提示同时只存在一个且关闭后可再弹() {
+        let mut slot = None;
+        let first = PrintSuccessView::new("拨款单 A".into(), 1, 2);
+        let second = PrintSuccessView::new("拨款单 B".into(), 2, 4);
+        assert!(offer_print_success(&mut slot, first.clone()));
+        assert!(
+            !offer_print_success(&mut slot, second.clone()),
+            "未关闭时必须忽略后续成功，避免覆盖或重复弹出"
+        );
+        assert_eq!(slot.as_ref(), Some(&first), "必须保留首次打印信息");
+        dismiss_print_success(&mut slot);
+        assert!(slot.is_none());
+        assert!(offer_print_success(&mut slot, second), "关闭后可再次弹出");
+    }
+
+    #[test]
+    fn 失败优先清理成功提示且两者不叠加() {
+        let mut failure = None;
+        let mut success = Some(PrintSuccessView::new("拨款单 A".into(), 1, 2));
+        let first = pv(PrintStage::Print, "第 1 页输出失败");
+        assert!(offer_print_failure_exclusive(
+            &mut failure,
+            &mut success,
+            first.clone()
+        ));
+        assert!(success.is_none(), "显示失败时必须清掉成功提示");
+        assert_eq!(failure.as_ref(), Some(&first));
+
+        // 失败未关闭期间再来一次失败：成功提示仍要清掉，失败保留首次原因
+        let mut success2 = Some(PrintSuccessView::new("拨款单 B".into(), 1, 2));
+        let later = pv(PrintStage::Print, "打印作业结束失败");
+        assert!(!offer_print_failure_exclusive(
+            &mut failure,
+            &mut success2,
+            later
+        ));
+        assert!(success2.is_none());
+        assert_eq!(failure.as_ref().map(|v| v.kind), Some("出纸中断"));
+    }
+
+    #[test]
+    fn 任一打印提示在场都禁止再次发起打印() {
+        assert!(!print_busy(&None, &None));
+        assert!(print_busy(
+            &Some(pv(PrintStage::Print, "第 1 页输出失败")),
+            &None
+        ));
+        assert!(print_busy(
+            &None,
+            &Some(PrintSuccessView::new("拨款单 A".into(), 1, 2))
+        ));
+    }
+
+    #[test]
+    fn 取消与失败都不生成成功提示且只有成功页数才提示() {
+        let cancelled: std::result::Result<usize, PrintError> = Ok(0);
+        let failed: std::result::Result<usize, PrintError> =
+            Err(PrintError::Print("第 1 页输出失败".into()));
+        let success: std::result::Result<usize, PrintError> = Ok(4);
+        assert!(success_for_outcome(&cancelled, "拨款单 A".into(), 1).is_none());
+        assert!(success_for_outcome(&failed, "拨款单 A".into(), 1).is_none());
+        let v = success_for_outcome(&success, "拨款单 A 等 2 张".into(), 2)
+            .expect("成功必须生成提示弹窗");
+        assert_eq!(v.title, "打印已提交");
+        assert_eq!(v.sheets, 2);
+        assert_eq!(v.pages, 4);
     }
 }
