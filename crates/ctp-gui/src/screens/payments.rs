@@ -80,6 +80,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut text = app.pay_contract_text.clone();
     let mut picked: Option<String> = None;
     let mut edited = false;
+    // R-52：输入框内容必须能唯一对上一份合同。对不上时不能沿用原合同去登记，
+    // 否则界面写着合同 B、落库却是合同 A（与 R-51 问题 1 同型，但错的是资金）。
+    let text_mismatch = unique_contract_match(&app.summaries, &app.pay_contract_text).as_deref()
+        != app.pay_contract.as_deref();
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("合同").size(12.5).color(p.text_muted));
@@ -97,7 +101,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         edited = out.changed;
 
         // 当前合同的项目状态与支付率：输入框之后紧跟，样式与合同台账一致
-        if let Some(s) = app
+        if text_mismatch {
+            // 文本没对上唯一合同：不展示原合同的状态与支付率，避免误读成「输入的那份」
+            ui.add_space(8.0);
+            widgets::badge(ui, &p, "未匹配", Tone::Danger);
+            ui.label(RichText::new("输入未唯一对上合同").size(11.5).color(p.warn));
+        } else if let Some(s) = app
             .pay_contract
             .as_ref()
             .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
@@ -137,11 +146,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             app.pay_contract = Some(s.contract_id.clone());
         }
     } else if edited {
-        // 边输边匹配：唯一命中才切换，匹配不到沿用原合同
+        // 边输边匹配：唯一命中才切换。匹配不到时保留原合同用于展示，
+        // 但本帧起按「未匹配」处理并禁用登记，不再静默沿用原合同继续保存（R-52）。
         if let Some(id) = unique_contract_match(&app.summaries, &app.pay_contract_text) {
             app.pay_contract = Some(id);
         }
     }
+    // 输入处理之后再判一次：本轮渲染与「能否登记」都以它为准
+    let form_mismatch = unique_contract_match(&app.summaries, &app.pay_contract_text).as_deref()
+        != app.pay_contract.as_deref();
 
     let Some(cid) = app.pay_contract.clone() else {
         return;
@@ -212,6 +225,37 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut open_pay: Option<String> = None;
 
     ui.add_space(10.0);
+
+    // ---------------- 未匹配提示（R-52）：下面所有额度与明细都属于「原合同」
+    if form_mismatch {
+        let typed = app.pay_contract_text.trim().to_string();
+        widgets::soft_box(&p, p.danger_soft).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("合同未匹配，暂不能登记")
+                        .size(12.5)
+                        .strong()
+                        .color(p.danger),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "输入框里的「{}」没有唯一对上一份合同；下方额度与明细仍属于「{}」。\
+                         请从候选里点选，或把输入框改回合同编号 / 名称。",
+                        if typed.is_empty() {
+                            "（空）"
+                        } else {
+                            &typed
+                        },
+                        contract_label
+                    ))
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+            });
+        });
+        ui.add_space(10.0);
+    }
 
     // ---------------- 付清条件提示
     if let Some(note) = limit_note {
@@ -403,7 +447,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let amount_ok = amount.map(|m| m.cent() > 0).unwrap_or(false);
                     let date_ok = is_iso_date(&app.pay_form.date);
                     let over = amount.map(|m| m.cent() > payable_cent).unwrap_or(false);
-                    let ok = amount_ok && date_ok && !over && payable;
+                    let ok = amount_ok && date_ok && !over && payable && !form_mismatch;
 
                     ui.add_space(9.0);
                     if over {
@@ -453,6 +497,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new("当前合同不可拨款，按钮已禁用")
+                                .size(11.0)
+                                .color(p.text_muted),
+                        );
+                    }
+                    if form_mismatch {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("合同未匹配，登记按钮已禁用")
                                 .size(11.0)
                                 .color(p.text_muted),
                         );
@@ -718,6 +770,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     if submit {
+        // R-52 兜底：按钮已按「未匹配」禁用，这里再挡一次，绝不把款项记到另一份合同上
+        if unique_contract_match(&app.summaries, &app.pay_contract_text).as_deref()
+            != app.pay_contract.as_deref()
+        {
+            app.error("合同未匹配，未登记拨款单：请从候选里点选合同");
+            return;
+        }
         // 正常路径由表单校验保证解析成功；这里兜底，绝不把解析失败悄悄写成 0 元单据
         let amount = match Money::parse_yuan(&app.pay_form.amount) {
             Ok(m) if m.cent() > 0 => m,
@@ -819,7 +878,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
 /// 按输入文本找合同：整串「编号 名称」/ 编号 / 名称精确命中，或**唯一**包含命中。
 ///
-/// 命中多于一份时返回 `None`——继续沿用用户原先选中的合同，避免边打字边跳合同。
+/// 返回 `None` 表示「没有唯一对上一份合同」（空串、打错、命中多份）。
+/// 调用方据此禁用登记，而不是沿用原合同继续保存（R-52）。
 fn unique_contract_match(
     summaries: &[ctp_core::ledger::ContractSummary],
     text: &str,
@@ -849,5 +909,67 @@ fn unique_contract_match(
         Some(hits[0].contract_id.clone())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ctp_core::ledger::ContractSummary;
+    use ctp_core::rate::Rate;
+
+    fn summary(id: &str, no: &str, name: &str) -> ContractSummary {
+        ContractSummary {
+            contract_id: id.into(),
+            project_id: "P".into(),
+            contract_no: no.into(),
+            contract_name: name.into(),
+            status: "PERFORMING".into(),
+            contractor_name: "某施工单位".into(),
+            contract_type: "CONSTRUCT".into(),
+            contract_category_code: "GC".into(),
+            category_code: None,
+            category_name: None,
+            total_amount: Money::from_cent(1_000),
+            audit_price: None,
+            is_audited: false,
+            base_amount: Money::from_cent(1_000),
+            audit_reduction: Money::ZERO,
+            paid_amount: Money::ZERO,
+            inflight_amount: Money::ZERO,
+            occupied_amount: Money::ZERO,
+            available_amount: Money::from_cent(1_000),
+            pay_rate: Rate::from_bp(0),
+            is_inverted: false,
+            planned_end: None,
+            duration_days: 0,
+            delivery_date: None,
+        }
+    }
+
+    /// R-52：只有唯一对上才能登记；打错、清空、模糊多命中都不算。
+    #[test]
+    fn 合同文本需唯一命中() {
+        let list = vec![
+            summary("C1", "HT-2026-001", "某市政道路改扩建工程"),
+            summary("C2", "HT-2026-002", "某桥梁加固工程"),
+        ];
+        // 整串 / 编号 / 名称三种写法都唯一
+        assert_eq!(
+            unique_contract_match(&list, "HT-2026-001 某市政道路改扩建工程").as_deref(),
+            Some("C1")
+        );
+        assert_eq!(
+            unique_contract_match(&list, "  ht-2026-002  ").as_deref(),
+            Some("C2")
+        );
+        assert_eq!(
+            unique_contract_match(&list, "某桥梁加固工程").as_deref(),
+            Some("C2")
+        );
+        // 打错 / 清空 / 模糊命中两份 → 无唯一结果，界面据此禁用登记
+        assert_eq!(unique_contract_match(&list, "HT-2026-999"), None);
+        assert_eq!(unique_contract_match(&list, "   "), None);
+        assert_eq!(unique_contract_match(&list, "工程"), None);
     }
 }

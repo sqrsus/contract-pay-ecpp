@@ -2542,6 +2542,7 @@ impl EditDoneView {
                 row("所属项目", "测试项目", "另一个项目"),
                 row("合同名称", contract_name, "（更名后的合同）"),
                 row("工期", "90 日历天", "120 日历天"),
+                row("质保金率", "3.00%", "3.50%"),
                 row("计划交工", "2026-05-29", "2026-06-28"),
                 row("备注", "—", "补充说明：本合同为二期扩建配套工程，含场平、管网及临时道路，付款按季度计量，质保金比例 3%，缺陷责任期 24 个月。"),
             ],
@@ -2726,11 +2727,25 @@ fn delivery_date(app: &mut App, ctx: &egui::Context) {
                 260.0,
             );
 
-            let ok = is_iso_date(&app.delivery_form);
-            if !ok {
+            let date_ok = is_iso_date(&app.delivery_form);
+            // R-52：与已登记的交工日期一致时没有可留痕的变化，不用提交后再报一次
+            let cur_delivery = app.detail.as_ref().and_then(|c| c.delivery_date.clone());
+            let same_date = cur_delivery
+                .as_deref()
+                .map(|d| d.trim() == app.delivery_form.trim())
+                .unwrap_or(false);
+            let ok = date_ok && !same_date;
+            if !date_ok {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("请选择合法日期（YYYY-MM-DD）")
+                        .size(11.5)
+                        .color(p.warn),
+                );
+            } else if same_date {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("与已登记的交工日期一致，无需重复提交")
                         .size(11.5)
                         .color(p.warn),
                 );
@@ -2764,6 +2779,25 @@ fn delivery_date(app: &mut App, ctx: &egui::Context) {
             Err(e) => app.error(format!("登记交工日期失败：{e}")),
         }
     }
+}
+
+/// 表单文本与库里的可选文本是否同值（两端 trim，空串等价于未填）。
+fn opt_text_eq(form: &str, db: &Option<String>) -> bool {
+    form.trim() == db.as_deref().unwrap_or("").trim()
+}
+
+/// 审计价弹窗预填的就是现值：四个字段都没改动时不必提交（R-52 / P3）。
+fn audit_form_unchanged(app: &App) -> bool {
+    let Some(c) = app.detail.as_ref() else {
+        return false;
+    };
+    let typed = Money::parse_yuan(&app.audit_form.amount)
+        .ok()
+        .filter(|m| m.cent() > 0);
+    typed == c.audit_price()
+        && opt_text_eq(&app.audit_form.date, &c.audit_date)
+        && opt_text_eq(&app.audit_form.org, &c.audit_org)
+        && opt_text_eq(&app.audit_form.report_no, &c.audit_report_no)
 }
 
 fn audit_price(app: &mut App, ctx: &egui::Context) {
@@ -2817,7 +2851,17 @@ fn audit_price(app: &mut App, ctx: &egui::Context) {
             let date_ok = app.audit_form.date.trim().is_empty()
                 || is_iso_date(&app.audit_form.date);
             let reason_ok = !app.audit_form.reason.trim().is_empty();
-            let ok = amount_ok && date_ok && reason_ok && id.is_some();
+            // R-52：预填的就是现值，四个字段都没改 → 不提交，免得写重复历史与日志
+            let unchanged = audit_form_unchanged(app);
+            let ok = amount_ok && date_ok && reason_ok && id.is_some() && !unchanged;
+            if unchanged {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("审计价信息与当前档案一致，无需重复登记")
+                        .size(11.5)
+                        .color(p.warn),
+                );
+            }
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -2882,9 +2926,15 @@ fn edit_amount(app: &mut App, ctx: &egui::Context) {
     let mut cancel = false;
     let mut submit = false;
     let id = app.selected.clone();
-    let (no, cur) = app
+    let (no, cur, cur_money) = app
         .selected_summary()
-        .map(|s| (s.contract_no.clone(), s.total_amount.format_yuan()))
+        .map(|s| {
+            (
+                s.contract_no.clone(),
+                s.total_amount.format_yuan(),
+                s.total_amount,
+            )
+        })
         .unwrap_or_default();
 
     modal(format!("修改合同金额 · {no}"), &p)
@@ -2916,7 +2966,20 @@ fn edit_amount(app: &mut App, ctx: &egui::Context) {
             let amount_ok = Money::parse_yuan(&app.amount_form.amount)
                 .map(|m| m.cent() > 0)
                 .unwrap_or(false);
-            let ok = amount_ok && !app.amount_form.reason.trim().is_empty() && id.is_some();
+            // R-52：新金额与当前一致时没有可留痕的变化，别让用户提交后再吃一次提示
+            let same_amount = Money::parse_yuan(&app.amount_form.amount).ok() == Some(cur_money);
+            let ok = amount_ok
+                && !app.amount_form.reason.trim().is_empty()
+                && id.is_some()
+                && !same_amount;
+            if same_amount {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("新金额与当前金额一致，无需保存")
+                        .size(11.5)
+                        .color(p.warn),
+                );
+            }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if widgets::primary_button(ui, &p, "保存", ok).clicked() && ok {

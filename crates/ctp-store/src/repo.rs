@@ -760,22 +760,24 @@ pub fn payment_summary(
     f: &SummaryFilter,
 ) -> Result<Vec<SummaryRow>> {
     use SummaryDim as D;
-    // 分组键 / 显示名；「按合同」额外带一列承包单位
+    // 分组键 / 显示名；「按合同」额外带一列承包单位。
+    // 档案缺失时显示「—」而不是回退成主键或空串（P7）：报表里的 `PRJ-2026-001`
+    // 看着像项目编码，容易被当成名称；空串则与「未选」混在一起。
     let (key_expr, label_expr, sub_expr) = match dim {
         D::Project => (
             "p.project_id",
-            "COALESCE(pj.project_name, p.project_id)".to_string(),
+            "COALESCE(pj.project_name, '—')".to_string(),
             "NULL",
         ),
         D::Contractor => (
             "c.contractor_id",
-            "COALESCE(o.contractor_name, c.contractor_id)".to_string(),
+            "COALESCE(o.contractor_name, '—')".to_string(),
             "NULL",
         ),
         D::Contract => (
             "p.contract_id",
             "c.contract_no || ' · ' || c.contract_name".to_string(),
-            "COALESCE(o.contractor_name, '')",
+            "COALESCE(o.contractor_name, '—')",
         ),
         D::ContractType => ("c.contract_type", "c.contract_type".to_string(), "NULL"),
     };

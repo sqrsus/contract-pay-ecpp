@@ -1347,3 +1347,125 @@ fn 修改所属项目_名称改成新名字按新名称建档() {
         Some("二期工程")
     );
 }
+
+// ---------------------------------------------------------------- R-52
+
+fn action_count(conn: &Connection, action: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sys_audit_log WHERE action = ?1",
+        [action],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// R-52 / P2·P3·P4：金额、审计价、交工日期重复提交 —— 不写历史、不写日志，
+/// 也不能顶「口径违例」的帽子（那不是违规，只是没变化）。
+#[test]
+fn 同值提交不写历史也不顶口径违例() {
+    let (mut conn, cid) = fixture(1_000_000);
+
+    // —— 合同金额：与库里完全一致
+    let c = repo::get_contract(&conn, &cid).unwrap();
+    let err = service::edit_contract_amount(&mut conn, &cid, c.original_amount_cent, "复核", "t")
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("金额未变化"), "{msg}");
+    assert!(!msg.contains("口径违例"), "「没变化」不是口径问题：{msg}");
+
+    // —— 审计价：先登记，再原样提交（弹窗预填的就是现值）
+    service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(90_000_000)),
+        Some("2026-03-01".into()),
+        Some("某造价咨询".into()),
+        Some("SH-001".into()),
+        "结算审定",
+        "t",
+    )
+    .unwrap();
+    let logs_before = action_count(&conn, "SET_AUDIT_PRICE");
+    let hist_before = ctp_app::history::load(&conn, ctp_app::history::KEY_AUDIT_PRICE)
+        .unwrap()
+        .len();
+    let err = service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(90_000_000)),
+        Some("2026-03-01".into()),
+        Some("某造价咨询".into()),
+        Some("SH-001".into()),
+        "复核",
+        "t",
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("审计价信息未变化"), "{msg}");
+    assert!(!msg.contains("口径违例"), "「没变化」不是口径问题：{msg}");
+    assert_eq!(
+        action_count(&conn, "SET_AUDIT_PRICE"),
+        logs_before,
+        "同值不该多写一条日志"
+    );
+    assert_eq!(
+        ctp_app::history::load(&conn, ctp_app::history::KEY_AUDIT_PRICE)
+            .unwrap()
+            .len(),
+        hist_before,
+        "同值不该多写一条审计价历史"
+    );
+
+    // —— 交工日期：fixture 已登记 2020-01-01
+    let logs_before = action_count(&conn, "SET_DELIVERY_DATE");
+    let err = service::set_delivery_date(&mut conn, &cid, "2020-01-01", "t").unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("交工日期未变化"), "{msg}");
+    assert!(!msg.contains("口径违例"), "「没变化」不是口径问题：{msg}");
+    assert_eq!(
+        action_count(&conn, "SET_DELIVERY_DATE"),
+        logs_before,
+        "同值不该多写一条日志"
+    );
+}
+
+/// R-52 / P6：单位文本带编码前缀时按名称段认领，不再建出「ORG-1 某施工单位」
+/// 这样的重复档案（系统没有档案维护界面，重复项无法合并）。
+#[test]
+fn 承包单位写成编码加名称不重复建档() {
+    let (mut conn, _cid) = fixture(1_000_000);
+    let org_count = repo::list_contractors(&conn).unwrap().len();
+
+    let mk = |name: &str, contractor_text: &str| NewContract {
+        project_text: Some("测试项目".into()),
+        contractor_text: Some(contractor_text.to_string()),
+        contract_name: name.into(),
+        contract_type: ctp_core::contract::ContractType::Service,
+        contract_category_code: "GC".into(),
+        party_a: "某建设单位".into(),
+        sign_date: "2026-02-01".into(),
+        original_amount: Money::from_cent(10_000_000),
+        payment_terms: "按月计量支付".into(),
+        ..Default::default()
+    };
+
+    // 已存在的单位：整串里带编码，仍应复用 ORG-1，不新增档案
+    let c =
+        service::create_contract(&mut conn, mk("编码前缀复用", "ORG-1 某施工单位"), "t").unwrap();
+    assert_eq!(c.contractor_id, "ORG-1", "编码前缀不该绕开已有档案");
+    assert_eq!(
+        repo::list_contractors(&conn).unwrap().len(),
+        org_count,
+        "单位档案数量不应增加"
+    );
+
+    // 新单位：建档时只写名称段，前缀不进入单位名称
+    let c2 = service::create_contract(&mut conn, mk("编码前缀新建", "ORG-9 新单位"), "t").unwrap();
+    let orgs = repo::list_contractors(&conn).unwrap();
+    let made = orgs
+        .iter()
+        .find(|o| o.id == c2.contractor_id)
+        .expect("应已建档");
+    assert_eq!(made.contractor_name, "新单位", "编码前缀不该进单位名称");
+    assert_eq!(orgs.len(), org_count + 1, "只应新增一条");
+}

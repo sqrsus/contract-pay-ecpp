@@ -186,7 +186,27 @@ fn role_for_type(t: ContractType) -> ContractorRole {
     }
 }
 
+/// 把「编码 名称」按首个空白切成两段；任一段为空即视为「没拆开」。
+/// 项目名与单位名都可能自带空格，所以调用方还要判断 head 是否真像编码。
+fn split_code_name(text: &str) -> Option<(&str, &str)> {
+    text.find(char::is_whitespace)
+        .map(|i| (text[..i].trim(), text[i..].trim()))
+        .filter(|(head, tail)| !head.is_empty() && !tail.is_empty())
+}
+
+/// 是否像编码前缀：全 ASCII 字母数字与 `- _ .`，长度不超过 32。
+/// 用来区分「ORG-001 某单位」（前缀是编码）与「中铁 十二局」（前缀属于名称）。
+fn looks_like_code(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// 取单位 id：名称已在档就复用，否则按给定角色建档。甲方与承包单位共用。
+///
+/// 文本口径与所属项目同源（R-52 / P6）：整串先查；若写成「编码 名称」且前缀
+/// 确实像编码，则按名称段查 / 建档，不再把「ORG-001 某单位」整体建成一条新档。
 fn ensure_contractor(
     conn: &Connection,
     name: &str,
@@ -199,6 +219,28 @@ fn ensure_contractor(
     }
     if let Some(c) = repo::find_contractor_by_name(conn, name)? {
         return Ok(c.id);
+    }
+    if let Some((head, tail)) = split_code_name(name) {
+        if looks_like_code(head) {
+            if let Some(c) = repo::find_contractor_by_name(conn, tail)? {
+                return Ok(c.id);
+            }
+            return create_contractor(conn, tail, role, operator);
+        }
+    }
+    create_contractor(conn, name, role, operator)
+}
+
+/// 按名称新建单位档案并写审计（调用方负责先查重）。
+fn create_contractor(
+    conn: &Connection,
+    name: &str,
+    role: ContractorRole,
+    operator: &str,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(DomainError::MissingField("单位名称").into());
     }
     let now = now_iso();
     let c = Contractor {
@@ -259,11 +301,7 @@ fn resolve_project(
         return Ok(p.id);
     }
     // 只有出现空白时才拆「编码 / 名称」两段；名称本身可能带空格，故按首个空白切
-    let split = text
-        .find(char::is_whitespace)
-        .map(|i| (text[..i].trim(), text[i..].trim()))
-        .filter(|(head, tail)| !head.is_empty() && !tail.is_empty());
-    if let Some((head, tail)) = split {
+    if let Some((head, tail)) = split_code_name(text) {
         // 名称段优先：用户改的一定是名称，编码只是沿用下来的前缀
         if let Some(p) = repo::find_project_by_text(conn, tail)? {
             return Ok(p.id);
@@ -645,8 +683,9 @@ pub fn update_contract_master(
     );
     note!(
         "质保金率",
-        format!("{} bp", c.retention_rate_bp),
-        format!("{} bp", input.retention_rate_bp)
+        // R-52：与表单（输入 3 表示 3%）、详情卡（3.00）同口径，不再输出 300 bp
+        Rate::from_bp(c.retention_rate_bp).percent_string(),
+        Rate::from_bp(input.retention_rate_bp).percent_string()
     );
     note!(
         "招标代理",
@@ -737,34 +776,28 @@ pub fn update_contract_master(
 }
 
 /// 项目名称（不含编码）：界面展示与「本次修改」弹窗都用它，
-/// 与修改窗里所属项目的显示口径一致（R-51）。
+/// 与修改窗里所属项目的显示口径一致（R-51）。查不到给「—」，不留空白（P7）。
 fn project_name_of(conn: &Connection, id: &str) -> String {
     repo::list_projects(conn)
         .ok()
         .and_then(|v| v.into_iter().find(|p| p.id == id))
         .map(|p| p.project_name)
-        .unwrap_or_default()
+        .unwrap_or_else(|| "—".to_string())
 }
 
-/// 单位展示名，查不到返回空串。
+/// 单位展示名，查不到返回「—」（与其它缺失值口径一致，P7）。
 fn contractor_label(conn: &Connection, id: &str) -> String {
     repo::list_contractors(conn)
         .ok()
         .and_then(|v| v.into_iter().find(|x| x.id == id))
         .map(|x| x.contractor_name)
-        .unwrap_or_default()
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn bid_agent_label(conn: &Connection, id: Option<&str>) -> String {
     match id {
-        Some(id) => {
-            let name = contractor_label(conn, id);
-            if name.is_empty() {
-                "—".to_string()
-            } else {
-                name
-            }
-        }
+        // 缺失值统一由 contractor_label 输出「—」，这里不再二次判断空串
+        Some(id) => contractor_label(conn, id),
         None => "—".to_string(),
     }
 }
@@ -961,7 +994,8 @@ pub fn edit_contract_amount(
     }
     let old = c.original_amount_cent;
     if old == new_amount {
-        return Err(DomainError::Invariant("新旧金额相同，无需留痕".into()).into());
+        // R-52：不是口径问题，也不是「填错」，只是没有变化；不顶「口径违例」的帽子
+        return Err(DomainError::NoChange("金额未变化，没有修改任何内容，无需留痕".into()).into());
     }
     let at = now_iso();
     c.original_amount_cent = new_amount;
@@ -990,6 +1024,11 @@ pub fn edit_contract_amount(
     )?;
     tx.commit()?;
     Ok(c)
+}
+
+/// 可选文本的落库口径：去首尾空白，全空视为「未填」。
+fn norm_text(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// 审计价登记 / 修改 / 清空（BR-14 / BR-16）。
@@ -1026,12 +1065,26 @@ pub fn register_audit_price(
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
     let old = c.audit_price().map(|m| m.cent());
-    // 归一：<= 0 一律按未审定处理（4.2.7）
+    // 归一：<= 0 一律按未审定处理（4.2.7）；字符串字段也先 trim 再落库，
+    // 让「同值判定」和「实际写入」用同一份值，避免多打一个空格就多一条留痕（R-52）。
     let normalized = price.filter(|p| p.cent() > 0);
+    let new_date = norm_text(audit_date);
+    let new_org = norm_text(audit_org);
+    let new_report = norm_text(audit_report_no);
+    if c.audit_price() == normalized
+        && norm_text(c.audit_date.clone()) == new_date
+        && norm_text(c.audit_org.clone()) == new_org
+        && norm_text(c.audit_report_no.clone()) == new_report
+    {
+        // 四个字段都没变：不写历史、不写日志、不改档案
+        return Err(
+            DomainError::NoChange("审计价信息未变化，没有修改任何内容，无需留痕".into()).into(),
+        );
+    }
     c.audit_price_cent = normalized;
-    c.audit_date = audit_date.filter(|d| !d.trim().is_empty());
-    c.audit_org = audit_org.filter(|d| !d.trim().is_empty());
-    c.audit_report_no = audit_report_no.filter(|d| !d.trim().is_empty());
+    c.audit_date = new_date;
+    c.audit_org = new_org;
+    c.audit_report_no = new_report;
     c.updated_at = now_iso();
     c.updated_by = Some(operator.to_string());
     repo::update_contract(&tx, &c)?;
@@ -1078,19 +1131,27 @@ pub fn set_delivery_date(
     operator: &str,
 ) -> Result<Contract> {
     validate_iso_date(date)?;
+    let d = date.trim();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
     if c.is_deleted {
-        return Err(DomainError::Invariant("合同已删除，不能登记交工".into()).into());
+        // 这是状态非法，不是口径违例（与 edit_contract_amount 的 Void 判定同类）
+        return Err(DomainError::IllegalState("合同已删除，不能登记交工".into()).into());
     }
     let old = c.delivery_date.clone();
-    c.delivery_date = Some(date.trim().to_string());
+    if old.as_deref().map(str::trim) == Some(d) {
+        // 同日期重复提交：不写日志、不改档案（R-52 / P4）
+        return Err(
+            DomainError::NoChange("交工日期未变化，没有修改任何内容，无需留痕".into()).into(),
+        );
+    }
+    c.delivery_date = Some(d.to_string());
     c.updated_at = now_iso();
     c.updated_by = Some(operator.to_string());
     repo::update_contract(&tx, &c)?;
     let detail = format!(
         "交工日期 {}（原 {}）",
-        date.trim(),
+        d,
         old.unwrap_or_else(|| "未登记".into())
     );
     db::insert_audit_log(
