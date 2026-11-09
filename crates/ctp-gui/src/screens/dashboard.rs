@@ -9,6 +9,10 @@ use eframe::egui::{self, RichText};
 /// 最近拨款一行：(单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额分, 是否作废)
 type RecentRow = (String, String, String, String, String, String, i64, bool);
 
+/// 「最近拨款」合同名称列宽：按需求加宽到原来的 1.3 倍（236 × 1.3 = 306.8）。
+/// 表头、单元格与滚动命名三处必须同值，否则文字与列边界会错位。
+const NAME_W: f32 = 306.8;
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
 
@@ -247,7 +251,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             head_cell(ui, &p, 24.0, "", false);
             head_cell(ui, &p, 86.0, "开单日期", false);
             head_cell(ui, &p, 104.0, "拨款单号", false);
-            head_cell(ui, &p, 236.0, "合同名称", false);
+            // 合同名称列加宽到 1.3 倍（236 → 306.8）：长名称少滚动一截
+            head_cell(ui, &p, NAME_W, "合同名称", false);
             head_cell(ui, &p, 130.0, "承包单位", false);
             head_cell(ui, &p, 110.0, "金额", true);
             head_cell(ui, &p, 52.0, "状态", false);
@@ -288,12 +293,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 open_pay = Some(pay_id.clone());
                             }
                         });
-                        cell(ui, 236.0, false, |ui| {
+                        cell(ui, NAME_W, false, |ui| {
                             // 合同名称即详情入口：悬停滚动查看全名，点击弹出该合同的详情弹窗
                             let r = widgets::marquee_sense(
                                 ui,
                                 &cname,
-                                236.0,
+                                NAME_W,
                                 12.5,
                                 p.primary,
                                 egui::Sense::click(),

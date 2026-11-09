@@ -188,7 +188,9 @@ fn role_for_type(t: ContractType) -> ContractorRole {
 
 /// 把「编码 名称」按首个空白切成两段；任一段为空即视为「没拆开」。
 /// 项目名与单位名都可能自带空格，所以调用方还要判断 head 是否真像编码。
-fn split_code_name(text: &str) -> Option<(&str, &str)> {
+///
+/// `pub(crate)`：批量合同导入的查重键要按同一套规则归一，不能各写一份。
+pub(crate) fn split_code_name(text: &str) -> Option<(&str, &str)> {
     text.find(char::is_whitespace)
         .map(|i| (text[..i].trim(), text[i..].trim()))
         .filter(|(head, tail)| !head.is_empty() && !tail.is_empty())
@@ -196,7 +198,7 @@ fn split_code_name(text: &str) -> Option<(&str, &str)> {
 
 /// 是否像编码前缀：全 ASCII 字母数字与 `- _ .`，长度不超过 32。
 /// 用来区分「ORG-001 某单位」（前缀是编码）与「中铁 十二局」（前缀属于名称）。
-fn looks_like_code(s: &str) -> bool {
+pub(crate) fn looks_like_code(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
         && s.chars()

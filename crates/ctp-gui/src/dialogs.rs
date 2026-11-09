@@ -46,8 +46,12 @@ pub enum Dialog {
 }
 
 /// 导入结果弹窗的数据：只保留统计摘要与失败条目，不逐行列明细（R-33 确认口径）。
+///
+/// `kind` 决定标题与统计口径（拨款论「笔」、合同论「条」），两条链路的
+/// 校验标记、上限、逐行事务与失败行提示完全共用，只有文案不同。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportResultView {
+    pub kind: crate::BatchImport,
     pub imported: usize,
     pub skipped: usize,
     /// （Excel 可见行号，失败原因）
@@ -432,8 +436,9 @@ pub fn success_for_outcome(
 }
 
 impl ImportResultView {
-    pub fn from_report(r: &ctp_app::batch::ImportReport) -> Self {
+    pub fn from_report(r: &ctp_app::batch::ImportReport, kind: crate::BatchImport) -> Self {
         ImportResultView {
+            kind,
             imported: r.imported,
             skipped: r.skipped,
             failures: r
@@ -445,12 +450,48 @@ impl ImportResultView {
         }
     }
 
-    pub fn rejected(reason: impl Into<String>) -> Self {
+    pub fn rejected(kind: crate::BatchImport, reason: impl Into<String>) -> Self {
         ImportResultView {
+            kind,
             imported: 0,
             skipped: 0,
             failures: Vec::new(),
             rejected: Some(reason.into()),
+        }
+    }
+
+    /// 弹窗标题：`批量拨款导入结果` / `批量合同导入结果`。
+    fn title(&self) -> String {
+        format!("{}导入结果", self.kind.subject())
+    }
+
+    /// 统计口径随来源变：拨款论「笔」且报跳过行，合同论「条」（空白行不计）。
+    fn summary(&self) -> String {
+        match self.kind {
+            crate::BatchImport::Payments => format!(
+                "成功导入 {} 笔 · 跳过 {} 行 · 失败 {} 行",
+                self.imported,
+                self.skipped,
+                self.failures.len()
+            ),
+            crate::BatchImport::Contracts => format!(
+                "成功导入 {} 条 · 失败 {} 行",
+                self.imported,
+                self.failures.len()
+            ),
+        }
+    }
+
+    /// 统计摘要下方的口径提示。
+    fn note(&self) -> &'static str {
+        match self.kind {
+            crate::BatchImport::Payments => {
+                "本次金额留空或为 0 的行跳过；日期留空按当天、事由留空按「拨付进度款」、支付方式留空按转账。"
+            }
+            crate::BatchImport::Contracts => {
+                "导入的合同一律为草稿，需在详情卡上传「合同」附件后才能设为生效；\
+                 同名且同承包单位的合同会被判为重复并跳过该行。"
+            }
         }
     }
 
@@ -1289,7 +1330,7 @@ fn print_success_dialog(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-/// 批量拨款导入结果：常驻真模态，只列统计摘要 + 失败条目，不列逐行明细。
+/// 批量导入结果（拨款 / 合同共用）：常驻真模态，只列统计摘要 + 失败条目，不列逐行明细。
 fn import_result(app: &mut App, ctx: &egui::Context) {
     let Some(view) = app.import_result.clone() else {
         dismiss_import_result(&mut app.dialog, &mut app.import_result);
@@ -1297,7 +1338,7 @@ fn import_result(app: &mut App, ctx: &egui::Context) {
     };
     let p = app.pal;
     let mut close = false;
-    egui::Window::new("批量拨款导入结果")
+    egui::Window::new(view.title())
         .collapsible(false)
         .resizable(false)
         .order(egui::Order::Foreground)
@@ -1313,7 +1354,7 @@ fn import_result(app: &mut App, ctx: &egui::Context) {
             ui.set_width(520.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("批量拨款导入结果")
+                    RichText::new(view.title())
                         .size(17.0)
                         .strong()
                         .color(p.text),
@@ -1323,30 +1364,24 @@ fn import_result(app: &mut App, ctx: &egui::Context) {
             ui.add_space(10.0);
 
             ui.label(
-                RichText::new(format!(
-                    "成功导入 {} 笔 · 跳过 {} 行 · 失败 {} 行",
-                    view.imported,
-                    view.skipped,
-                    view.failures.len()
-                ))
-                .size(13.5)
-                .strong()
-                .color(p.text),
+                RichText::new(view.summary())
+                    .size(13.5)
+                    .strong()
+                    .color(p.text),
             );
             ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "本次金额留空或为 0 的行跳过；日期留空按当天、事由留空按「拨付进度款」、支付方式留空按转账。",
-                )
-                .size(11.5)
-                .color(p.text_muted),
-            );
+            ui.label(RichText::new(view.note()).size(11.5).color(p.text_muted));
             ui.add_space(10.0);
 
             if let Some(reason) = &view.rejected {
                 widgets::divider(ui, &p);
                 ui.add_space(6.0);
-                ui.label(RichText::new("拒绝原因").size(12.5).strong().color(p.danger));
+                ui.label(
+                    RichText::new("拒绝原因")
+                        .size(12.5)
+                        .strong()
+                        .color(p.danger),
+                );
                 ui.label(RichText::new(reason).size(12.0).color(p.text));
                 ui.add_space(8.0);
             }
@@ -4095,6 +4130,7 @@ mod tests {
                 skipped: 1,
                 failures: vec![],
             },
+            crate::BatchImport::Payments,
         ));
         dismiss_import_result(&mut dialog, &mut result);
         assert!(dialog == Dialog::None, "dialog 必须回到 None");

@@ -125,6 +125,37 @@ pub struct ShotJob {
     pub requested: bool,
 }
 
+/// 批量导入的来源。
+///
+/// 两条链路共用同一套护栏（隐藏校验表、文件/行数上限、逐行事务、结果弹窗），
+/// 差别只在「读进哪个模块」与文案，所以用同一个待办槽位 + 一个来源标记，
+/// 避免为合同再造一份 `pending_*` 状态与一套弹窗。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchImport {
+    /// 批量拨款（`ctp_app::batch`）
+    Payments,
+    /// 批量合同（`ctp_app::contract_batch`）
+    Contracts,
+}
+
+impl BatchImport {
+    /// 弹窗标题与提示里用的主体名。
+    pub fn subject(self) -> &'static str {
+        match self {
+            BatchImport::Payments => "批量拨款",
+            BatchImport::Contracts => "批量合同",
+        }
+    }
+
+    /// 「处理中」遮罩上的文案。
+    pub fn busy_text(self) -> &'static str {
+        match self {
+            BatchImport::Payments => "正在导入批量拨款…",
+            BatchImport::Contracts => "正在导入批量合同…",
+        }
+    }
+}
+
 /// 应用状态。
 pub struct App {
     pub mode: ThemeMode,
@@ -143,7 +174,8 @@ pub struct App {
     /// R-39：耗时操作的「处理中」状态。批量导入仍是同步的（本轮不做线程化），
     /// 该状态用于挡住重复提交，并在下一帧真正执行前给出可见反馈。
     pub busy: Option<String>,
-    pub pending_import: Option<std::path::PathBuf>,
+    /// 上一帧登记的批量导入：（来源, 文件）。来源决定调哪个模块的 `import`。
+    pub pending_import: Option<(BatchImport, std::path::PathBuf)>,
 
     pub summaries: Vec<ContractSummary>,
     pub projects: Vec<Project>,
@@ -1011,13 +1043,20 @@ impl App {
     }
 
     /// 上一帧登记的批量导入，在这一帧真正执行（R-39「处理中」状态的落地）。
-    fn run_pending_import(&mut self, path: &std::path::Path) {
-        let view = match self.exec(|c| ctp_app::batch::import(c, path, "管理员")) {
+    fn run_pending_import(&mut self, kind: BatchImport, path: &std::path::Path) {
+        // 两条链路返回同一个 `ImportReport`，结果弹窗与失败行提示完全共用
+        let report = match kind {
+            BatchImport::Payments => self.exec(|c| ctp_app::batch::import(c, path, "管理员")),
+            BatchImport::Contracts => {
+                self.exec(|c| ctp_app::contract_batch::import(c, path, "管理员"))
+            }
+        };
+        let view = match report {
             Ok(report) => {
                 self.refresh();
-                crate::dialogs::ImportResultView::from_report(&report)
+                crate::dialogs::ImportResultView::from_report(&report, kind)
             }
-            Err(e) => crate::dialogs::ImportResultView::rejected(format!("导入失败：{e}")),
+            Err(e) => crate::dialogs::ImportResultView::rejected(kind, format!("导入失败：{e}")),
         };
         self.busy = None;
         self.show_import_result(view);
@@ -1512,8 +1551,8 @@ impl eframe::App for App {
             self.screen = Screen::Dashboard;
         }
         // R-39：上一帧登记的耗时操作在这一帧执行，期间「处理中」状态挡住重复提交
-        if let Some(path) = self.pending_import.take() {
-            self.run_pending_import(&path);
+        if let Some((kind, path)) = self.pending_import.take() {
+            self.run_pending_import(kind, &path);
         }
 
         self.top_bar(ctx);

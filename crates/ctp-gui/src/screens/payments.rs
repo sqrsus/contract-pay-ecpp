@@ -791,8 +791,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             .add_filter("Excel 工作簿", &["xlsx"])
             .pick_file()
         {
-            app.pending_import = Some(path);
-            app.busy = Some("正在导入批量拨款…".to_string());
+            app.pending_import = Some((crate::BatchImport::Payments, path));
+            app.busy = Some(crate::BatchImport::Payments.busy_text().to_string());
         }
     }
 

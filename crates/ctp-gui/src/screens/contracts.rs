@@ -56,6 +56,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut action: Option<Act> = None;
     // R-33：合同台账导出（与屏幕表格同源的 ReportResult）
     let mut export_ledger = false;
+    // 批量合同：导出空白模板 / 导入回传（与「拨款管理」的批量功能同构）
+    let mut export_contract_tpl = false;
+    let mut import_contracts = false;
     // 展开面板里的打印入口：与拨款管理页「拨款明细」操作列一致
     let mut print_pay: Option<ctp_core::payment::Payment> = None;
     let mut print_material: Option<String> = None;
@@ -107,6 +110,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::primary_button(ui, &p, "新建合同", true).clicked() {
                 action = Some(Act::New);
+            }
+            if widgets::ghost_button(ui, &p, "批量导入合同")
+                .on_hover_text("按模板填好后一次导入多份合同，逐行校验、失败行单独提示")
+                .clicked()
+            {
+                import_contracts = true;
+            }
+            if widgets::ghost_button(ui, &p, "导出批量合同模板")
+                .on_hover_text(
+                    "导出含 21 列（= 新建合同全部字段）的空白 xlsx，带必填标记与枚举下拉",
+                )
+                .clicked()
+            {
+                export_contract_tpl = true;
             }
             if widgets::ghost_button(ui, &p, "导出 Excel").clicked() {
                 export_ledger = true;
@@ -452,6 +469,35 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         let rows = filtered_summaries(app);
         let result = ReportResult::contract_ledger(&rows, LedgerColumns::FULL);
         app.open_export_columns(result);
+    }
+
+    // 批量合同：模板 21 列 = 新建合同表单的全部字段；导入每行独立事务、失败行单独提示。
+    // 与「拨款管理」的批量入口共用体检（校验表 / 上限 / 结果弹窗），只是落库模块不同。
+    if export_contract_tpl {
+        let name = format!("批量合同模板_{}.xlsx", ctp_core::date::today_iso());
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&name)
+            .add_filter("Excel 工作簿", &["xlsx"])
+            .save_file()
+        {
+            match ctp_app::contract_batch::write_template(&path, &ctp_core::date::now_iso()) {
+                Ok(n) => app.success(format!(
+                    "模板已导出（{n} 列）：带 * 为必填，枚举列可下拉选择；填好后用「批量导入合同」导入"
+                )),
+                Err(e) => app.error(format!("导出模板失败：{e}")),
+            }
+        }
+    }
+    if import_contracts && app.require_write() {
+        if app.busy.is_some() {
+            app.toast(Tone::Neutral, "正在处理上一次导入，请稍候");
+        } else if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel 工作簿", &["xlsx"])
+            .pick_file()
+        {
+            app.pending_import = Some((crate::BatchImport::Contracts, path));
+            app.busy = Some(crate::BatchImport::Contracts.busy_text().to_string());
+        }
     }
 
     // 浏览用户不许触发写类动作：不置灰，点了直接提示「无权限」

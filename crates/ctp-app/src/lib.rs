@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod batch;
 pub mod checks;
+pub mod contract_batch;
 pub mod demo;
 pub mod history;
 pub mod logs;
