@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 # 项目版本唯一真源：四个 crate 均用 version.workspace = true 继承。
 # Excel 导出页脚「系统版本」由 env!("CARGO_PKG_VERSION") 自动取此值，不要再硬编码。
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 
 [workspace.dependencies]

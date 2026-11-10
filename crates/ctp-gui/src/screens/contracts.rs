@@ -580,8 +580,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     let panel = contractor_panel(
                                         ui,
                                         &p,
-                                        &s.contract_id,
-                                        &s.contractor_name,
+                                        s,
                                         &others,
                                         &mut detail,
                                     );
@@ -1067,22 +1066,31 @@ fn other_contracts_of<'a>(
         .collect()
 }
 
+/// R-63：承包单位面板的「合计合同金额」口径 —— 本合同金额 + 该单位其他合同金额之和。
+/// 台账合计行、总览卡片、报表都统计别的东西，只有这里代表「这家单位在库里的全部合同额」，
+/// 所以本合同必须计入，否则同一块面板里「份数含本合同、金额不含」会自相矛盾。
+/// 单独成函数是为了让这个加法只有一处实现，界面改动不会漏掉本合同。
+fn contractor_total_cent(own_cent: i64, others: &[&ctp_core::ledger::ContractSummary]) -> i64 {
+    Money::sum_saturating(
+        std::iter::once(own_cent).chain(others.iter().map(|o| o.total_amount.cent())),
+    )
+}
+
 /// R-59：点承包单位后在该行下方展开的面板，沿用「拨款明细」展开卡的同款样式。
-/// `anchor` 是当前行合同 id，只用来给面板内的表格划出独立 id 作用域——
-/// 同一帧里若有多张表，自动生成的 id 会撞车（egui 会报 “First/Second use of Table ID”）。
+/// `own` 是当前行合同：既是面板内表格 id 作用域的锚点（同一帧里若有多张表，自动生成的
+/// id 会撞车，egui 会报 “First/Second use of Table ID”），也是 R-63 合计口径里的「本合同」。
 /// 列：合同编号 / 合同名称 / 合同金额 / 审计价 / 支付率 / 项目状态；点名称打开合同详情
 /// （R-60：编号与台账一致，不再可点）。
 fn contractor_panel(
     ui: &mut egui::Ui,
     p: &crate::theme::Palette,
-    anchor: &str,
-    contractor: &str,
+    own: &ctp_core::ledger::ContractSummary,
     others: &[&ctp_core::ledger::ContractSummary],
     open: &mut Option<String>,
 ) -> egui::Rect {
     let start = ui.min_rect();
-    ui.push_id(("contractor_panel", anchor), |ui| {
-        contractor_panel_body(ui, p, contractor, others, open);
+    ui.push_id(("contractor_panel", &own.contract_id), |ui| {
+        contractor_panel_body(ui, p, own, others, open);
     });
     ui.add_space(3.0);
     start.union(ui.min_rect())
@@ -1091,7 +1099,7 @@ fn contractor_panel(
 fn contractor_panel_body(
     ui: &mut egui::Ui,
     p: &crate::theme::Palette,
-    contractor: &str,
+    own: &ctp_core::ledger::ContractSummary,
     others: &[&ctp_core::ledger::ContractSummary],
     open: &mut Option<String>,
 ) -> egui::Rect {
@@ -1104,31 +1112,30 @@ fn contractor_panel_body(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                // R-63：份数与金额同口径 —— 都含本合同，避免「N 份」却按 N+1 份算钱
                 ui.label(
-                    RichText::new(format!("承包单位其他合同 · {} 份", others.len()))
+                    RichText::new(format!("承包单位合同 · {} 份", others.len() + 1))
                         .size(12.0)
                         .strong()
                         .color(p.text),
                 );
-                if !others.is_empty() {
-                    let total = Money::sum_saturating(others.iter().map(|o| o.total_amount.cent()));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "合计合同金额 {} 元",
-                                Money::from_cent(total).format_yuan()
-                            ))
-                            .size(11.5)
-                            .color(p.text_muted),
-                        );
-                    });
-                }
+                let total = contractor_total_cent(own.total_amount.cent(), others);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "合计合同金额 {} 元",
+                            Money::from_cent(total).format_yuan()
+                        ))
+                        .size(11.5)
+                        .color(p.text_muted),
+                    );
+                });
             });
             ui.add_space(4.0);
 
             if others.is_empty() {
                 ui.label(
-                    RichText::new(format!("{contractor} 名下暂无其他合同"))
+                    RichText::new(format!("{} 名下暂无其他合同", own.contractor_name))
                         .size(11.5)
                         .color(p.text_muted),
                 );
@@ -1514,6 +1521,36 @@ mod tests {
         assert!(other_contracts_of(&only, "某设计院", "C9").is_empty());
         // 单位名不匹配时不串台
         assert!(other_contracts_of(&all, "某设备公司", "C1").is_empty());
+    }
+
+    /// R-63：合计合同金额 = 本合同 + 同单位其他合同。份数含本合同，金额也必须含，
+    /// 否则同一块面板里两个数各自一套口径；没有其他合同时退化为本合同金额而不是 0。
+    #[test]
+    fn 合计合同金额包含本合同() {
+        let all = [
+            summary("C1", "HT-001", "道路工程一标", "某建工集团", 1_000),
+            summary("C2", "HT-002", "桥梁加固", "某建工集团", 2_000),
+            summary("C4", "HT-004", "管网改造", "某建工集团", 4_000),
+        ];
+        let others = other_contracts_of(&all, "某建工集团", "C1");
+        assert_eq!(others.len(), 2, "面板只列其他两份");
+        // 本合同 1000 + 其他 2000 + 4000
+        assert_eq!(
+            contractor_total_cent(all[0].total_amount.cent(), &others),
+            7_000
+        );
+
+        // 空态：合计退化为本合同金额，不能因为「没有其他合同」而变成 0 或消失
+        let only = [summary("C9", "HT-009", "独立合同", "某设计院", 500)];
+        let none = other_contracts_of(&only, "某设计院", "C9");
+        assert!(none.is_empty());
+        assert_eq!(
+            contractor_total_cent(only[0].total_amount.cent(), &none),
+            500
+        );
+
+        // 饱和相加：极端金额不 panic、不翻转成负数
+        assert_eq!(contractor_total_cent(i64::MAX, &[&only[0]]), i64::MAX);
     }
 
     /// R-61：点空白收起与点展开入口在同一帧发生时，展开优先 ——
