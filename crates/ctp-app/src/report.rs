@@ -614,7 +614,8 @@ impl ReportResult {
                 "承包单位",
                 ColumnKind::Text,
                 22.0,
-                165.0,
+                // R-56：110 → 165（1.5 倍）；R-58：再 ×1.2 → 198，新增宽度由余量列「合同名称」让位
+                198.0,
             ));
             columns.push(ReportColumn::new(
                 "total_amount",

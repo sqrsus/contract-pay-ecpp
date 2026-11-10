@@ -8,7 +8,8 @@ pub mod auth;
 pub mod batch;
 pub mod checks;
 pub mod contract_batch;
-pub mod demo;
+#[cfg(test)]
+pub mod fixture;
 pub mod history;
 pub mod logs;
 pub mod paper;

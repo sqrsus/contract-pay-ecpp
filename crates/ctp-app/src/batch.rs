@@ -454,15 +454,15 @@ mod tests {
         ))
     }
 
-    fn conn_with_demo() -> Connection {
+    fn conn_with_fixture() -> Connection {
         let mut c = db::open_in_memory().unwrap();
         db::migrate(&mut c).unwrap();
         seed::seed_reference(&c, "t").unwrap();
-        crate::demo::seed_demo(&mut c, "t").unwrap();
+        crate::fixture::seed_fixture(&mut c, "t").unwrap();
         c
     }
 
-    fn demo_rows(conn: &Connection) -> Vec<TemplateRow> {
+    fn fixture_rows(conn: &Connection) -> Vec<TemplateRow> {
         repo::summaries(conn)
             .unwrap()
             .iter()
@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn 模板可写出并带校验标记() {
-        let conn = conn_with_demo();
-        let rows = demo_rows(&conn);
+        let conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
         assert!(!rows.is_empty());
         let path = temp_path("write");
         let (n, cols) = write_template(&rows, &path, "2026-11-06T00:00:00Z").unwrap();
@@ -493,8 +493,8 @@ mod tests {
 
     #[test]
     fn 标记不符时整份拒绝() {
-        let mut conn = conn_with_demo();
-        let rows = demo_rows(&conn);
+        let mut conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
         let path = temp_path("badmark");
         write_template(&rows, &path, "x").unwrap();
 
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn 缺校验表时拒绝() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("nosheet");
         {
             let mut wb = Workbook::new();
@@ -530,8 +530,8 @@ mod tests {
 
     #[test]
     fn 空行不算失败() {
-        let mut conn = conn_with_demo();
-        let rows = demo_rows(&conn);
+        let mut conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
         let path = temp_path("blank");
         write_template(&rows, &path, "x").unwrap();
         let report = import(&mut conn, &path, "批量导入").unwrap();
@@ -543,8 +543,8 @@ mod tests {
 
     #[test]
     fn 金额为零跳过_留空字段按默认值写入() {
-        let mut conn = conn_with_demo();
-        let rows = demo_rows(&conn);
+        let mut conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
         let path = temp_path("defaults");
         let target = rows[0].contract_name.clone();
         {
@@ -582,8 +582,8 @@ mod tests {
 
     #[test]
     fn 填了金额的行会被写入且字段正确() {
-        let mut conn = conn_with_demo();
-        let rows = demo_rows(&conn);
+        let mut conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
         let before = repo::list_payments(&conn, None).unwrap().len();
         let target = rows[0].contract_name.clone();
 
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn 合同名对不上时只报该行() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("badname");
         {
             let mut wb = Workbook::new();
@@ -667,7 +667,7 @@ mod tests {
     /// R-39：文件大小与行数上限在解压/逐行写入之前生效。
     #[test]
     fn 超大文件与超量行数被整份拒绝() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let big = temp_path("bigfile");
         // 超过 10 MB 的文件，在 open_workbook 之前就被 metadata 检查挡下
         std::fs::write(&big, vec![0u8; (MAX_IMPORT_FILE_BYTES + 1) as usize]).unwrap();
@@ -696,8 +696,8 @@ mod tests {
     #[test]
     #[ignore = "需要人工看版式时手动执行"]
     fn 落一份模板供肉眼核对() {
-        let conn = conn_with_demo();
-        let rows = demo_rows(&conn);
+        let conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
         let path = std::env::temp_dir().join("ctp-批量拨款模板_核对用.xlsx");
         let (n, _) = write_template(&rows, &path, &ctp_core::date::now_iso()).unwrap();
         println!("已写出 {} 行 → {}", n, path.display());

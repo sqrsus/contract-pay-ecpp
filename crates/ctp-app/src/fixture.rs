@@ -1,6 +1,10 @@
+//! 测试夹具：一套可复现的最小业务数据（1 个项目、3 份合同、4 张拨款单，其中 1 张作废）。
+//!
+//! R-58 起产品界面不再提供「载入演示数据」入口，原 `demo` 模块降级为本夹具：
+//! 只在 `cfg(test)` 下编译，没有任何界面按钮或环境变量开关，Release 二进制里不含本模块。
+
 use crate::service::{self, NewContract, NewPayment};
 use ctp_core::attachment::AttachmentKind;
-use ctp_core::date::today_iso;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
 use ctp_core::project::{Contact, Contractor, ContractorRole, Project};
@@ -11,8 +15,8 @@ fn yuan(v: i64) -> Money {
     Money::from_cent(v * 100)
 }
 
-/// 演示附件。真实项目当然是扫描件，这里落一段可读文本占位，
-/// 目的是让「附件 3/4」「生效前必须齐备」这些链路在演示库里真的能走通。
+/// 夹具附件。真实项目当然是扫描件，这里落一段可读文本占位，
+/// 目的是让「附件 3/4」「生效前必须齐备」这些链路在测试库里真的能走通。
 fn seed_attachments(
     conn: &mut Connection,
     contract_id: &str,
@@ -24,7 +28,7 @@ fn seed_attachments(
         (AttachmentKind::BidNotice, "中标通知书"),
     ];
     for (kind, title) in items {
-        let body = format!("演示占位件：{title}\n本文件由演示数据生成，仅用于验证附件链路。");
+        let body = format!("测试占位件：{title}\n本文件由测试夹具生成，仅用于验证附件链路。");
         let name = format!("{title}.txt");
         service::save_attachment(
             conn,
@@ -37,7 +41,7 @@ fn seed_attachments(
         )?;
     }
     if with_audit {
-        let body = "演示占位件：审计报告\n本文件由演示数据生成，仅用于验证附件链路。";
+        let body = "测试占位件：审计报告\n本文件由测试夹具生成，仅用于验证附件链路。";
         service::save_attachment(
             conn,
             contract_id,
@@ -51,9 +55,11 @@ fn seed_attachments(
     Ok(())
 }
 
-/// 演示数据：覆盖「未审定 / 已审定 / 已作废一笔」三种典型形态，
+/// 测试夹具：覆盖「未审定 / 已审定 / 已作废一笔」三种典型形态，
 /// 便于用 `summary`、`ledger`、`category` 三个命令直接核对口径。
-pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
+///
+/// 仅供测试构造数据：产品界面不提供入口，release 构建不引用本模块的任何函数。
+pub fn seed_fixture(conn: &mut Connection, operator: &str) -> Result<()> {
     ctp_store::seed::seed_reference(conn, operator)?;
 
     let now = ctp_core::date::now_iso();
@@ -63,7 +69,7 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
             id: "PJ-1".into(),
             project_code: "XAJT".into(),
             project_name: "某市政道路改扩建工程".into(),
-            remark: Some("演示项目".into()),
+            remark: Some("夹具项目".into()),
             is_deleted: false,
             version: 1,
             created_at: now.clone(),
@@ -215,7 +221,7 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
     p.reason = Some("第一季度监理费".into());
     service::register_payment(conn, p, operator)?;
 
-    // 合同三：材料采购，一笔拨款作废（演示 H5 的「作废 + 重登」）
+    // 合同三：材料采购，一笔拨款作废（夹具里的「作废 + 重登」）
     let c3 = service::create_contract(
         conn,
         NewContract {
@@ -251,6 +257,5 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
     p.pay_method = PayMethod::Transfer;
     service::register_payment(conn, p, operator)?;
 
-    println!("演示数据已写入（基准日期 {}）", today_iso());
     Ok(())
 }

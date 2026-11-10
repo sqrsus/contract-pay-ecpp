@@ -500,14 +500,6 @@ impl App {
             "admin" => self.role = Some(ctp_app::auth::Role::Admin),
             _ => {}
         }
-        // `CTP_DEMO=1`：空库时灌演示数据，供截图与冒烟核对（只在显式开启时生效）
-        if std::env::var("CTP_DEMO").unwrap_or_default() == "1" && self.summaries.is_empty() {
-            let op = self.operator();
-            match self.exec(|c| ctp_app::demo::seed_demo(c, op)) {
-                Ok(_) => self.refresh(),
-                Err(e) => self.error(format!("载入演示数据失败：{e}")),
-            }
-        }
         // `CTP_SELECT=1` 仅选中第一份合同，用于核对选中态布局
         if std::env::var("CTP_SELECT").unwrap_or_default() == "1" {
             if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {

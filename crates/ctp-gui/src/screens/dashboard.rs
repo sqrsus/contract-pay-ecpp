@@ -9,9 +9,12 @@ use eframe::egui::{self, RichText};
 /// 最近拨款一行：(单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额分, 是否作废)
 type RecentRow = (String, String, String, String, String, String, i64, bool);
 
-/// 「最近拨款」合同名称列宽：按需求加宽到原来的 1.3 倍（236 × 1.3 = 306.8）。
-/// 表头、单元格与滚动命名三处必须同值，否则文字与列边界会错位。
-const NAME_W: f32 = 306.8;
+/// 「最近拨款」合同名称列宽：R-56 加宽到 1.3 倍（236 → 306.8），
+/// R-58 再按需求 ×1.2 → 368.16。表头、单元格与滚动宽度三处必须同值，否则文字与列边界会错位。
+const NAME_W: f32 = 368.16;
+
+/// 「最近拨款」承包单位列宽：130 × 1.2 = 156（R-58）。同样三处同值。
+const CONTRACTOR_W: f32 = 156.0;
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
@@ -45,30 +48,23 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if app.summaries.is_empty() {
         widgets::card(&p).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new("还没有合同数据").size(16.0).strong().color(p.text));
+            ui.label(
+                RichText::new("还没有合同数据")
+                    .size(16.0)
+                    .strong()
+                    .color(p.text),
+            );
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "可以直接载入一套演示数据（1 个项目、3 份合同、若干拨款单），也可以从「合同台账」新建。",
+                    "从「合同台账」新建第一份合同；多份合同可先导出批量合同模板，填好后再导入。",
                 )
                 .size(12.5)
                 .color(p.text_muted),
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if widgets::primary_button(ui, &p, "载入演示数据", true).clicked() {
-                    let op = app.operator();
-                    match app.exec(|c| ctp_app::demo::seed_demo(c, op)) {
-                        Ok(()) => {
-                            app.refresh();
-                            app.success("演示数据已载入");
-                        }
-                        Err(e) => app.error(format!("载入演示数据失败：{e}")),
-                    }
-                }
-                if widgets::ghost_button(ui, &p, "新建合同").clicked()
-                    && app.require_write()
-                {
+                if widgets::ghost_button(ui, &p, "新建合同").clicked() && app.require_write() {
                     app.dialog = crate::dialogs::Dialog::NewContract;
                 }
             });
@@ -252,9 +248,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             head_cell(ui, &p, 24.0, "", false);
             head_cell(ui, &p, 86.0, "开单日期", false);
             head_cell(ui, &p, 104.0, "拨款单号", false);
-            // 合同名称列加宽到 1.3 倍（236 → 306.8）：长名称少滚动一截
+            // R-58：合同名称 ×1.2（→ 368.16）、承包单位 ×1.2（→ 156），其余列宽不变
             head_cell(ui, &p, NAME_W, "合同名称", false);
-            head_cell(ui, &p, 130.0, "承包单位", false);
+            head_cell(ui, &p, CONTRACTOR_W, "承包单位", false);
             head_cell(ui, &p, 110.0, "金额", true);
             head_cell(ui, &p, 52.0, "状态", false);
             head_cell(ui, &p, 116.0, "操作", false);
@@ -310,8 +306,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 open_contract = Some(contract_id.clone());
                             }
                         });
-                        cell(ui, 130.0, false, |ui| {
-                            widgets::marquee(ui, &contractor, 130.0, 12.0, p.text_muted);
+                        cell(ui, CONTRACTOR_W, false, |ui| {
+                            widgets::marquee(ui, &contractor, CONTRACTOR_W, 12.0, p.text_muted);
                         });
                         cell(ui, 110.0, true, |ui| {
                             ui.label(

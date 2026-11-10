@@ -654,11 +654,11 @@ mod tests {
         ))
     }
 
-    fn conn_with_demo() -> Connection {
+    fn conn_with_fixture() -> Connection {
         let mut c = db::open_in_memory().unwrap();
         db::migrate(&mut c).unwrap();
         seed::seed_reference(&c, "t").unwrap();
-        crate::demo::seed_demo(&mut c, "t").unwrap();
+        crate::fixture::seed_fixture(&mut c, "t").unwrap();
         c
     }
 
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn 用拨款模板导合同会被标记挡下() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("paytpl");
         {
             let mut wb = Workbook::new();
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn 完整一行导入后字段全部落库() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("full");
         workbook_with_row(&path, &full_row());
 
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn 同名同承包单位重复导入只成功一次() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("dup");
         workbook_with_row(&path, &full_row());
         assert_eq!(import(&mut conn, &path, "t").unwrap().imported, 1);
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn 必填缺失与枚举非法只报该行() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("bad");
         {
             let mut wb = Workbook::new();
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn 空白行不计入统计() {
-        let mut conn = conn_with_demo();
+        let mut conn = conn_with_fixture();
         let path = temp_path("blank");
         // 与真实模板一样：只有表头与空白输入行
         write_template(&path, "x").unwrap();

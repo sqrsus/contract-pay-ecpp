@@ -61,7 +61,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
     if app.summaries.is_empty() {
         widgets::card(&p).show(ui, |ui| {
-            widgets::empty_state(ui, &p, "还没有合同，先去「合同台账」新建或载入演示数据。");
+            widgets::empty_state(ui, &p, "还没有合同，先去「合同台账」新建一份合同。");
         });
         return;
     }

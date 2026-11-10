@@ -130,11 +130,63 @@ fn pay(
     )
 }
 
+/// 多类别数据集：工程 / 服务 / 货物各一份，含一笔作废与一笔审计价。
+/// 仅供本文件的「比率口径」与「会计分类」两项核对使用（R-58 起夹具不再对集成测试开放）。
+fn seed_mixed(conn: &mut Connection) {
+    ctp_store::seed::seed_reference(conn, "t").unwrap();
+    project_and_org(conn);
+    let items = [
+        ("道路工程（一标段）施工总承包", "GC", "C02", 2_850_000i64),
+        ("道路工程施工监理服务", "FW", "C04", 120_000),
+        ("沥青混合料采购", "CL", "C03", 500_000),
+    ];
+    let mut ids = Vec::new();
+    for (name, biz, acc, amount) in items {
+        let c = service::create_contract(
+            conn,
+            NewContract {
+                project_id: "PJ-1".into(),
+                contract_name: name.into(),
+                contract_category_code: biz.into(),
+                category_id: Some(acc.into()),
+                party_a: "某建设单位".into(),
+                contractor_id: "ORG-1".into(),
+                sign_date: "2026-01-10".into(),
+                original_amount: Money::from_cent(amount * 100),
+                payment_terms: "按月计量支付".into(),
+                ..Default::default()
+            },
+            "t",
+        )
+        .unwrap();
+        attach_contract(conn, &c.id);
+        service::activate_contract(conn, &c.id, "t").unwrap();
+        ids.push(c.id);
+    }
+    pay(conn, &ids[0], 1000).unwrap();
+    pay(conn, &ids[0], 600).unwrap();
+    service::register_audit_price(
+        conn,
+        &ids[1],
+        Some(Money::from_cent(118_000 * 100)),
+        Some("2026-10-20".into()),
+        Some("某造价咨询公司".into()),
+        Some("SJ-2026-0088".into()),
+        "竣工结算审计完成",
+        "t",
+    )
+    .unwrap();
+    pay(conn, &ids[1], 30).unwrap();
+    let wrong = pay(conn, &ids[2], 200).unwrap();
+    service::void_payment(conn, &wrong.id, "金额录错，作废重登", "t").unwrap();
+    pay(conn, &ids[2], 120).unwrap();
+}
+
 #[test]
 fn 比率口径_视图与应用层差异为零() {
     let mut conn = db::open_in_memory().unwrap();
     db::migrate(&mut conn).unwrap();
-    ctp_app::demo::seed_demo(&mut conn, "t").unwrap();
+    seed_mixed(&mut conn);
 
     assert!(
         service::reconcile(&conn).unwrap().is_empty(),
@@ -459,7 +511,7 @@ fn 新建合同先草稿再生效后才能拨款() {
 fn 会计分类与合同类别分离() {
     let mut conn = db::open_in_memory().unwrap();
     db::migrate(&mut conn).unwrap();
-    ctp_app::demo::seed_demo(&mut conn, "t").unwrap();
+    seed_mixed(&mut conn);
 
     let rows = repo::category_summary(&conn).unwrap();
     assert!(!rows.is_empty());
