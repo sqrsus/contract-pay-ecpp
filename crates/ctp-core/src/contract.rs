@@ -51,11 +51,10 @@ pub fn business_field_count() -> usize {
 /// 合同类型（4.2.2）。
 ///
 /// R-57 起只保留 **工程 / 货物 / 服务** 三类：原「施工」改名为「工程」，
-/// 「监理 / 设计 / 勘察」三类整体退场（历史数据在 `ctp_store::db::migrate`
-/// 中一次性并入 `CONSTRUCT`）。
+/// 「监理 / 设计 / 勘察」三类整体退场。本软件尚未正式投用、不提供迁移，
+/// 旧码既不在 DDL 的 CHECK 里，也不会被 `from_code` 接受。
 ///
-/// 落库码沿用 `CONSTRUCT`：存量库的 CHECK 约束与 46 条历史行都以此为准，
-/// 改码要重建表，收益仅为字面整齐，不值得承担迁移风险。
+/// 落库码沿用 `CONSTRUCT`，保持与界面文案「工程」的稳定映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContractType {
     #[default]
@@ -474,6 +473,7 @@ impl Contract {
             return Err(DomainError::DateFormat(self.sign_date.clone()));
         }
         validate_opt_date(self.audit_date.as_deref())?;
+        validate_opt_date(self.open_bid_date.as_deref())?;
         validate_opt_date(self.planned_start.as_deref())?;
         validate_opt_date(self.planned_end.as_deref())?;
         validate_opt_date(self.actual_start.as_deref())?;
@@ -490,6 +490,13 @@ impl Contract {
             return Err(DomainError::StatusOutOfPhase(
                 self.status.code().to_string(),
             ));
+        }
+        // Unknown 只用于「读到一个不认识的旧码」，不能原样写回：
+        // DDL 的 CHECK 只收 OPEN / GOV_PROC / DIRECT，硬写会拿到一条 SQLite 约束错误。
+        if let Some(BidMethod::Unknown(raw)) = &self.bid_method {
+            return Err(DomainError::Invariant(format!(
+                "招标方式编码「{raw}」无法识别，不能写回数据库"
+            )));
         }
         Ok(())
     }
@@ -564,6 +571,20 @@ mod tests {
         }
     }
 
+    /// 保存前校验要覆盖开标日期，且 Unknown 招标方式不能原样写回（会被 CHECK 拒）。
+    #[test]
+    fn 校验覆盖开标日期与未知招标方式() {
+        let mut c = sample();
+        assert!(c.validate().is_ok(), "基线样本必须合法");
+        c.open_bid_date = Some("2026-13-01".into());
+        assert!(c.validate().is_err(), "非法开标日期必须拒绝");
+        c.open_bid_date = Some("2026-02-28".into());
+        assert!(c.validate().is_ok());
+        c.bid_method = Some(BidMethod::Unknown("LEGACY_X".into()));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("无法识别"), "{err}");
+    }
+
     #[test]
     fn 业务字段计数口径为_31() {
         assert_eq!(business_field_count(), 31);
@@ -579,7 +600,7 @@ mod tests {
             ContractType::from_code("SUPPLY"),
             Some(ContractType::Supply)
         );
-        // R-57：原「施工」显示为「工程」，落库码保持 CONSTRUCT 以兼容存量数据
+        // R-57：原「施工」显示为「工程」，落库码沿用 CONSTRUCT
         assert_eq!(ContractType::default().label(), "工程");
         assert_eq!(ContractType::default().code(), "CONSTRUCT");
         assert_eq!(

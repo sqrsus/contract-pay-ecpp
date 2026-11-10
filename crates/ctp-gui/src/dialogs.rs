@@ -54,10 +54,16 @@ pub struct ImportResultView {
     pub kind: crate::BatchImport,
     pub imported: usize,
     pub skipped: usize,
+    /// 因导入幂等键命中而跳过的重复行数
+    pub duplicates: usize,
     /// （Excel 可见行号，失败原因）
     pub failures: Vec<(usize, String)>,
     /// 整份拒绝的原因（文件打不开 / 缺校验表 / 标记不符 / 无权限等）
     pub rejected: Option<String>,
+    /// 本次导入的批次号；批次日志失败时据此补记
+    pub batch_no: String,
+    /// 批次审计日志写入失败等可见警告
+    pub warning: Option<String>,
 }
 
 /// 关闭导入结果弹窗：把弹窗状态与结果数据一起清空。
@@ -441,12 +447,15 @@ impl ImportResultView {
             kind,
             imported: r.imported,
             skipped: r.skipped,
+            duplicates: r.duplicates,
             failures: r
                 .failures
                 .iter()
                 .map(|f| (f.line, f.message.clone()))
                 .collect(),
             rejected: None,
+            batch_no: r.batch_no.clone(),
+            warning: r.warning.clone(),
         }
     }
 
@@ -455,8 +464,11 @@ impl ImportResultView {
             kind,
             imported: 0,
             skipped: 0,
+            duplicates: 0,
             failures: Vec::new(),
             rejected: Some(reason.into()),
+            batch_no: String::new(),
+            warning: None,
         }
     }
 
@@ -467,15 +479,20 @@ impl ImportResultView {
 
     /// 统计口径随来源变：拨款论「笔」且报跳过行，合同论「条」（空白行不计）。
     fn summary(&self) -> String {
+        let dup = if self.duplicates > 0 {
+            format!(" · 重复跳过 {} 行", self.duplicates)
+        } else {
+            String::new()
+        };
         match self.kind {
             crate::BatchImport::Payments => format!(
-                "成功导入 {} 笔 · 跳过 {} 行 · 失败 {} 行",
+                "成功导入 {} 笔 · 跳过 {} 行 · 失败 {} 行{dup}",
                 self.imported,
                 self.skipped,
                 self.failures.len()
             ),
             crate::BatchImport::Contracts => format!(
-                "成功导入 {} 条 · 失败 {} 行",
+                "成功导入 {} 条 · 失败 {} 行{dup}",
                 self.imported,
                 self.failures.len()
             ),
@@ -1406,6 +1423,23 @@ fn import_result(app: &mut App, ctx: &egui::Context) {
             );
             ui.add_space(6.0);
             ui.label(RichText::new(view.note()).size(11.5).color(p.text_muted));
+            // 批次审计日志写失败必须看得见：给出批次号，便于人工补记
+            if let Some(w) = &view.warning {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("注意：{w}"))
+                        .size(12.0)
+                        .color(p.danger),
+                );
+            }
+            if !view.batch_no.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("批次号：{}", view.batch_no))
+                        .size(11.0)
+                        .color(p.text_muted),
+                );
+            }
             ui.add_space(10.0);
 
             if let Some(reason) = &view.rejected {
@@ -4191,6 +4225,9 @@ mod tests {
                 imported: 2,
                 skipped: 1,
                 failures: vec![],
+                duplicates: 0,
+                batch_no: "IMP-TEST".into(),
+                warning: None,
             },
             crate::BatchImport::Payments,
         ));
@@ -4200,6 +4237,22 @@ mod tests {
             result.is_none(),
             "import_result 必须清空，避免下次打开残留旧摘要"
         );
+    }
+
+    /// 批次日志写失败不再是静默吞掉：警告与批次号要进入结果弹窗。
+    #[test]
+    fn 批次警告与批次号进入导入结果() {
+        let mut r = ctp_app::batch::ImportReport {
+            batch_no: "IMP-TEST-1".into(),
+            duplicates: 2,
+            ..Default::default()
+        };
+        r.warn("批次结果日志写入失败：磁盘只读；请按批次号补记");
+        let v = ImportResultView::from_report(&r, crate::BatchImport::Payments);
+        assert_eq!(v.batch_no, "IMP-TEST-1");
+        assert_eq!(v.duplicates, 2);
+        assert!(v.warning.as_ref().unwrap().contains("批次结果日志写入失败"));
+        assert!(v.summary().contains("重复跳过 2 行"));
     }
 
     #[test]

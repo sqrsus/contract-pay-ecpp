@@ -43,13 +43,16 @@ pub struct LogFilter {
 
 impl LogFilter {
     /// 四个条件写成「参数为空即放行」，避免动态拼 SQL 带来的参数错位。
+    ///
+    /// 关键词按**字面子串**匹配：`ESCAPE '\'` + `db::like_escape` 把 `%` / `_` /
+    /// `\` 转义掉。否则输入一个 `%` 就命中全表，「按条件清理」会退化成「全部清理」。
     fn where_clause() -> &'static str {
         "WHERE (?1 = '' OR date(created_at, '+8 hours') >= ?1) \
            AND (?2 = '' OR date(created_at, '+8 hours') <= ?2) \
            AND (?3 = '' OR action = ?3) \
-           AND (?4 = '' OR COALESCE(target_label, '') LIKE '%' || ?4 || '%' \
-                         OR COALESCE(detail, '') LIKE '%' || ?4 || '%' \
-                         OR target_id LIKE '%' || ?4 || '%')"
+           AND (?4 = '' OR COALESCE(target_label, '') LIKE '%' || ?4 || '%' ESCAPE '\\' \
+                         OR COALESCE(detail, '') LIKE '%' || ?4 || '%' ESCAPE '\\' \
+                         OR target_id LIKE '%' || ?4 || '%' ESCAPE '\\')"
     }
 
     fn params(&self) -> [String; 4] {
@@ -57,7 +60,7 @@ impl LogFilter {
             self.from.trim().to_string(),
             self.to.trim().to_string(),
             self.action.clone().unwrap_or_default(),
-            self.keyword.trim().to_string(),
+            crate::db::like_escape(self.keyword.trim()),
         ]
     }
 
@@ -144,14 +147,35 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
 /// （用户明确指定了范围），只有「全部清理」兜住最近这么多条。
 pub const AUDIT_KEEP_MIN: usize = 200;
 
+/// 是否触发「最近 N 条」保底。
+///
+/// 早期只按「四个条件全空」判定，于是填一个能匹配全表的关键词（字面 `%` 已转义，
+/// 但仍可填表内共有的文字）、或把时间区间拉满，就能绕过保底把日志清空。
+/// 改为按**删完后还剩多少**判定：任何形式的「实质全清」都要兜住；
+/// 小范围按条件清理（删完仍 ≥ 200 条）不受影响。
+pub fn needs_floor(conn: &Connection, f: &LogFilter, explicit_all: bool) -> Result<bool> {
+    // 「全部清理」无条件保底，哪怕库里刚好只剩 200 条（此时删除数应为 0）。
+    if explicit_all {
+        return Ok(true);
+    }
+    let all = total(conn)?;
+    // 全表还不到 200 条时，「保留最近 200 条」等同于一条都不许删，
+    // 会让小库上的按条件清理彻底失效；此时按用户给定的范围如实删除。
+    if all <= AUDIT_KEEP_MIN as i64 {
+        return Ok(false);
+    }
+    let matched = count(conn, f)?;
+    Ok(all.saturating_sub(matched) < AUDIT_KEEP_MIN as i64)
+}
+
 /// 删除符合条件的日志，返回删除条数。
 ///
-/// `keep_recent_min = true`（全部清理）时，按日志 id 序保留最近
-/// [`AUDIT_KEEP_MIN`] 条不删——id 形如 LOG-{毫秒}-{序号}，固定宽度使
-/// 字典序即时间序，与 `db::insert_audit_log` 的裁剪口径一致。
+/// 按日志 id 序保留最近 [`AUDIT_KEEP_MIN`] 条不删——id 形如 LOG-{毫秒}-{序号}，
+/// 固定宽度使字典序即时间序，与 `db::insert_audit_log` 的裁剪口径一致。
 pub fn clear(conn: &Connection, f: &LogFilter, keep_recent_min: bool) -> Result<usize> {
     let p = f.params();
-    let n = if keep_recent_min {
+    let protect = needs_floor(conn, f, keep_recent_min)?;
+    let n = if protect {
         let sql = format!(
             "DELETE FROM sys_audit_log {} \
              AND id NOT IN (SELECT id FROM sys_audit_log ORDER BY id DESC LIMIT ?5)",
@@ -176,7 +200,7 @@ mod tests {
 
     fn fixture() -> Connection {
         let mut conn = db::open_in_memory().unwrap();
-        db::migrate(&mut conn).unwrap();
+        db::init_schema(&mut conn).unwrap();
         conn
     }
 
@@ -251,27 +275,48 @@ mod tests {
         assert_eq!(actions(&conn).unwrap(), vec!["CREATE".to_string()]);
     }
 
-    /// R-68（C14）：全部清理保底保留最近 200 条，按条件清理不受限。
+    /// 保底按「删完还剩多少」判定：即使填了筛选条件，只要实质是清空也要兜住。
     #[test]
-    fn 全部清理保留最近两百条() {
+    fn 实质全清一律保留最近两百条() {
         let conn = fixture();
         for i in 0..205 {
             add(&conn, "HT-001", "CREATE", &format!("第 {i} 条"));
         }
-        // 按条件清理（指定类型）不受保底约束，应全删命中行
+        // 所有行都是 CREATE，按类型清理会命中全表；不能靠「填了个条件」绕过保底
         let f = LogFilter {
             action: Some("CREATE".into()),
             ..Default::default()
         };
-        assert_eq!(clear(&conn, &f, false).unwrap(), 205);
-        for i in 0..205 {
-            add(&conn, "HT-001", "CREATE", &format!("第 {i} 条"));
-        }
-        // 全部清理（keep_recent_min）保留最近 200 条
-        assert_eq!(clear(&conn, &LogFilter::default(), true).unwrap(), 5);
+        assert_eq!(clear(&conn, &f, false).unwrap(), 5);
+        assert_eq!(total(&conn).unwrap(), 200);
+        // 全部清理同样保底，且再来一次不会继续删
+        assert_eq!(clear(&conn, &LogFilter::default(), true).unwrap(), 0);
         assert_eq!(total(&conn).unwrap(), 200);
         // 留下的是最新的那些（detail 带行号，按 id 序倒排取第一条）
         let rows = list(&conn, &LogFilter::default(), 1).unwrap();
         assert_eq!(rows[0].detail.as_deref(), Some("第 204 条"));
+    }
+
+    /// 关键词是字面子串：`%` / `_` 不再充当 LIKE 通配，避免误清全表。
+    #[test]
+    fn 关键词按字面匹配不把通配符当模式() {
+        let conn = fixture();
+        add(&conn, "HT-001", "CREATE", "明细 100%");
+        add(&conn, "HT-002", "CREATE", "明细正常");
+        let f = LogFilter {
+            keyword: "%".into(),
+            ..Default::default()
+        };
+        assert_eq!(count(&conn, &f).unwrap(), 1, "只有含字面 % 的那条命中");
+        let f2 = LogFilter {
+            keyword: "明细".into(),
+            ..Default::default()
+        };
+        assert_eq!(count(&conn, &f2).unwrap(), 2);
+        let f3 = LogFilter {
+            keyword: "\\".into(),
+            ..Default::default()
+        };
+        assert_eq!(count(&conn, &f3).unwrap(), 0, "反斜杠也必须按字面处理");
     }
 }

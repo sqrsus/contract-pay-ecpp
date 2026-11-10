@@ -22,6 +22,8 @@ pub fn action_label(action: &str) -> String {
         "UPSERT" => "上传/替换附件",
         "DELETE" => "删除附件",
         "EXPORT" => "导出报表",
+        "IMPORT_START" => "批量导入开始",
+        "IMPORT_DONE" => "批量导入结束",
         "LOGIN_OK" => "管理登录成功",
         "LOGIN_FAIL" => "管理登录失败",
         "CHANGE_PASSWORD" => "修改管理密码",
@@ -41,6 +43,7 @@ pub fn target_label(target_type: &str) -> String {
         "prj_project" => "项目",
         "org_contractor" => "单位",
         "report" => "报表",
+        "import" => "批量导入",
         "session" => "登录会话",
         "sys_meta" => "系统设置",
         "sys_audit_log" => "操作日志",
@@ -66,10 +69,10 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
     audit::actions(conn)
 }
 
-/// 「全部清理」至少保留的最近条数（R-68 / C14-A）。
+/// 「实质全清」至少保留的最近条数（R-68 / C14-A）。
 ///
-/// 全删不可恢复，误触一次就把审计链清零；按条件清理不受此限
-/// （用户明确指定了范围），只有「全部清理」兜住最近 [`AUDIT_KEEP_MIN`] 条。
+/// 全删不可恢复，误触一次就把审计链清零；保底不再只看「条件是否全空」，
+/// 而是看删完后还剩多少——条件拉满或关键词覆盖全表同样要兜住。
 pub use ctp_store::audit::AUDIT_KEEP_MIN;
 
 /// 清理日志并留痕，返回删除条数。
@@ -77,11 +80,11 @@ pub use ctp_store::audit::AUDIT_KEEP_MIN;
 /// `filter` 四个条件全空即「全部清理」；否则按条件清理（例如只清某个时间范围）。
 /// R-39：删除与 `CLEAR` 留痕放在同一个 IMMEDIATE 事务里，
 /// 否则「删光了但留痕写入失败」会得到一个没有来源说明的空日志表。
-/// R-68（C14）：「全部清理」至少保留最近 [`AUDIT_KEEP_MIN`] 条（按日志 id 序，
-/// 与裁剪口径一致）；按条件清理不动这个底线——用户给定了明确范围。
+/// 保底按「删完后还剩多少」判定（见 `audit::needs_floor`），任何形式的
+/// 实质全清都至少留下最近 [`AUDIT_KEEP_MIN`] 条，留痕文案与实际行为一致。
 pub fn clear(conn: &mut Connection, filter: &LogFilter, operator: &str) -> Result<usize> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let keep_min = filter.is_empty();
+    let keep_min = audit::needs_floor(&tx, filter, filter.is_empty())?;
     let n = audit::clear(&tx, filter, keep_min)?;
     let scope = describe(filter);
     let kept_note = if keep_min {
@@ -134,7 +137,7 @@ mod tests {
 
     fn fixture() -> Connection {
         let mut conn = db::open_in_memory().unwrap();
-        db::migrate(&mut conn).unwrap();
+        db::init_schema(&mut conn).unwrap();
         conn
     }
 

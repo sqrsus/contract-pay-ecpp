@@ -91,7 +91,7 @@ fn seed_fixture(
     ctype: ctp_core::contract::ContractType,
     delivery: Option<&str>,
 ) -> String {
-    db::migrate(conn).unwrap();
+    db::init_schema(conn).unwrap();
     ctp_store::seed::seed_reference(conn, "t").unwrap();
     project_and_org(conn);
     let c = service::create_contract(
@@ -199,7 +199,7 @@ fn seed_mixed(conn: &mut Connection) {
 #[test]
 fn 比率口径_视图与应用层差异为零() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     seed_mixed(&mut conn);
 
     assert!(
@@ -269,7 +269,7 @@ fn 超付拦截_拒绝并给出差额() {
 #[test]
 fn 容差固定为零_超基准即拦截() {
     let (mut conn, cid) = fixture(1000);
-    // R-33：界面与命令行都不再能改容差；旧库里残留的非 0 值也必须被忽略
+    // 容差是编译期常量；即便 sys_meta 里被手工塞了非 0 值也不参与额度计算
     db::set_meta(&conn, "tol_bp", "100", "t").unwrap();
 
     let q = service::quota_of(&conn, &cid).unwrap();
@@ -479,7 +479,7 @@ fn 草稿合同不可拨款() {
 #[test]
 fn 新建合同先草稿再生效后才能拨款() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     project_and_org(&conn);
     let c = service::create_contract(
@@ -533,7 +533,7 @@ fn 新建合同先草稿再生效后才能拨款() {
 #[test]
 fn 会计分类与合同类别分离() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     seed_mixed(&mut conn);
 
     let rows = repo::category_summary(&conn).unwrap();
@@ -568,7 +568,7 @@ fn 会计分类与合同类别分离() {
 #[test]
 fn 业务表审计列齐全() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     let bad = repo::audit_column_violations(&conn).unwrap();
     assert!(bad.is_empty(), "M4：{bad:?}");
 }
@@ -708,7 +708,7 @@ fn 合同编号按年度递增且唯一() {
 #[test]
 fn 合同必填项与字典校验生效() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     project_and_org(&conn);
 
@@ -759,7 +759,7 @@ fn 合同必填项与字典校验生效() {
 #[test]
 fn 名称输入自动建档_同名复用不重复() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     // 刻意不插任何项目与单位：完全靠输入框文本建档
 
@@ -805,7 +805,7 @@ fn 名称输入自动建档_同名复用不重复() {
 #[test]
 fn 附件每类一份_替换即覆盖且可删除() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     project_and_org(&conn);
     let c = service::create_contract(
@@ -882,7 +882,7 @@ fn 附件每类一份_替换即覆盖且可删除() {
 #[test]
 fn 附件空文件与超限被拒() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     project_and_org(&conn);
     let c = service::create_contract(
@@ -1895,7 +1895,7 @@ fn r68_拨款归集按合同当前项目() {
 #[test]
 fn r68_台账合计排除作废合同并标注() {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     project_and_org(&conn);
 
@@ -2004,7 +2004,7 @@ fn r68_作废最后一笔后状态回退且不可重复生效() {
     );
 }
 
-/// C8：变更历史按合同隔离，不再挤在全局 50 条上限的 JSON 数组里。
+/// 变更历史按合同分表且带前后值；旧版 sys_meta 全局 JSON 数组已整体移除。
 #[test]
 fn r68_变更历史按合同分表且带前后值() {
     let (mut conn, cid) = fixture(1_000_000);
@@ -2023,9 +2023,184 @@ fn r68_变更历史按合同分表且带前后值() {
     assert_eq!(n, 2, "两条变更都要留在本合同名下");
     assert_eq!(old, 100_000_000);
     assert_eq!(new, 120_000_000);
-    let legacy = ctp_app::history::load(&conn, ctp_app::history::KEY_CONTRACT_AMOUNT).unwrap();
+    // 旧版 sys_meta 全局 JSON 数组已整体移除：库里不应再有那两个键
+    let legacy_keys: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sys_meta WHERE meta_key IN \
+             ('contract_amount_history','audit_price_history')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_keys, 0, "旧 JSON 历史键不应再被写入");
+}
+
+// ---------------------------------------------------------------- R-69 数据准确性回归
+
+/// 合同换项目后，按项目汇总的分组键、项目名称、关键词必须都跟着当前项目走。
+/// 旧实现分组用 c.project_id、名称却 JOIN p.project_id（签约快照），必然错位。
+#[test]
+fn r69_按项目汇总的名称与分组键同口径() {
+    use ctp_core::ledger::{SummaryDim, SummaryFilter};
+    let (mut conn, cid) = fixture(1_000_000);
+    let now = ctp_core::date::now_iso();
+    repo::insert_project(
+        &conn,
+        &Project {
+            id: "PJ-2".into(),
+            project_code: "YXM".into(),
+            project_name: "乙项目".into(),
+            remark: None,
+            is_deleted: false,
+            version: 1,
+            created_at: now.clone(),
+            created_by: Some("t".into()),
+            updated_at: now,
+            updated_by: Some("t".into()),
+        },
+    )
+    .unwrap();
+    pay(&mut conn, &cid, 100_000).unwrap();
+    // 只改主档，拨款单上的 project_id 仍是 PJ-1 的签约快照
+    conn.execute(
+        "UPDATE ct_contract SET project_id = 'PJ-2' WHERE id = ?1",
+        [&cid],
+    )
+    .unwrap();
+
+    let rows =
+        repo::payment_summary(&conn, SummaryDim::Project, &SummaryFilter::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "PJ-2", "分组键按合同当前项目");
+    assert_eq!(rows[0].label, "乙项目", "显示名不能仍是旧项目");
+
+    let f_new = SummaryFilter {
+        keyword: "乙项目".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        repo::payment_summary(&conn, SummaryDim::Project, &f_new)
+            .unwrap()
+            .len(),
+        1,
+        "新项目名应能筛到"
+    );
+    let f_old = SummaryFilter {
+        keyword: "测试项目".into(),
+        ..Default::default()
+    };
     assert!(
-        legacy.is_empty(),
-        "新变更不应再写全局 JSON 数组（旧键仅保留兼容读）"
+        repo::payment_summary(&conn, SummaryDim::Project, &f_old)
+            .unwrap()
+            .is_empty(),
+        "旧项目名不该再匹配这份合同"
+    );
+
+    // 四个维度共用同一段 FROM / WHERE，切换维度合计不能变
+    let totals: Vec<i64> = SummaryDim::all()
+        .iter()
+        .map(|d| {
+            repo::payment_summary(&conn, *d, &SummaryFilter::default())
+                .unwrap()
+                .iter()
+                .map(|r| r.amount.cent())
+                .sum()
+        })
+        .collect();
+    assert!(
+        totals.iter().all(|x| *x == totals[0]),
+        "四个维度合计应一致：{totals:?}"
+    );
+    assert_eq!(totals[0], 100_000 * 100);
+}
+
+/// 空库 → 建合同 → 拨款 → 作废：视图 / 应用层 / 期间汇总 / 报表合计逐位对齐。
+#[test]
+fn r69_端到端写入与报表口径一致() {
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 100_000).unwrap();
+    let p2 = pay(&mut conn, &cid, 200_000).unwrap();
+    service::void_payment(&mut conn, &p2.id, "登记有误", "t").unwrap();
+
+    // 1) 视图 paid_cent == 应用层 paid_net
+    let s = repo::summary(&conn, &cid).unwrap().unwrap();
+    assert_eq!(s.paid_amount.cent(), 100_000 * 100);
+    assert_eq!(
+        repo::paid_net(&conn, &cid).unwrap().cent(),
+        s.paid_amount.cent()
+    );
+
+    // 2) 期间统计（v_payment_period）合计 == 已付净额
+    let period_total: i64 = repo::period_summary(&conn)
+        .unwrap()
+        .iter()
+        .map(|r| r.amount.cent())
+        .sum();
+    assert_eq!(period_total, s.paid_amount.cent());
+
+    // 3) 拨款一览：明细保留作废行，合计只累加未作废
+    let payments = repo::list_payments(&conn, Some(&cid)).unwrap();
+    assert_eq!(payments.len(), 2);
+    let ledger = ctp_app::report::ReportResult::payment_ledger(&payments, "测试合同");
+    assert_eq!(ledger.rows.len(), 2, "作废行仍要看得见");
+    let live: i64 = payments
+        .iter()
+        .filter(|p| p.status != ctp_core::payment::PaymentStatus::Void)
+        .map(|p| p.amount_cent.cent())
+        .sum();
+    assert_eq!(
+        ledger.totals[2].yuan(),
+        Some(live as f64 / 100.0),
+        "屏幕合计不能把作废单算回来"
+    );
+
+    // 4) 无迁移：库内不再写结构版本标记
+    assert!(db::get_meta(&conn, "schema_version").unwrap().is_none());
+    assert!(db::get_meta(&conn, "tol_bp").unwrap().is_none());
+}
+
+/// 拨款单的任何回写路径都要过实体校验，不能把金额改成 0 / 日期改非法。
+#[test]
+fn r69_拨款单回写也过实体校验() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let p = pay(&mut conn, &cid, 100_000).unwrap();
+    let mut bad = p.clone();
+    bad.amount_cent = Money::ZERO;
+    assert!(
+        repo::update_payment(&conn, &bad).is_err(),
+        "金额为 0 的拨款单不能回写"
+    );
+    let still = repo::get_payment(&conn, &p.id).unwrap();
+    assert_eq!(still.amount_cent.cent(), 100_000 * 100, "库内值未被污染");
+}
+
+/// 附件名只留安全的 basename，避免「另存为」把库里的名字当路径拼接。
+#[test]
+fn r69_附件名净化掉路径与保留字符() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let a = service::save_attachment(
+        &mut conn,
+        &cid,
+        AttachmentKind::AuditReport,
+        r"..\..\Windows\system.ini:evil?.pdf",
+        None,
+        b"audit-content",
+        "t",
+    )
+    .unwrap();
+    assert_eq!(a.file_name, "system.inievil.pdf");
+    assert!(!a.file_name.contains('\\') && !a.file_name.contains('/'));
+    assert!(
+        service::save_attachment(
+            &mut conn,
+            &cid,
+            AttachmentKind::AuditReport,
+            "..",
+            None,
+            b"x",
+            "t",
+        )
+        .is_err(),
+        "纯路径名应被拒绝"
     );
 }

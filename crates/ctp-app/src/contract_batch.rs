@@ -529,7 +529,34 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
             .or_insert(0) += 1;
     }
 
-    let mut report = ImportReport::default();
+    // 批次号在写任何业务数据之前生成；sys_audit_log 只插不改，
+    // 用 START / DONE 两条事件描述一次导入，失败时界面可据此补记。
+    let batch_no = ids::new_id("IMP");
+    let file_label = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut report = ImportReport {
+        batch_no: batch_no.clone(),
+        ..Default::default()
+    };
+    if let Err(e) = db::insert_audit_log(
+        conn,
+        "import",
+        &batch_no,
+        Some(&file_label),
+        "IMPORT_START",
+        Some(&format!(
+            "批次 {batch_no} 开始｜批量合同导入｜{}",
+            path.display()
+        )),
+        operator,
+    ) {
+        report.warn(format!(
+            "批次开始日志写入失败：{e}；请按批次号 {batch_no} 补记"
+        ));
+    }
+
     let start_row = range.start().map(|(r, _)| r as usize).unwrap_or(0);
     for (i, row) in range.rows().enumerate() {
         let abs = start_row + i;
@@ -644,27 +671,25 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
         }
     }
 
-    // R-68（#14）：与批量拨款同款——批次号 + 文件名 + 结果统计整批留痕
-    let batch_no = ids::new_id("IMP");
-    let file_label = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let _ = db::insert_audit_log(
+    // 批次结束事件：统计与文件名、批次号一起留痕；写失败作为可见警告返回界面。
+    if let Err(e) = db::insert_audit_log(
         conn,
         "import",
         &batch_no,
         Some(&file_label),
-        "IMPORT",
+        "IMPORT_DONE",
         Some(&format!(
-            "批次 {batch_no}｜批量合同导入｜成功 {} 行，跳过 {} 行，失败 {} 行｜{}",
+            "批次 {batch_no} 结束｜批量合同导入｜成功 {} 条，失败 {} 行｜{}",
             report.imported,
-            report.skipped,
             report.failures.len(),
             path.display()
         )),
         operator,
-    );
+    ) {
+        report.warn(format!(
+            "批次结果日志写入失败：{e}；请按批次号 {batch_no} 补记"
+        ));
+    }
 
     Ok(report)
 }
@@ -717,7 +742,7 @@ mod tests {
 
     fn conn_with_fixture() -> Connection {
         let mut c = db::open_in_memory().unwrap();
-        db::migrate(&mut c).unwrap();
+        db::init_schema(&mut c).unwrap();
         seed::seed_reference(&c, "t").unwrap();
         crate::fixture::seed_fixture(&mut c, "t").unwrap();
         c

@@ -148,7 +148,7 @@ mod tests {
 
     fn conn() -> Connection {
         let mut c = db::open_in_memory().unwrap();
-        db::migrate(&mut c).unwrap();
+        db::init_schema(&mut c).unwrap();
         c
     }
 

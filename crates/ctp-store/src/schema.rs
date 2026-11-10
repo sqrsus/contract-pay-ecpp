@@ -14,12 +14,11 @@
 //!
 //! 本期建表 13 张 + 视图 4 个；文档目标态为 21 张，其余随移出模块或二期补建。
 
-/// 结构版本，写入 `PRAGMA user_version` 的伴生元数据键 `schema_version`。
+/// 结构标签：**仅供顶栏与自检页显示**，不写入库、不参与任何判定。
 ///
-/// R-68 起版本守卫：库内版本**新于**本常量时 `migrate` 拒绝执行（旧程序开新库
-/// 只读不动结构）；版本相同则跳过建表 / 重建视图，避免多实例互相打断；
-/// 版本较旧才执行迁移并回写新版本号。
-pub const SCHEMA_VERSION: &str = "1.6.0-rv27";
+/// 本软件尚未正式投用，不提供迁移；结构变更直接改 DDL 并递增本标签，
+/// 旧库由部署方删除后重新生成。rv28：移除迁移 / 旧 JSON 历史，拨款单加导入幂等键。
+pub const SCHEMA_VERSION: &str = "1.6.0-rv28";
 
 /// 计入「已付净额」的单据状态（**唯一口径**，视图与仓储共用）。
 pub const PAID_STATUS_SQL: &str = "'PAID'";
@@ -116,6 +115,9 @@ pub fn index_statements() -> Vec<&'static str> {
         // R-68（C8）：按合同查变更历史
         "CREATE INDEX IF NOT EXISTS ix_change_history_contract ON ct_contract_change_history(contract_id, created_at)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_no ON pay_payment(payment_no) WHERE is_deleted = 0",
+        // 批量拨款导入的幂等锚点：同一行内容重复导入不会重复入账。
+        // 仅导入写入该列，手工拨款为 NULL，SQLite 的部分索引不约束 NULL 行。
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_import_key ON pay_payment(import_key) WHERE import_key IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS ix_payment_date ON pay_payment(pay_date, status)",
         "CREATE INDEX IF NOT EXISTS ix_payment_contract ON pay_payment(contract_id, pay_date)",
         "CREATE INDEX IF NOT EXISTS ix_payment_project ON pay_payment(project_id, pay_date)",
@@ -362,13 +364,10 @@ CREATE TABLE IF NOT EXISTS ct_contract_attachment (
 )
 "#;
 
-/// 合同变更历史（R-68 / C8）。
+/// 合同变更历史：一行一次金额 / 审计价变更，带合同外键、前后值与原因。
 ///
-/// 取代 `sys_meta` 里的全局 JSON 数组（`contract_amount_history` /
-/// `audit_price_history`）：那两个键**跨合同共享 50 条上限**且条目不带合同 id，
-/// 合同一多先变更的记录就被挤掉，审计链断开。这里一行一条、带合同外键与索引，
-/// 保留期不再共享。旧 JSON 键保留只读，迁移时能归属到合同的操作日志记录
-/// 会被搬进来（以日志 id 作主键，天然幂等）。
+/// 由 service 层在写主档的同一事务内插入，是 `last_audit_reason()` 的唯一取数点。
+/// 追加型事件表，只插不改（见 `AUDIT_COLUMN_EXEMPT`）。
 const CT_CONTRACT_CHANGE_HISTORY: &str = r#"
 CREATE TABLE IF NOT EXISTS ct_contract_change_history (
     id           TEXT PRIMARY KEY,
@@ -384,8 +383,8 @@ CREATE TABLE IF NOT EXISTS ct_contract_change_history (
 
 /// 拨款单（本期唯一支付表）。
 /// 评审 H3：无 `application_id`；评审 H5：无 `reversal_of`，`status ∈ ('PAID','VOID')`。
-/// R-68（C13-B）：`print_count` 列移除——全库从无自增入口、恒为 0，留着只会
-/// 在验收时被当成缺陷；存量库由 `migrate_drop_retired_columns` 一并 DROP。
+/// `import_key` 只由批量拨款导入写入：同一行内容重复导入时唯一索引会挡住重复入账，
+/// 手工登记的拨款恒为 NULL，不受约束。
 const PAY_PAYMENT: &str = r#"
 CREATE TABLE IF NOT EXISTS pay_payment (
     id              TEXT PRIMARY KEY,
@@ -411,7 +410,8 @@ CREATE TABLE IF NOT EXISTS pay_payment (
     created_by      TEXT,
     updated_at      TEXT NOT NULL,
     updated_by      TEXT,
-    version         INTEGER NOT NULL DEFAULT 1
+    version         INTEGER NOT NULL DEFAULT 1,
+    import_key      TEXT
 )
 "#;
 

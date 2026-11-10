@@ -10,7 +10,6 @@ pub mod checks;
 pub mod contract_batch;
 #[cfg(test)]
 pub mod fixture;
-pub mod history;
 pub mod logs;
 pub mod paper;
 pub mod print;

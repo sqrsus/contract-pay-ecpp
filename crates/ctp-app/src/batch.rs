@@ -10,9 +10,15 @@
 //!
 //! **逐行提交**：每一行单独走 `service::register_payment`（内部独立事务），
 //! 失败的行跳过并记下行号，成功的行已经落库——按 2026-11-06 确认的口径。
+//!
+//! **导入幂等**：每行按「Excel 绝对行号 + 该行所有单元格原值」算 SHA-256 作
+//! `import_key` 写进拨款单。同一份表重复上传时已入账的行直接跳过，不会重复拨款；
+//! 用户改了某一行内容才算新数据。日期留空按当天展开，但指纹取的是原始空值，
+//! 隔天重传同一张表仍能被识别为同一行。
 
 use crate::service::{self, NewPayment};
 use ctp_core::date::{is_iso_date, today_local_iso};
+use ctp_core::digest;
 use ctp_core::ids;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
@@ -204,13 +210,19 @@ pub struct ImportFailure {
     pub message: String,
 }
 
-/// 导入结果：成功多少行、跳过多少行、哪些行失败。
+/// 导入结果：成功多少行、跳过多少行、哪些行失败，以及批次审计信息。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportReport {
     pub imported: usize,
     /// 本次金额为 0 或留空而跳过的行数（不算失败）
     pub skipped: usize,
     pub failures: Vec<ImportFailure>,
+    /// 导入幂等键命中、判定为重复而跳过的行数（不算失败）
+    pub duplicates: usize,
+    /// 本次导入的批次号；批次日志写入失败时据此补记
+    pub batch_no: String,
+    /// 批次审计日志写入失败等可见警告；非空时界面必须提示
+    pub warning: Option<String>,
 }
 
 impl ImportReport {
@@ -218,15 +230,45 @@ impl ImportReport {
         !self.failures.is_empty()
     }
 
+    /// 追加一条可见警告（多条自动拼接，不覆盖前一条）。
+    pub fn warn(&mut self, msg: impl Into<String>) {
+        let m = msg.into();
+        match self.warning.as_mut() {
+            Some(w) => {
+                w.push('；');
+                w.push_str(&m);
+            }
+            None => self.warning = Some(m),
+        }
+    }
+
     /// 统计摘要：结果弹窗顶部与提示条共用，不列逐行明细。
     pub fn summary(&self) -> String {
+        let dup = if self.duplicates > 0 {
+            format!("，重复跳过 {} 行", self.duplicates)
+        } else {
+            String::new()
+        };
         format!(
-            "成功导入 {} 笔，跳过 {} 行，失败 {} 行",
+            "成功导入 {} 笔，跳过 {} 行，失败 {} 行{dup}",
             self.imported,
             self.skipped,
             self.failures.len()
         )
     }
+}
+
+/// 行级幂等指纹：Excel 绝对行号 + 该行所有单元格的**原始**文本。
+///
+/// 只取 row 里的值、不取展开后的业务值（例如留空日期在写入时才补今天），
+/// 这样同一张表隔天重传仍算出同一个键；改了任一格才算新数据。
+fn row_fingerprint(row: &[calamine::Data], line: usize) -> String {
+    let mut buf = format!("line={line}\u{1f}");
+    for (i, d) in row.iter().enumerate() {
+        buf.push_str(&format!("{i}={}", cell_text(d)));
+        buf.push('\u{1f}');
+    }
+    format!("BKIMP:{}", digest::sha256_hex(buf.as_bytes()))
 }
 
 fn cell_text(d: &calamine::Data) -> String {
@@ -371,7 +413,35 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
             .push(s.contract_id.as_str());
     }
 
-    let mut report = ImportReport::default();
+    // 批次号在写任何业务数据之前生成：即便日志写失败，界面也能拿到这个号补记。
+    // sys_audit_log 是只插不改的事件表，所以用 START / DONE 两条事件描述一次导入，
+    // 不尝试「先插后更新」。
+    let batch_no = ids::new_id("IMP");
+    let file_label = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut report = ImportReport {
+        batch_no: batch_no.clone(),
+        ..Default::default()
+    };
+    if let Err(e) = db::insert_audit_log(
+        conn,
+        "import",
+        &batch_no,
+        Some(&file_label),
+        "IMPORT_START",
+        Some(&format!(
+            "批次 {batch_no} 开始｜批量拨款导入｜{}",
+            path.display()
+        )),
+        operator,
+    ) {
+        report.warn(format!(
+            "批次开始日志写入失败：{e}；请按批次号 {batch_no} 补记"
+        ));
+    }
+
     // 用工作表里的**绝对行号**，不能按 range 的相对序号算：
     // 若前几行是空的（用户把表头删了），calamine 的 Range 会从第一个有值的行开始，
     // 相对序号就会把数据行当成表头跳掉。
@@ -394,6 +464,20 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
                 line,
                 message: "合同名称为空，无法确定写到哪份合同".into(),
             });
+            continue;
+        }
+
+        // 同一行内容已入账则跳过，不重复拨款；改过任一格才算新数据。
+        let import_key = row_fingerprint(row, line);
+        let taken: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pay_payment WHERE import_key = ?1",
+                [&import_key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if taken > 0 {
+            report.duplicates += 1;
             continue;
         }
 
@@ -429,6 +513,7 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
             let mut input = NewPayment::new(ids[0].to_string(), amount, date);
             input.pay_method = method;
             input.reason = Some(reason);
+            input.import_key = Some(import_key.clone());
             service::register_payment(conn, input, operator).map_err(|e| e.to_string())?;
             Ok(())
         })();
@@ -439,29 +524,28 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
         }
     }
 
-    // R-68（#14）：整批导入留一条批次日志——批次号 + 文件名 + 结果统计。
-    // 逐行写入只有 CREATE / REGISTER 日志，缺一条「这批是同一次导入」的归属；
-    // 有了批次号，重传 / 回溯 / 对账都能按批定位。留痕失败不影响导入结果。
-    let batch_no = ids::new_id("IMP");
-    let file_label = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let _ = db::insert_audit_log(
+    // 批次结束事件：成功 / 跳过 / 重复 / 失败统计与文件名、批次号一起留痕。
+    // 写失败不再静默吞掉，而是作为可见警告返回界面，并把批次号留给人工补记。
+    if let Err(e) = db::insert_audit_log(
         conn,
         "import",
         &batch_no,
         Some(&file_label),
-        "IMPORT",
+        "IMPORT_DONE",
         Some(&format!(
-            "批次 {batch_no}｜批量拨款导入｜成功 {} 行，跳过 {} 行，失败 {} 行｜{}",
+            "批次 {batch_no} 结束｜批量拨款导入｜成功 {} 笔，跳过 {} 行，重复 {} 行，失败 {} 行｜{}",
             report.imported,
             report.skipped,
+            report.duplicates,
             report.failures.len(),
             path.display()
         )),
         operator,
-    );
+    ) {
+        report.warn(format!(
+            "批次结果日志写入失败：{e}；请按批次号 {batch_no} 补记"
+        ));
+    }
 
     Ok(report)
 }
@@ -481,7 +565,7 @@ mod tests {
 
     fn conn_with_fixture() -> Connection {
         let mut c = db::open_in_memory().unwrap();
-        db::migrate(&mut c).unwrap();
+        db::init_schema(&mut c).unwrap();
         seed::seed_reference(&c, "t").unwrap();
         crate::fixture::seed_fixture(&mut c, "t").unwrap();
         c
@@ -726,5 +810,96 @@ mod tests {
         let path = std::env::temp_dir().join("ctp-批量拨款模板_核对用.xlsx");
         let (n, _) = write_template(&rows, &path, &ctp_core::date::now_iso()).unwrap();
         println!("已写出 {} 行 → {}", n, path.display());
+    }
+
+    /// R-69：同一份表重复上传，已入账的行按 import_key 跳过，绝不重复拨款；
+    /// 每次导入都有 START / DONE 两条批次日志，批次号能回溯到结果。
+    #[test]
+    fn 重复导入按幂等键跳过且批次日志可追溯() {
+        let mut conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
+        let target = rows[0].contract_name.clone();
+        let path = temp_path("idempotent");
+        {
+            let mut wb = Workbook::new();
+            let ws = wb.add_worksheet();
+            ws.set_name(TEMPLATE_SHEET).unwrap();
+            let r = FIRST_DATA_ROW as u32;
+            ws.write_string(r, 0, target.as_str()).unwrap();
+            ws.write_number(r, 5, 100.0).unwrap();
+            let chk = wb.add_worksheet();
+            chk.set_name(CHECK_SHEET).unwrap();
+            chk.write_string(0, 0, CHECK_MARK).unwrap();
+            wb.save(&path).unwrap();
+        }
+
+        let first = import(&mut conn, &path, "t").unwrap();
+        assert_eq!(first.imported, 1, "{:?}", first.failures);
+        assert_eq!(first.duplicates, 0);
+        assert!(!first.batch_no.is_empty(), "批次号必须返回给界面");
+        assert!(first.warning.is_none(), "正常写日志不应有警告");
+
+        let second = import(&mut conn, &path, "t").unwrap();
+        assert_eq!(second.imported, 0, "同一行不能再入一次账");
+        assert_eq!(second.duplicates, 1, "重复行应单独计数");
+        assert!(second.failures.is_empty(), "{:?}", second.failures);
+
+        let imported_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pay_payment WHERE import_key IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_rows, 1, "两次导入只应产生一笔拨款");
+
+        let starts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_audit_log WHERE action = 'IMPORT_START'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_audit_log WHERE action = 'IMPORT_DONE'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((starts, dones), (2, 2), "每次导入各留起止两条事件");
+        let hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_audit_log WHERE target_id = ?1 AND action = 'IMPORT_DONE'",
+                [&first.batch_no],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "批次号应能定位到该次导入的结果日志");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 行指纹只取原始单元格：日期留空按当天展开，但隔天重传仍是同一行。
+    #[test]
+    fn 行指纹用原始值而非展开后的业务值() {
+        let row = vec![
+            calamine::Data::String("甲合同".into()),
+            calamine::Data::Empty,
+            calamine::Data::Float(100.0),
+            calamine::Data::Empty,
+        ];
+        assert_eq!(row_fingerprint(&row, 4), row_fingerprint(&row, 4));
+        assert_ne!(
+            row_fingerprint(&row, 4),
+            row_fingerprint(&row, 5),
+            "不同行号必须是不同键"
+        );
+        let changed = vec![
+            calamine::Data::String("甲合同".into()),
+            calamine::Data::Empty,
+            calamine::Data::Float(200.0),
+            calamine::Data::Empty,
+        ];
+        assert_ne!(row_fingerprint(&row, 4), row_fingerprint(&changed, 4));
     }
 }

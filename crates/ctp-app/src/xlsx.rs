@@ -3,12 +3,16 @@
 //! 这一层是**新建式导出**（write-only），不读取也不修改任何已有 .xlsx 模板；
 //! 打印模板填充走 `print::PrintAdapter`，是另一条链路，二者不共用实现。
 //!
-//! 版式：标题行 + 口径说明行 + 表头行（冻结） + 数据行 + 合计行（SUM 公式）。
+//! 版式：标题行 + 口径说明行 + 表头行（冻结） + 数据行 + 合计行（固定数值快照）。
 //! 金额一律以「元」写数值并套 `#,##0.00`，不写字符串，便于用户在 Excel 里二次计算。
+//!
+//! 合计行**不写 SUM 公式**：合同台账 / 拨款一览的合计会剔除作废行，而 Excel
+//! 打开时重算 `=SUM(...)` 会把作废行加回来，导致屏幕与文件两个数。合计按导出
+//! 那一刻的口径写死，并在说明行标注「快照」，改动明细后需重新导出。
 
 use crate::report::{Cell, ColumnKind, ReportResult};
 use ctp_store::{Result, StoreError};
-use rust_xlsxwriter::{Color, Format, FormatAlign, Formula, Workbook};
+use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook};
 use std::path::Path;
 
 fn xerr(e: impl std::fmt::Display) -> StoreError {
@@ -27,18 +31,6 @@ fn cell_format(kind: ColumnKind, bold: bool) -> Format {
         ColumnKind::Money => f.set_num_format("#,##0.00").set_align(FormatAlign::Right),
         ColumnKind::Rate => f.set_num_format("0.00\"%\"").set_align(FormatAlign::Right),
     }
-}
-
-/// 0-based 列号 → Excel 列字母（A, B, …, Z, AA）。
-fn col_letter(col: u16) -> String {
-    let mut n = col + 1;
-    let mut s = String::new();
-    while n > 0 {
-        let r = (n - 1) % 26;
-        s.insert(0, (b'A' + r as u8) as char);
-        n = (n - 1) / 26;
-    }
-    s
 }
 
 /// 写出报表。返回已写入的行列数，供集成测试断言。
@@ -76,7 +68,7 @@ pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Resul
         1,
         last_col,
         &format!(
-            "{} ｜ 库内以「分」存储，导出时换算为元 ｜ 导出时间 {} ｜ 数据源 {}",
+            "{} ｜ 库内以「分」存储，导出时换算为元 ｜ 合计为导出时快照（改动明细请重新导出） ｜ 导出时间 {} ｜ 数据源 {}",
             result.subtitle,
             result.generated_at,
             result.kind.code()
@@ -121,7 +113,9 @@ pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Resul
         }
     }
 
-    // 合计行：数字列写 SUM 公式（带缓存结果），文本列写标签
+    // 合计行：直接写 ReportResult.totals 的数值快照（不写公式）。
+    // 屏幕合计与导出合计来自同一个 Vec<Cell>，逐位一致；若用 =SUM，Excel 重算
+    // 会把「行里保留但合计剔除」的作废记录加回来，两个数就对不上。
     let total_row = last_data_row;
     for (ci, cell) in result.totals.iter().enumerate() {
         let c = ci as u16;
@@ -129,20 +123,11 @@ pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Resul
         let fmt = cell_format(kind, true);
         match kind {
             ColumnKind::Integer | ColumnKind::Money => {
-                let letter = col_letter(c);
-                let formula = format!(
-                    "=SUM({}{}:{}{})",
-                    letter,
-                    first_data_row + 1,
-                    letter,
-                    last_data_row
-                );
-                let cached = match cell {
-                    Cell::Money(_) => cell.yuan().unwrap_or(0.0).to_string(),
-                    _ => cell.integer().unwrap_or(0).to_string(),
+                let n = match cell {
+                    Cell::Money(_) => cell.yuan().unwrap_or(0.0),
+                    _ => cell.integer().unwrap_or(0) as f64,
                 };
-                let f = Formula::new(formula).set_result(cached);
-                ws.write_formula_with_format(total_row, c, f, &fmt)
+                ws.write_number_with_format(total_row, c, n, &fmt)
                     .map_err(xerr)?;
             }
             ColumnKind::Rate => {
@@ -250,11 +235,41 @@ mod tests {
     }
 
     #[test]
-    fn 列字母与格式工厂() {
-        assert_eq!(col_letter(0), "A");
-        assert_eq!(col_letter(25), "Z");
-        assert_eq!(col_letter(26), "AA");
-        let _ = cell_format(ColumnKind::Money, true);
+    fn 合计行是数值快照而不是公式() {
+        use calamine::Reader;
+        let rows = vec![
+            PeriodRow {
+                project_id: "P1".into(),
+                period_month: "2026-06".into(),
+                payment_count: 1,
+                amount: Money::from_cent(12_345_67),
+            },
+            PeriodRow {
+                project_id: "P1".into(),
+                period_month: "2026-07".into(),
+                payment_count: 1,
+                amount: Money::from_cent(20_000_00),
+            },
+        ];
+        let mut result = ReportResult::period(&rows);
+        // 模拟「明细保留、合计剔除」的口径：合计只算第一行
+        result.totals = vec![
+            Cell::Text("合计（不含作废）".into()),
+            Cell::Integer(1),
+            Cell::Money(Money::from_cent(12_345_67)),
+            Cell::Rate("100.00%".into(), 10_000),
+        ];
+        let path = tmp_path("total_snapshot");
+        write_report(&result, &path, "测试").unwrap();
+        let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+        let range = wb.worksheet_range("期间统计").unwrap();
+        // 前 3 行标题 / 口径 / 表头 + 2 行明细 = 合计行索引 5（0-based）
+        let total = cell_text(range.get_value((5, 2)));
+        assert_eq!(
+            total, "12345.67",
+            "合计必须是导出快照，不能被 SUM 重算成两行之和 32345.67：{total}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -494,8 +494,8 @@ impl App {
         }
         match db::open(path.to_string_lossy().as_ref()) {
             Ok(mut conn) => {
-                if let Err(e) = db::migrate(&mut conn) {
-                    app.init_error = Some(format!("初始化数据库结构失败：{e}"));
+                if let Err(e) = db::init_schema(&mut conn) {
+                    app.init_error = Some(format!("建库失败：{e}"));
                     return app;
                 }
                 if let Err(e) = ctp_store::seed::seed_reference(&conn, "system") {
@@ -735,11 +735,8 @@ impl App {
             load!("拨款明细", repo::list_payments(conn, None), payments);
             load!("分类汇总", repo::category_summary(conn), categories);
             load!("期间统计", repo::period_summary(conn), periods);
-            match db::schema_version(conn) {
-                Ok(Some(v)) => self.schema_version = v,
-                Ok(None) => {}
-                Err(e) => errs.push(format!("结构版本({e})")),
-            }
+            // 无迁移：结构版本由程序自身决定，直接显示编译期常量
+            self.schema_version = ctp_store::schema::SCHEMA_VERSION.to_string();
             // 选中项跟随数据刷新：合同不在了就清空
             if let Some(id) = self.selected.clone() {
                 match repo::get_contract(conn, &id) {

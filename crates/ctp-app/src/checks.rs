@@ -67,7 +67,8 @@ const N_ROWS: &str = "视图行数";
 
 /// 跑一遍全部检查。单项异常不中断，转成该条的失败说明。
 pub fn run(conn: &Connection) -> Result<CheckReport> {
-    let version = ctp_store::db::schema_version(conn)?.unwrap_or_else(|| "（未初始化）".into());
+    // 无迁移：结构标签是编译期常量，界面直接显示，不再从库内 sys_meta 读取。
+    let version = ctp_store::schema::SCHEMA_VERSION.to_string();
     let mut items = Vec::with_capacity(6);
 
     match service::reconcile(conn) {

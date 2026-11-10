@@ -491,6 +491,9 @@ pub fn insert_payment(conn: &Connection, p: &Payment) -> Result<()> {
 }
 
 pub fn update_payment(conn: &Connection, p: &Payment) -> Result<()> {
+    // 与 insert_payment 同口径：作废 / 编辑等任何回写路径都先过实体校验，
+    // 否则金额被改成 0、日期非法、项目 id 清空也能写进库。
+    p.validate()?;
     let n = conn.execute(
         "UPDATE pay_payment SET title=?3, sort_no=?4, period_no=?5, contract_id=?6, project_id=?7, \
             pay_date=?8, amount_cent=?9, reason=?10, pay_method=?11, bank_serial_no=?12, \
@@ -787,12 +790,16 @@ pub fn payment_summary(
         Some(false) => 0,
         None => -1,
     };
+    // 项目名称与分组键必须同口径：分组按 c.project_id（合同当前项目），名称也要
+    // JOIN 到 c.project_id。用单据上的签约快照 p.project_id 会在合同换项目后
+    // 「归到新项目、显示旧项目名」；四个维度共用这段 WHERE，关键词同理受影响。
+    // 与 v_payment_ledger / v_payment_period 的 C11 口径保持一致。
     let sql = format!(
         "SELECT {key_expr} AS k, {label_expr} AS label, {sub_expr} AS sub, \
                 COUNT(*) AS n, COALESCE(SUM(p.amount_cent), 0) AS amt \
          FROM pay_payment p \
          JOIN ct_contract c ON c.id = p.contract_id \
-         LEFT JOIN prj_project pj ON pj.id = p.project_id \
+         LEFT JOIN prj_project pj ON pj.id = c.project_id \
          LEFT JOIN org_contractor o ON o.id = c.contractor_id \
          LEFT JOIN v_contract_summary cs ON cs.contract_id = p.contract_id \
          WHERE p.status = 'PAID' AND p.is_deleted = 0 \
@@ -800,14 +807,15 @@ pub fn payment_summary(
            AND (?2 = '' OR p.pay_date <= ?2) \
            AND (?3 = -1 OR (CASE WHEN COALESCE(cs.pay_rate_bp, 0) >= 10000 THEN 1 ELSE 0 END) = ?3) \
            AND (?4 = '' OR c.contract_type = ?4) \
-           AND (?5 = '' OR pj.project_name LIKE '%' || ?5 || '%' \
-                         OR o.contractor_name LIKE '%' || ?5 || '%' \
-                         OR c.contract_no LIKE '%' || ?5 || '%' \
-                         OR c.contract_name LIKE '%' || ?5 || '%') \
+           AND (?5 = '' OR pj.project_name LIKE '%' || ?5 || '%' ESCAPE '\\' \
+                         OR o.contractor_name LIKE '%' || ?5 || '%' ESCAPE '\\' \
+                         OR c.contract_no LIKE '%' || ?5 || '%' ESCAPE '\\' \
+                         OR c.contract_name LIKE '%' || ?5 || '%' ESCAPE '\\') \
          GROUP BY {key_expr} \
          ORDER BY amt DESC, label"
     );
-    let kw = f.keyword.trim().to_string();
+    // 与日志筛选同口径：关键词按字面子串匹配，% / _ 不是模式
+    let kw = crate::db::like_escape(f.keyword.trim());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params![

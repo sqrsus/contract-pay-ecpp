@@ -4,8 +4,8 @@ use crate::money::Money;
 
 /// 支付方式（5.4.4 `pay_method`）。
 ///
-/// R-57 起「承兑」退场，只保留 转账 / 现金 / 其他；历史 `ACCEPTANCE`
-/// 行在 `ctp_store::db::migrate` 中一次性改写为 `TRANSFER`。
+/// R-57 起「承兑」退场，只保留 转账 / 现金 / 其他。本软件尚未正式投用，
+/// 不保留旧码兼容分支：`ACCEPTANCE` 既不在 CHECK 里，也不会被 `from_code` 接受。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PayMethod {
     #[default]

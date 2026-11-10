@@ -146,6 +146,9 @@ pub struct NewPayment {
     pub pay_account: Option<String>,
     pub receive_account: Option<String>,
     pub remark: Option<String>,
+    /// 批量导入专用幂等键：同一行内容重复导入时不再重复入账。
+    /// 手工登记恒为 `None`；由 `register_payment` 在同一事务内写入 `pay_payment.import_key`。
+    pub import_key: Option<String>,
 }
 
 impl NewPayment {
@@ -161,6 +164,7 @@ impl NewPayment {
             pay_account: None,
             receive_account: None,
             remark: None,
+            import_key: None,
         }
     }
 }
@@ -893,6 +897,27 @@ pub fn activate_contract(
 /// （R-39）——它们是数据库体积失控的主要来源。
 ///
 /// 写附件与写审计日志在**同一个 IMMEDIATE 事务**里，避免出现「文件进了库、
+/// 附件名净化：库里只存可安全显示的 basename。
+///
+/// 原始名可能带 `..\..\` / `/` / Windows 保留字符；「另存为」会把它当默认文件名
+/// 交给系统对话框，拼进用户选的目录就可能写到目录外。这里统一取最后一段、
+/// 去掉控制字符与保留字符，并限制长度。
+fn sanitize_file_name(raw: &str) -> String {
+    let base = raw.trim().rsplit(['/', '\\']).next().unwrap_or("").trim();
+    let mut out = String::with_capacity(base.len());
+    for ch in base.chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            continue;
+        }
+        out.push(ch);
+    }
+    let out = out.trim();
+    if out == "." || out == ".." {
+        return String::new();
+    }
+    out.chars().take(180).collect()
+}
+
 /// 日志没记上」或反之的半截状态。
 pub fn save_attachment(
     conn: &mut Connection,
@@ -918,7 +943,7 @@ pub fn save_attachment(
             max / 1024 / 1024
         )));
     }
-    let name = file_name.trim();
+    let name = sanitize_file_name(file_name);
     if name.is_empty() {
         return Err(DomainError::MissingField("附件文件名").into());
     }
@@ -973,7 +998,7 @@ pub fn save_attachment(
         &tx,
         "ct_contract_attachment",
         &logged.id,
-        Some(name),
+        Some(name.as_str()),
         "UPSERT",
         Some(&format!("{} · {}", kind.label(), name)),
         operator,
@@ -1321,8 +1346,23 @@ pub fn register_payment(
         return Err(DomainError::NonPositivePayment(input.amount.cent()).into());
     }
     validate_iso_date(&input.pay_date)?;
+    let import_key = input.import_key.clone();
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // 导入幂等：查重与写入在同一 IMMEDIATE 事务里，双实例并发也不会重复入账
+    // （唯一索引 ux_payment_import_key 是最后一道闸）。
+    if let Some(ref key) = import_key {
+        let taken: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pay_payment WHERE import_key = ?1",
+            [key],
+            |r| r.get(0),
+        )?;
+        if taken > 0 {
+            return Err(StoreError::Inconsistent(format!(
+                "导入行 {key} 已入账，拒绝重复登记"
+            )));
+        }
+    }
     let mut c = repo::get_contract(&tx, &input.contract_id)?;
     let paid = repo::paid_net(&tx, &c.id)?;
     // 超付容差固定为 0（R-33）：不再读 sys_meta.tol_bp，也不提供任何写入口
@@ -1384,6 +1424,14 @@ pub fn register_payment(
     };
     p.validate()?;
     repo::insert_payment(&tx, &p)?;
+    // 幂等键不进 Payment 实体（只有导入链路需要），插完立刻在同一事务补写；
+    // 作废 / 编辑走的 update_payment 不含该列，键不会被抹掉。
+    if let Some(ref key) = import_key {
+        tx.execute(
+            "UPDATE pay_payment SET import_key = ?2 WHERE id = ?1",
+            rusqlite::params![p.id, key],
+        )?;
+    }
 
     // 首笔拨款：生效 → 履行中（4.2.3）
     if c.status == ContractStatus::Active {

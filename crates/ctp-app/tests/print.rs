@@ -60,7 +60,7 @@ fn project_and_org(conn: &Connection) {
 /// 一张已生效合同（合同价 1000 元、付款条款固定），可继续登记拨款。
 fn fixture() -> (Connection, String) {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
+    db::init_schema(&mut conn).unwrap();
     ctp_store::seed::seed_reference(&conn, "t").unwrap();
     project_and_org(&conn);
     let c = service::create_contract(
