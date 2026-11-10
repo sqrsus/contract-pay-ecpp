@@ -33,23 +33,52 @@ enum Act {
 
 const STATUSES: [ContractStatus; 2] = [ContractStatus::Performing, ContractStatus::Closed];
 
+/// 滚动锚定的容差：小于这个位移不值得补，免得为亚像素反复触发滚动（R-61）
+const ANCHOR_EPSILON: f32 = 0.5;
+
+/// 锚定补偿量：正数表示内容要向下移动（被点击的行被上方收起的面板带上去了）。
+/// 单独成函数是为了让符号方向可以被测试钉住 —— 这里写反会让跳动翻倍（R-61）
+fn anchor_delta(anchor_y: f32, current_y: f32) -> f32 {
+    anchor_y - current_y
+}
+
+/// 帧末是否要收起面板：只在点了面板以外的区域时才收，且「点展开入口」优先。
+/// 同一帧既有空白点击又有展开意图时，交给 toggle 一次完成互斥切换，
+/// 不走「先全部收起、再展开」的中间态（R-61）
+fn should_collapse_panels(clicked_outside: bool, expanding: bool) -> bool {
+    clicked_outside && !expanding
+}
+
+/// 切换展开目标时的偏移预修正量：被收起的面板在目标行**之上**才需要把内容补回来，
+/// 在下方时目标行本来就不动。同一行（切换面板类型）和没有展开行时都是零（R-61）
+fn offset_fix_for(open_idx: Option<usize>, clicked_idx: Option<usize>, panel_h: f32) -> f32 {
+    match (open_idx, clicked_idx) {
+        (Some(from), Some(to)) if from < to => panel_h,
+        _ => 0.0,
+    }
+}
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
 
-    // 展开的拨款明细 / 单位合同面板：点击面板以外区域自动收起（用上一帧的矩形判断）
+    // 展开的拨款明细 / 单位合同面板：点击面板以外区域自动收起（用上一帧的矩形判断）。
+    // R-61：这里**只判定、不改状态**，而且判定放在「释放」而不是「按下」。
+    // 两个理由：① 收起会改变表格布局（少掉一个面板的高度，其下的行整体上移，靠近底部时滚动偏移
+    // 还会被重新钳制），若在绘制与命中测试之前生效，按下那一帧的表格就已经不是用户看到的样子，
+    // 命中落到错误的行上、指针微调还会把点击判成拖拽；② egui 的 clicked() 要到释放帧才成立，
+    // 用按下帧判定只能拿到「点了面板外」、拿不到「点的是哪个展开入口」，于是仍会在按下与释放之间
+    // 先塌一次。改到释放帧后，同一帧就能同时知道这两件事，展开与收起一次算清，中间不留空档。
+    // 真正的状态转移统一放在帧末，见 `should_collapse_panels`。
     let keep_id = egui::Id::new("contract_expand_keep");
     let keep: Option<egui::Rect> = ui
         .memory(|m| m.data.get_temp::<Option<egui::Rect>>(keep_id))
         .flatten();
     let any_panel = app.expanded_contract.is_some() || app.expanded_contractor.is_some();
-    if any_panel && ui.input(|i| i.pointer.any_pressed()) {
-        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            if keep.is_none_or(|r| !r.contains(pos)) {
-                app.expanded_contract = None;
-                app.expanded_contractor = None;
-            }
-        }
-    }
+    let click_outside = any_panel
+        && ui.input(|i| i.pointer.any_released())
+        && ui
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|pos| keep.is_none_or(|r| !r.contains(pos)));
     page_header(
         ui,
         &p,
@@ -58,6 +87,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     );
 
     let mut action: Option<Act> = None;
+    // 本帧被点击的展开入口所在行的顶部纵坐标（屏幕坐标），用于下一帧的滚动锚定（R-61）
+    let mut clicked_top: Option<f32> = None;
+    // 同上，行序号：用来判断被收起的面板是否在这一行之上（在下方就不用补偿）
+    let mut clicked_idx: Option<usize> = None;
     // R-33：合同台账导出（与屏幕表格同源的 ReportResult）
     let mut export_ledger = false;
     // 批量合同：导出空白模板 / 导入回传（与「拨款管理」的批量功能同构）
@@ -162,6 +195,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let rows = filtered_summaries(app);
 
                     if rows.is_empty() {
+                        // R-61：空列表不会再有锚定 / 预修正对象，清掉残留，避免筛选变化后误用旧坐标
+                        app.pending_expand_anchor = None;
+                        app.pending_offset_fix = None;
                         widgets::empty_state(ui, &p, "没有符合条件的合同");
                         return;
                     }
@@ -242,14 +278,38 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let mut expand_contractor: Option<String> = None;
                     let mut open_pay: Option<String> = None;
                     let mut keep_rect: Option<egui::Rect> = None;
+                    // 本帧处于展开态的行序号与它面板的高度（互斥，最多一个）
+                    let mut open_idx: Option<usize> = None;
+                    let mut open_panel_h: f32 = 0.0;
 
-                    egui::ScrollArea::vertical()
+                    // R-61：切换展开目标时，被收起的面板会让它下方的行整体上移一个面板高度。
+                    // 这里在构造列表之前就把偏移补掉，切换那一帧就不跳；锚点只负责补残差。
+                    let mut scroll = egui::ScrollArea::vertical()
                         .id_salt("contract_list_scroll")
                         .auto_shrink([false, false])
                         .max_height((page_h - 64.0).max(220.0))
-                        .min_scrolled_height((page_h - 110.0).max(200.0))
+                        .min_scrolled_height((page_h - 110.0).max(200.0));
+                    if let Some(fix) = app.pending_offset_fix.take() {
+                        scroll = scroll.vertical_scroll_offset((app.ledger_offset - fix).max(0.0));
+                    }
+                    let scroll_out = scroll
                         .show(ui, |ui| {
                             for (idx, s) in rows.iter().enumerate() {
+                                // R-61：本行顶部（与上一帧同一套坐标），滚动锚定按它对齐
+                                let row_top = ui.cursor().top();
+                                // R-61：上一帧点了这一行的展开入口 → 它本该停在这里，
+                                // 但上方被收起的面板已把内容带偏，这里把偏移补回来
+                                if let Some((id, anchor_y)) = app.pending_expand_anchor.as_ref() {
+                                    if id == &s.contract_id {
+                                        let dy = anchor_delta(*anchor_y, row_top);
+                                        if dy.abs() > ANCHOR_EPSILON {
+                                            ui.scroll_with_delta_animation(
+                                                egui::vec2(0.0, dy),
+                                                egui::style::ScrollAnimation::none(),
+                                            );
+                                        }
+                                    }
+                                }
                                 // 本行所有显示文本来自 ReportResult；交互仍按列语义绘制
                                 let cells = &result.rows[idx];
                                 let text_of = |key: &str| -> String {
@@ -367,6 +427,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                     if r.clicked() || mark.clicked() {
                                                         expand_contractor =
                                                             Some(s.contract_id.clone());
+                                                        clicked_top = Some(row_top);
+                                                        clicked_idx = Some(idx);
                                                     }
                                                     if is_open {
                                                         contractor_rect =
@@ -440,9 +502,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                     .on_hover_text(
                                                         "点击展开 / 收起该合同的拨款明细",
                                                     );
-                                                if amount.clicked() || mark.clicked() {
-                                                    expand = Some(s.contract_id.clone());
-                                                }
+                                                    if amount.clicked() || mark.clicked() {
+                                                        expand = Some(s.contract_id.clone());
+                                                        clicked_top = Some(row_top);
+                                                        clicked_idx = Some(idx);
+                                                    }
                                                 if expanded {
                                                     paid_rect = Some(amount.rect.union(mark.rect));
                                                 }
@@ -481,6 +545,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         &mut print_material,
                                     );
                                     keep_rect = Some(paid_rect.map_or(panel, |n| n.union(panel)));
+                                    open_idx = Some(idx);
+                                    open_panel_h = panel.height();
                                 }
                                 if contractor_open {
                                     // R-59：取全量台账（不受搜索 / 状态筛选影响），排除当前行
@@ -499,9 +565,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     );
                                     let union = contractor_rect.map_or(panel, |c| c.union(panel));
                                     keep_rect = Some(keep_rect.map_or(union, |k| k.union(union)));
+                                    open_idx = Some(idx);
+                                    open_panel_h = panel.height();
                                 }
                             }
                         });
+                    app.ledger_offset = scroll_out.state.offset.y;
 
                     // R-33：合计行取自 result.totals，列宽与对齐跟表头同一套列配置
                     widgets::divider(ui, &p);
@@ -526,6 +595,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     });
 
                     ui.memory_mut(|m| m.data.insert_temp(keep_id, keep_rect));
+                    // R-61：锚点只服务一帧 —— 绘制时已按它补偿过（或该行不在结果里），到此清掉
+                    app.pending_expand_anchor = None;
+                    // R-61：被收起的面板在这一行之上，下一帧把这一个面板的高度补回去
+                    let fix = offset_fix_for(open_idx, clicked_idx, open_panel_h);
+                    if fix > 0.0 {
+                        app.pending_offset_fix = Some(fix);
+                    }
 
                     if let Some(id) = expand {
                         action = Some(Act::Expand(id));
@@ -601,6 +677,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // 浏览用户不许触发写类动作：不置灰，点了直接提示「无权限」
+    // ---------------- 帧末面板状态转移（R-61）
+    // 绘制与命中测试全部结束之后再改状态：本帧的布局、命中与点击判定都用用户实际看到的那一版。
+    // 若在帧首收起，按下那一帧的表格就少了一个面板的高度，其下的行整体移位、靠近底部时滚动偏移
+    // 还会被重新钳制，指针落点与新的行错位，点击（甚至被追着微调成拖拽）便落不到目标上。
+    // 收起与展开在同一帧末完成，下一帧一次性呈现「旧面板消失 + 新面板出现」，没有中间空档。
+    let expanding = matches!(
+        action,
+        Some(Act::Expand(_)) | Some(Act::ExpandContractor(_))
+    );
+    if should_collapse_panels(click_outside, expanding) {
+        app.expanded_contract = None;
+        app.expanded_contractor = None;
+    }
+
     let writes = matches!(
         action,
         Some(Act::New)
@@ -621,9 +711,22 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(Act::Expand(id)) => {
             app.select(&id);
+            // R-61：从别的行切过来时才锚定 —— 收起自己不会移动本行，不需要补偿
+            if app.expanded_contract.as_deref() != Some(id.as_str()) {
+                if let Some(top) = clicked_top {
+                    app.pending_expand_anchor = Some((id.clone(), top));
+                }
+            }
             app.toggle_expand(&id);
         }
-        Some(Act::ExpandContractor(id)) => app.toggle_contractor(&id),
+        Some(Act::ExpandContractor(id)) => {
+            if app.expanded_contractor.as_deref() != Some(id.as_str()) {
+                if let Some(top) = clicked_top {
+                    app.pending_expand_anchor = Some((id.clone(), top));
+                }
+            }
+            app.toggle_contractor(&id);
+        }
         Some(Act::OpenPayment(id)) => app.open_payment(&id),
         Some(Act::New) => {
             app.new_contract = crate::dialogs::ContractForm::default();
@@ -1363,5 +1466,59 @@ mod tests {
         assert!(other_contracts_of(&only, "某设计院", "C9").is_empty());
         // 单位名不匹配时不串台
         assert!(other_contracts_of(&all, "某设备公司", "C1").is_empty());
+    }
+
+    /// R-61：点空白收起与点展开入口在同一帧发生时，展开优先 ——
+    /// 不经过「先全部收起、再展开」的中间态，否则会多一次状态写入，
+    /// 在帧首执行时还会让布局先塌一次（本次故障的根因）。
+    #[test]
+    fn 空白点击让位于展开意图() {
+        assert!(
+            should_collapse_panels(true, false),
+            "点空白且无展开意图时必须收起"
+        );
+        assert!(
+            !should_collapse_panels(true, true),
+            "同一帧点了展开入口时不得先收起"
+        );
+        assert!(!should_collapse_panels(false, false), "点在面板内不收起");
+        assert!(
+            !should_collapse_panels(false, true),
+            "点在面板内的展开入口不收起"
+        );
+    }
+
+    /// R-61：锚定补偿的符号 —— 行被上方面板带上去（current 小于 anchor）时要往下补，
+    /// 写反会让跳动翻倍。位置没变时为零，落在容差内不触发滚动。
+    #[test]
+    fn 锚定按被点击行的原位置补偿() {
+        // 上方面板收起，行从 400 被带到 250：内容需要向下移 150
+        assert_eq!(anchor_delta(400.0, 250.0), 150.0);
+        assert!(anchor_delta(400.0, 250.0) > 0.0);
+        // 反向（内容被往下推）时为负
+        assert_eq!(anchor_delta(250.0, 400.0), -150.0);
+        // 位置没变：零补偿，且低于触发阈值
+        assert_eq!(anchor_delta(300.0, 300.0), 0.0);
+        assert!(anchor_delta(300.0, 300.0).abs() < ANCHOR_EPSILON);
+        // 亚像素位移也不补，避免为抖动反复滚动
+        assert!(anchor_delta(300.0, 300.2).abs() < ANCHOR_EPSILON);
+    }
+
+    /// R-61：偏移预修正只在上方面板被收起时才给量 ——
+    /// 给它下方的行补偿会把内容凭空推下去，反而制造新的跳动。
+    #[test]
+    fn 偏移预修正只补被收起面板之上的行() {
+        // 展开行在序号 2、点击的是序号 20：目标行会被带上去一个面板高度
+        assert_eq!(offset_fix_for(Some(2), Some(20), 186.0), 186.0);
+        // 展开行在目标行下方：目标行不动，不补
+        assert_eq!(offset_fix_for(Some(20), Some(2), 186.0), 0.0);
+        // 同一行换个面板类型：行本身不动，不补
+        assert_eq!(offset_fix_for(Some(7), Some(7), 186.0), 0.0);
+        // 本来没有展开行（第一次点开）：不补
+        assert_eq!(offset_fix_for(None, Some(9), 186.0), 0.0);
+        // 点了空白处（收起但没点入口）：不补
+        assert_eq!(offset_fix_for(Some(3), None, 186.0), 0.0);
+        // 没点到任何入口且没有展开行：不补
+        assert_eq!(offset_fix_for(None, None, 186.0), 0.0);
     }
 }
