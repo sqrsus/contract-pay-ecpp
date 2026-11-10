@@ -3,11 +3,13 @@ use crate::error::{DomainError, Result};
 use crate::money::Money;
 
 /// 支付方式（5.4.4 `pay_method`）。
+///
+/// R-57 起「承兑」退场，只保留 转账 / 现金 / 其他；历史 `ACCEPTANCE`
+/// 行在 `ctp_store::db::migrate` 中一次性改写为 `TRANSFER`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PayMethod {
     #[default]
     Transfer,
-    Acceptance,
     Cash,
     Other,
 }
@@ -16,7 +18,6 @@ impl PayMethod {
     pub fn code(self) -> &'static str {
         match self {
             PayMethod::Transfer => "TRANSFER",
-            PayMethod::Acceptance => "ACCEPTANCE",
             PayMethod::Cash => "CASH",
             PayMethod::Other => "OTHER",
         }
@@ -25,7 +26,6 @@ impl PayMethod {
     pub fn label(self) -> &'static str {
         match self {
             PayMethod::Transfer => "转账",
-            PayMethod::Acceptance => "承兑",
             PayMethod::Cash => "现金",
             PayMethod::Other => "其他",
         }
@@ -34,7 +34,6 @@ impl PayMethod {
     pub fn from_code(s: &str) -> Option<Self> {
         Some(match s {
             "TRANSFER" => PayMethod::Transfer,
-            "ACCEPTANCE" => PayMethod::Acceptance,
             "CASH" => PayMethod::Cash,
             "OTHER" => PayMethod::Other,
             _ => return None,
@@ -201,5 +200,15 @@ mod tests {
         assert!(!p.counts_as_paid());
         assert_eq!(p.status.code(), "VOID");
         assert!(p.void().is_err(), "不可重复作废");
+    }
+
+    /// R-57：承兑退场，只剩 转账 / 现金 / 其他；旧码不再被解析。
+    #[test]
+    fn 支付方式不再接受承兑() {
+        assert_eq!(PayMethod::from_code("ACCEPTANCE"), None);
+        assert_eq!(PayMethod::from_code("TRANSFER"), Some(PayMethod::Transfer));
+        assert_eq!(PayMethod::from_code("CASH"), Some(PayMethod::Cash));
+        assert_eq!(PayMethod::from_code("OTHER"), Some(PayMethod::Other));
+        assert_eq!(PayMethod::default().label(), "转账");
     }
 }

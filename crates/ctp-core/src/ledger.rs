@@ -11,7 +11,7 @@ pub struct ContractSummary {
     pub contract_name: String,
     pub status: String,
     pub contractor_name: String,
-    /// 合同类型代码（CONSTRUCT / SUPERVISE / …），用于付清条件判定
+    /// 合同类型代码（CONSTRUCT / SUPPLY / SERVICE），用于付清条件判定
     pub contract_type: String,
     pub contract_category_code: String,
     pub category_code: Option<String>,
@@ -39,8 +39,8 @@ impl ContractSummary {
         self.pay_rate.bp() >= 10_000
     }
 
-    /// 是否施工类合同（付清需审定 + 交工满 2 年）。
-    pub fn is_construct(&self) -> bool {
+    /// 是否工程类合同（付清需审定 + 交工满 2 年）。
+    pub fn is_engineering(&self) -> bool {
         self.contract_type.eq_ignore_ascii_case("CONSTRUCT")
     }
 
@@ -68,7 +68,7 @@ impl ContractSummary {
     pub fn to_quota(&self, tolerance: Rate) -> PaymentQuota {
         let pay_date = crate::date::today_iso();
         let limit = crate::quota::pay_limit_for(
-            self.is_construct(),
+            self.is_engineering(),
             self.is_audited,
             self.delivery_date.as_deref(),
             self.base_amount,
@@ -169,7 +169,7 @@ pub enum SummaryDim {
     Contractor,
     /// 按合同归集（只列出区间内有拨款的合同，R-32 确认口径）
     Contract,
-    /// 按合同类型归集（施工 / 监理 / 设计 / 勘察 / 货物 / 服务）
+    /// 按合同类型归集（工程 / 货物 / 服务）
     ContractType,
 }
 
@@ -212,7 +212,7 @@ pub struct SummaryFilter {
     /// 项目状态：`Some(true)` 只看归档关闭（支付率 ≥ 100%），
     /// `Some(false)` 只看履行中；口径与 `ContractSummary::is_archived` 一致
     pub archived: Option<bool>,
-    /// 合同类型代码（`CONSTRUCT` / `SUPERVISE` …）
+    /// 合同类型代码（`CONSTRUCT` / `SUPPLY` / `SERVICE`）
     pub contract_type: Option<String>,
     /// 关键词：匹配项目名 / 承包单位 / 合同编号 / 合同名称
     pub keyword: String,

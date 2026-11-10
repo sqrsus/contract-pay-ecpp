@@ -190,10 +190,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     .target_label
                                     .clone()
                                     .unwrap_or_else(|| r.target_id.clone());
-                                ui.add(
-                                    egui::Label::new(RichText::new(name).size(12.0).color(p.text))
-                                        .truncate(),
-                                );
+                                widgets::cell_marquee(ui, &name, 12.0, p.text, egui::Align::LEFT);
                             });
                             row.col(|ui| {
                                 let d = r.detail.clone().unwrap_or_default();
@@ -202,19 +199,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 } else {
                                     (d.clone(), d)
                                 };
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(show).size(12.0).color(p.text_muted),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(hover);
+                                let resp = widgets::cell_marquee(
+                                    ui,
+                                    &show,
+                                    12.0,
+                                    p.text_muted,
+                                    egui::Align::LEFT,
+                                );
+                                if !hover.is_empty() {
+                                    resp.on_hover_text(hover);
+                                }
                             });
                             row.col(|ui| {
-                                ui.label(
-                                    RichText::new(r.operator_id.clone().unwrap_or_default())
-                                        .size(12.0)
-                                        .color(p.text_muted),
+                                widgets::cell_marquee(
+                                    ui,
+                                    &r.operator_id.clone().unwrap_or_default(),
+                                    12.0,
+                                    p.text_muted,
+                                    egui::Align::LEFT,
                                 );
                             });
                         });
@@ -274,7 +276,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         if submit && n > 0 {
             app.log_clear = None;
-            match app.exec(move |c| logs::clear(c, &filter, "管理员")) {
+            let op = app.operator();
+            match app.exec(move |c| logs::clear(c, &filter, op)) {
                 Ok(n) => {
                     app.log_key = None;
                     app.success(format!("已清理 {n} 条日志（已留痕）"));

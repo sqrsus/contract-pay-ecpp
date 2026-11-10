@@ -67,7 +67,7 @@ impl Default for NewContract {
         NewContract {
             project_id: String::new(),
             contract_name: String::new(),
-            contract_type: ContractType::Construct,
+            contract_type: ContractType::Engineering,
             contract_category_code: "GC".into(),
             category_id: None,
             party_a: String::new(),
@@ -176,12 +176,12 @@ pub struct RateMismatch {
 // 并写一条审计日志，事后能在档案里查到这个条目是怎么来的。
 
 /// 合同类型 → 参建单位角色（自动建档时按类型映射）。
+///
+/// R-57：合同类型只剩工程/货物/服务三类，但「参建单位角色」是**独立字典**
+/// （施工/监理/设计/勘察/供应/业主/其他/代理），不随合同类型一起收窄。
 fn role_for_type(t: ContractType) -> ContractorRole {
     match t {
-        ContractType::Construct => ContractorRole::Construct,
-        ContractType::Supervise => ContractorRole::Supervise,
-        ContractType::Design => ContractorRole::Design,
-        ContractType::Survey => ContractorRole::Survey,
+        ContractType::Engineering => ContractorRole::Construct,
         ContractType::Supply => ContractorRole::Supplier,
         ContractType::Service => ContractorRole::Other,
     }

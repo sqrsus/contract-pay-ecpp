@@ -49,24 +49,32 @@ pub fn business_field_count() -> usize {
 }
 
 /// 合同类型（4.2.2）。
+///
+/// R-57 起只保留 **工程 / 货物 / 服务** 三类：原「施工」改名为「工程」，
+/// 「监理 / 设计 / 勘察」三类整体退场（历史数据在 `ctp_store::db::migrate`
+/// 中一次性并入 `CONSTRUCT`）。
+///
+/// 落库码沿用 `CONSTRUCT`：存量库的 CHECK 约束与 46 条历史行都以此为准，
+/// 改码要重建表，收益仅为字面整齐，不值得承担迁移风险。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContractType {
     #[default]
-    Construct,
-    Supervise,
-    Design,
-    Survey,
+    Engineering,
     Supply,
     Service,
 }
 
 impl ContractType {
+    /// 全部类型，顺序即下拉与筛选的展示顺序（单一来源，新增类型只改这里）。
+    pub const ALL: [ContractType; 3] = [
+        ContractType::Engineering,
+        ContractType::Supply,
+        ContractType::Service,
+    ];
+
     pub fn code(self) -> &'static str {
         match self {
-            ContractType::Construct => "CONSTRUCT",
-            ContractType::Supervise => "SUPERVISE",
-            ContractType::Design => "DESIGN",
-            ContractType::Survey => "SURVEY",
+            ContractType::Engineering => "CONSTRUCT",
             ContractType::Supply => "SUPPLY",
             ContractType::Service => "SERVICE",
         }
@@ -74,10 +82,7 @@ impl ContractType {
 
     pub fn label(self) -> &'static str {
         match self {
-            ContractType::Construct => "施工",
-            ContractType::Supervise => "监理",
-            ContractType::Design => "设计",
-            ContractType::Survey => "勘察",
+            ContractType::Engineering => "工程",
             ContractType::Supply => "货物",
             ContractType::Service => "服务",
         }
@@ -85,10 +90,7 @@ impl ContractType {
 
     pub fn from_code(s: &str) -> Option<Self> {
         Some(match s {
-            "CONSTRUCT" => ContractType::Construct,
-            "SUPERVISE" => ContractType::Supervise,
-            "DESIGN" => ContractType::Design,
-            "SURVEY" => ContractType::Survey,
+            "CONSTRUCT" => ContractType::Engineering,
             "SUPPLY" => ContractType::Supply,
             "SERVICE" => ContractType::Service,
             _ => return None,
@@ -487,7 +489,7 @@ mod tests {
             project_id: "PJ-1".into(),
             contract_no: "HT-2026-001".into(),
             contract_name: "某道路工程施工".into(),
-            contract_type: ContractType::Construct,
+            contract_type: ContractType::Engineering,
             contract_category_code: "GC".into(),
             category_id: Some("C02".into()),
             party_a: "某建设单位".into(),
@@ -509,12 +511,23 @@ mod tests {
     }
 
     #[test]
-    fn 合同类型采购标签改为货物() {
+    fn 合同类型只剩工程货物服务三类() {
         assert_eq!(ContractType::Supply.label(), "货物");
         assert_eq!(
             ContractType::from_code("SUPPLY"),
             Some(ContractType::Supply)
         );
+        // R-57：原「施工」显示为「工程」，落库码保持 CONSTRUCT 以兼容存量数据
+        assert_eq!(ContractType::default().label(), "工程");
+        assert_eq!(ContractType::default().code(), "CONSTRUCT");
+        assert_eq!(
+            ContractType::from_code("CONSTRUCT"),
+            Some(ContractType::Engineering)
+        );
+        // 退场的三类不再被接受
+        for legacy in ["SUPERVISE", "DESIGN", "SURVEY"] {
+            assert_eq!(ContractType::from_code(legacy), None, "{legacy} 应已退场");
+        }
     }
 
     #[test]

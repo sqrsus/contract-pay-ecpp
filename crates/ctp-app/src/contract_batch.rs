@@ -160,9 +160,9 @@ pub fn write_template(path: &Path, generated_at: &str) -> Result<usize> {
             last_col,
             &format!(
                 "带 * 为必填。日期一律填 YYYY-MM-DD 文本；合同金额填元（两位小数）；\
-                 合同类型可填 施工/监理/设计/勘察/货物/服务（留空按施工）；\
-                 合同类别必填，可填 工程款/设备款/材料款/监理费/检测费；\
-                 计价方式可填 总价/单价/成本加酬金；招标方式可填 公开招标/政府采购/直接发包；\
+                 合同类型可填 工程/货物/服务（留空按工程）；\
+                 合同类别必填，可填 工程款/设备款/材料款/监理费/设计费/检测费；\
+                 计价方式可填 总价/单价/成本加酬金；招标方式可填 公开招标/政府采购/直接发包（留空按公开招标）；\
                  质保金率填百分数（如 3 表示 3%，留空按 3）；计划交工留空时按「计划开工 + 工期」推算；\
                  项目 / 承包单位 / 甲方 / 招标代理填名称即可，库里没有会自动建档；\
                  导入后一律为草稿，需在界面上传合同附件后才能「设为生效」。\
@@ -214,13 +214,13 @@ pub fn write_template(path: &Path, generated_at: &str) -> Result<usize> {
         for (col, list, hint) in [
             (
                 C_TYPE,
-                &["施工", "监理", "设计", "勘察", "货物", "服务"][..],
-                "合同类型：施工 / 监理 / 设计 / 勘察 / 货物 / 服务；留空按施工",
+                &["工程", "货物", "服务"][..],
+                "合同类型：工程 / 货物 / 服务；留空按工程",
             ),
             (
                 C_CATEGORY,
-                &["工程款", "设备款", "材料款", "监理费", "检测费"][..],
-                "合同类别（必填）：工程款 / 设备款 / 材料款 / 监理费 / 检测费",
+                &["工程款", "设备款", "材料款", "监理费", "设计费", "检测费"][..],
+                "合同类别（必填）：工程款 / 设备款 / 材料款 / 监理费 / 设计费 / 检测费",
             ),
             (
                 C_PRICING,
@@ -230,7 +230,7 @@ pub fn write_template(path: &Path, generated_at: &str) -> Result<usize> {
             (
                 C_BID_METHOD,
                 &["公开招标", "政府采购", "直接发包"][..],
-                "招标方式：公开招标 / 政府采购 / 直接发包；留空视为未选",
+                "招标方式：公开招标 / 政府采购 / 直接发包；留空按公开招标",
             ),
         ] {
             let dv = DataValidation::new()
@@ -365,37 +365,28 @@ fn opt_date(
     Ok(Some(t))
 }
 
-/// 合同类型：中文标签或英文码都认；留空按施工（与新建表单的默认选中项一致）。
+/// 合同类型：中文标签或英文码都认；留空按工程（与新建表单的默认选中项一致）。
 fn cell_contract_type(
     row: &[calamine::Data],
     col: usize,
 ) -> std::result::Result<ContractType, String> {
     let t = cell(row, col);
     if t.is_empty() {
-        return Ok(ContractType::Construct);
+        return Ok(ContractType::Engineering);
     }
-    for ty in [
-        ContractType::Construct,
-        ContractType::Supervise,
-        ContractType::Design,
-        ContractType::Survey,
-        ContractType::Supply,
-        ContractType::Service,
-    ] {
+    for ty in ContractType::ALL {
         if t == ty.label() || t.eq_ignore_ascii_case(ty.code()) {
             return Ok(ty);
         }
     }
-    Err(format!(
-        "合同类型「{t}」无法识别，可填 施工/监理/设计/勘察/货物/服务"
-    ))
+    Err(format!("合同类型「{t}」无法识别，可填 工程/货物/服务"))
 }
 
 /// 合同类别：必须命中字典（`sys_dict_item:CONTRACT_CATEGORY`），否则该行失败。
 fn cell_category(row: &[calamine::Data], col: usize) -> std::result::Result<String, String> {
     let t = cell(row, col);
     if t.is_empty() {
-        return Err("合同类别为空，可填 工程款/设备款/材料款/监理费/检测费".into());
+        return Err("合同类别为空，可填 工程款/设备款/材料款/监理费/设计费/检测费".into());
     }
     for (code, name) in dict::CONTRACT_CATEGORIES {
         if t == *name || t.eq_ignore_ascii_case(code) {
@@ -403,7 +394,7 @@ fn cell_category(row: &[calamine::Data], col: usize) -> std::result::Result<Stri
         }
     }
     Err(format!(
-        "合同类别「{t}」不在字典里，可填 工程款/设备款/材料款/监理费/检测费"
+        "合同类别「{t}」不在字典里，可填 工程款/设备款/材料款/监理费/设计费/检测费"
     ))
 }
 
@@ -435,7 +426,8 @@ fn cell_bid_method(
 ) -> std::result::Result<Option<BidMethod>, String> {
     let t = cell(row, col);
     if t.is_empty() {
-        return Ok(None);
+        // R-57：招标方式不再有「未选」，留空按公开招标（与新建表单默认值一致）。
+        return Ok(Some(BidMethod::Open));
     }
     for m in [BidMethod::Open, BidMethod::Government, BidMethod::Direct] {
         if t == m.label() || t.eq_ignore_ascii_case(m.code()) {
@@ -700,7 +692,7 @@ mod tests {
             (C_AGENT, "某招标代理"),
             (C_START, "2026-03-01"),
             (C_DURATION, "90"),
-            (C_TYPE, "施工"),
+            (C_TYPE, "工程"),
             (C_CATEGORY, "工程款"),
             (C_SIGN_DATE, "2026-02-10"),
             (C_AMOUNT, "1234567.89"),
@@ -774,7 +766,7 @@ mod tests {
         assert!(c.contract_no.starts_with("HT-"), "{}", c.contract_no);
 
         let full = repo::get_contract(&conn, &c.contract_id).unwrap();
-        assert_eq!(full.contract_type, ContractType::Construct);
+        assert_eq!(full.contract_type, ContractType::Engineering);
         assert_eq!(full.contract_category_code, "GC");
         assert_eq!(full.party_a, "某建设单位");
         assert_eq!(full.sign_date, "2026-02-10");

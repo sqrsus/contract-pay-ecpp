@@ -274,7 +274,23 @@ pub fn marquee_sense(
     color: Color32,
     sense: egui::Sense,
 ) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 18.0), sense);
+    marquee_sense_align(ui, text, width, size, color, egui::Align::LEFT, sense)
+}
+
+/// 同 `marquee_sense`，但对齐方式可指定（表格里右对齐的金额列用 `Align::RIGHT`）。
+///
+/// 放不下时悬停自动循环左移，**未悬停时仍从左侧开始**——右对齐列一旦超宽，
+/// 先看到的是开头（合同名、事由这类字段的开头更有辨识度）。
+pub fn marquee_sense_align(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    size: f32,
+    color: Color32,
+    align: egui::Align,
+    sense: egui::Sense,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width.max(1.0), 18.0), sense);
     let font = egui::FontId::proportional(size);
     let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, color));
     let text_w = galley.size().x;
@@ -290,30 +306,36 @@ pub fn marquee_sense(
 
     let painter = ui.painter().with_clip_rect(rect);
     let y = rect.center().y - galley.size().y / 2.0;
-    painter.galley(egui::pos2(rect.left() - offset, y), galley.clone(), color);
+    // 超宽或正在滚动时一律以左边缘为基准；只有「放得下」才按对齐方式定位
+    let x = if text_w > width || offset > 0.0 {
+        rect.left() - offset
+    } else {
+        match align {
+            egui::Align::RIGHT => rect.right() - text_w,
+            egui::Align::Center => rect.center().x - text_w / 2.0,
+            _ => rect.left(),
+        }
+    };
+    painter.galley(egui::pos2(x, y), galley.clone(), color);
     if offset > 0.0 {
         painter.galley(egui::pos2(rect.left() - offset + cycle, y), galley, color);
     }
     resp
 }
 
-/// 定宽文本（不滚动）：超出宽度直接裁剪，避免表格列被长名称撑开。
-pub fn clipped_text(
+/// 表格单元格文本：宽度取当前可用宽度，放不下时悬停自动横向滚动。
+///
+/// 列宽由调用方（TableBuilder 列配置或定宽 cell）决定，这里不再改宽度，
+/// 因此「默认完整可见、超宽才滚动」与 R-54 的下拉口径一致。
+pub fn cell_marquee(
     ui: &mut Ui,
     text: &str,
-    width: f32,
     size: f32,
     color: Color32,
-    sense: egui::Sense,
+    align: egui::Align,
 ) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width.max(1.0), 18.0), sense);
-    let galley =
-        ui.fonts(|f| f.layout_no_wrap(text.to_owned(), egui::FontId::proportional(size), color));
-    let y = rect.center().y - galley.size().y / 2.0;
-    ui.painter()
-        .with_clip_rect(rect)
-        .galley(egui::pos2(rect.left(), y), galley, color);
-    resp
+    let w = ui.available_width().max(1.0);
+    marquee_sense_align(ui, text, w, size, color, align, egui::Sense::hover())
 }
 
 /// 紧凑主按钮：详情卡里的「设为生效」这类唯一主行动。

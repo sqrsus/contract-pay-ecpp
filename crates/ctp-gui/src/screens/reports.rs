@@ -41,12 +41,21 @@ fn draw_cell(
             ui.label(label);
         }
         _ if right => {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(text);
-            });
+            if strong {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(text);
+                });
+            } else {
+                // 列宽不够时悬停自动横向滚动，不再直接截断
+                widgets::cell_marquee(ui, &cell.display(), 12.5, p.text, egui::Align::RIGHT);
+            }
         }
         _ => {
-            ui.label(text);
+            if strong {
+                ui.label(text);
+            } else {
+                widgets::cell_marquee(ui, &cell.display(), 12.5, p.text, egui::Align::LEFT);
+            }
         }
     }
 }
@@ -249,14 +258,7 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
             .width(110.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut app.summary_type, None, "全部");
-                for t in [
-                    ctp_core::contract::ContractType::Construct,
-                    ctp_core::contract::ContractType::Supervise,
-                    ctp_core::contract::ContractType::Design,
-                    ctp_core::contract::ContractType::Survey,
-                    ctp_core::contract::ContractType::Supply,
-                    ctp_core::contract::ContractType::Service,
-                ] {
+                for t in ctp_core::contract::ContractType::ALL {
                     ui.selectable_value(
                         &mut app.summary_type,
                         Some(t.code().to_string()),

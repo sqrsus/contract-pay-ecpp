@@ -63,7 +63,7 @@ fn project_and_org(conn: &Connection) {
 }
 
 fn fixture(amount_yuan: i64) -> (Connection, String) {
-    // 默认「非施工 + 已交工」：不受付清条件封顶，用于验证原始额度口径。
+    // 默认「非工程 + 已交工」：不受付清条件封顶，用于验证原始额度口径。
     fixture_with(
         amount_yuan,
         ctp_core::contract::ContractType::Service,
@@ -223,7 +223,7 @@ fn 容差固定为零_超基准即拦截() {
 
 #[test]
 fn 未交工合同封顶八成() {
-    let (mut conn, cid) = fixture_with(1000, ctp_core::contract::ContractType::Construct, None);
+    let (mut conn, cid) = fixture_with(1000, ctp_core::contract::ContractType::Engineering, None);
 
     pay(&mut conn, &cid, 700).unwrap();
     let err = pay(&mut conn, &cid, 101).unwrap_err();
@@ -242,11 +242,11 @@ fn 未交工合同封顶八成() {
 }
 
 #[test]
-fn 施工合同付清需审定且交工满两年() {
+fn 工程合同付清需审定且交工满两年() {
     // 交工 2024-06-01：距开单日 2026-03-31 不满 2 年
     let (mut conn, cid) = fixture_with(
         1000,
-        ctp_core::contract::ContractType::Construct,
+        ctp_core::contract::ContractType::Engineering,
         Some("2024-06-01"),
     );
 
@@ -286,7 +286,7 @@ fn 满两年当日仍不可付清() {
     // 交工 2024-03-31，开单 2026-03-31：同日不算「大于 2 年」
     let (mut conn, cid) = fixture_with(
         1000,
-        ctp_core::contract::ContractType::Construct,
+        ctp_core::contract::ContractType::Engineering,
         Some("2024-03-31"),
     );
     service::register_audit_price(
@@ -932,7 +932,7 @@ fn 汇总统计_四维度合计一致_筛选生效() {
         400_000 * 100
     );
 
-    // 类型筛选：两份都是服务类；查「设计」应一无所获
+    // 类型筛选：两份都是服务类；查「工程」应一无所获
     assert_eq!(
         sum_cent(&SummaryFilter {
             contract_type: Some("SERVICE".into()),
@@ -942,7 +942,7 @@ fn 汇总统计_四维度合计一致_筛选生效() {
     );
     assert_eq!(
         sum_cent(&SummaryFilter {
-            contract_type: Some("DESIGN".into()),
+            contract_type: Some("CONSTRUCT".into()),
             ..Default::default()
         }),
         0

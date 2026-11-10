@@ -15,7 +15,7 @@
 //! 本期建表 13 张 + 视图 4 个；文档目标态为 21 张，其余随移出模块或二期补建。
 
 /// 结构版本，写入 `PRAGMA user_version` 的伴生元数据键 `schema_version`。
-pub const SCHEMA_VERSION: &str = "1.6.0-rv25";
+pub const SCHEMA_VERSION: &str = "1.6.0-rv26";
 
 /// 计入「已付净额」的单据状态（**唯一口径**，视图与仓储共用）。
 pub const PAID_STATUS_SQL: &str = "'PAID'";
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS ct_contract (
     contract_no             TEXT NOT NULL,
     contract_name           TEXT NOT NULL,
     contract_type           TEXT NOT NULL
-                            CHECK (contract_type IN ('CONSTRUCT','SUPERVISE','DESIGN','SURVEY','SUPPLY','SERVICE')),
+                            CHECK (contract_type IN ('CONSTRUCT','SUPPLY','SERVICE')),
     contract_category_code  TEXT NOT NULL
                             CHECK (length(trim(contract_category_code)) > 0),
     category_id             TEXT REFERENCES ct_category(id),
@@ -350,7 +350,7 @@ CREATE TABLE IF NOT EXISTS pay_payment (
     amount_cent     INTEGER NOT NULL CHECK (amount_cent > 0),
     reason          TEXT,
     pay_method      TEXT NOT NULL DEFAULT 'TRANSFER'
-                    CHECK (pay_method IN ('TRANSFER','ACCEPTANCE','CASH','OTHER')),
+                    CHECK (pay_method IN ('TRANSFER','CASH','OTHER')),
     bank_serial_no  TEXT,
     pay_account     TEXT,
     receive_account TEXT,

@@ -30,7 +30,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("拨款管理").size(19.0).strong().color(p.text));
             ui.label(
                 RichText::new(
-                    "未交工合同累计付款不超过有效计价基准的 80%；施工合同须已审定、且交工满 2 年方可付清",
+                    "未交工合同累计付款不超过有效计价基准的 80%；工程合同须已审定、且交工满 2 年方可付清",
                 )
                 .size(12.0)
                 .color(p.text_muted),
@@ -580,10 +580,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 }
                                             }
                                             _ => {
-                                                ui.label(
-                                                    RichText::new(text.as_str())
-                                                        .size(12.0)
-                                                        .color(p.text_muted),
+                                                widgets::cell_marquee(
+                                                    ui,
+                                                    text.as_str(),
+                                                    12.0,
+                                                    p.text_muted,
+                                                    egui::Align::LEFT,
                                                 );
                                             }
                                         });
@@ -726,7 +728,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         };
         let idx = app.pay_form.method_idx;
         let input = crate::dialogs::new_payment_input(&cid, amount, &date, &reason, idx);
-        match app.exec(move |c| service::register_payment(c, input, "界面用户")) {
+        let op = app.operator();
+        match app.exec(move |c| service::register_payment(c, input, op)) {
             Ok(pm) => {
                 app.refresh();
                 app.pay_form = crate::dialogs::PayForm::default();

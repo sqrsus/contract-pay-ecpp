@@ -190,7 +190,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         } else if new != new2 {
             app.error("两次输入的新密码不一致");
         } else {
-            match app.exec(|c| auth::change(c, &new, "管理员")) {
+            match app.exec(|c| auth::change(c, &new, ctp_app::auth::Role::Admin.label())) {
                 Ok(()) => {
                     app.pw_old.clear();
                     app.pw_new.clear();

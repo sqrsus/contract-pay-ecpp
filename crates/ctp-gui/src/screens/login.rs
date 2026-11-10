@@ -177,7 +177,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     // R-39：补写登录留痕；不阻止登录，失败时保留警告供再次重试。
     if retry_audit {
         if let Some((ok, _)) = app.login_audit_warn.clone() {
-            match app.db.as_ref().map(|c| auth::log_login(c, ok, "管理员")) {
+            match app
+                .db
+                .as_ref()
+                .map(|c| auth::log_login(c, ok, Role::Admin.label()))
+            {
                 Some(Ok(())) => {
                     app.login_audit_warn = None;
                     app.success("登录留痕已补写");
@@ -203,7 +207,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
             Ok(ok) => {
                 // 统一走 auth::log_login（R-31 埋点，此前全库零调用），失败不静默吞掉
                 if let Some(conn) = app.db.as_ref() {
-                    match auth::log_login(conn, ok, "管理员") {
+                    match auth::log_login(conn, ok, Role::Admin.label()) {
                         Ok(()) => app.login_audit_warn = None,
                         Err(e) => {
                             let msg = format!("登录留痕写入失败：{e}");

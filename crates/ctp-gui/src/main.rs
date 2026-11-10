@@ -502,7 +502,8 @@ impl App {
         }
         // `CTP_DEMO=1`：空库时灌演示数据，供截图与冒烟核对（只在显式开启时生效）
         if std::env::var("CTP_DEMO").unwrap_or_default() == "1" && self.summaries.is_empty() {
-            match self.exec(|c| ctp_app::demo::seed_demo(c, "界面用户")) {
+            let op = self.operator();
+            match self.exec(|c| ctp_app::demo::seed_demo(c, op)) {
                 Ok(_) => self.refresh(),
                 Err(e) => self.error(format!("载入演示数据失败：{e}")),
             }
@@ -959,8 +960,9 @@ impl App {
             .and_then(|conn| ctp_app::service::report_of(conn, kind).ok())
             .map(|r| r.default_file_name())
             .unwrap_or_else(|| format!("{}.xlsx", kind.file_stem()));
+        let op = self.operator();
         self.save_report(kind.title(), &file_name, |conn, path| {
-            ctp_app::service::export_report(conn, kind, path, "界面用户")
+            ctp_app::service::export_report(conn, kind, path, op)
         });
     }
 
@@ -977,8 +979,9 @@ impl App {
     /// 屏幕与 Excel 读同一个结果对象，不重新查库、不重算合计。
     pub fn export_report_result(&mut self, result: &ctp_app::report::ReportResult) {
         let file_name = result.default_file_name();
+        let op = self.operator();
         self.save_report(result.title, &file_name, |conn, path| {
-            ctp_app::service::export_result(conn, result, path, "界面用户")
+            ctp_app::service::export_result(conn, result, path, op)
         });
     }
 
@@ -1045,11 +1048,10 @@ impl App {
     /// 上一帧登记的批量导入，在这一帧真正执行（R-39「处理中」状态的落地）。
     fn run_pending_import(&mut self, kind: BatchImport, path: &std::path::Path) {
         // 两条链路返回同一个 `ImportReport`，结果弹窗与失败行提示完全共用
+        let op = self.operator();
         let report = match kind {
-            BatchImport::Payments => self.exec(|c| ctp_app::batch::import(c, path, "管理员")),
-            BatchImport::Contracts => {
-                self.exec(|c| ctp_app::contract_batch::import(c, path, "管理员"))
-            }
+            BatchImport::Payments => self.exec(|c| ctp_app::batch::import(c, path, op)),
+            BatchImport::Contracts => self.exec(|c| ctp_app::contract_batch::import(c, path, op)),
         };
         let view = match report {
             Ok(report) => {
@@ -1081,6 +1083,15 @@ impl App {
     /// 当前身份能否写库（浏览用户一律 false）。
     pub fn can_write(&self) -> bool {
         self.role.map(|r| r.can_write()).unwrap_or(false)
+    }
+
+    /// 审计用「操作人」：**唯一来源**，一律取当前登录身份的名称。
+    ///
+    /// R-57 之前界面各入口各自硬编码（`界面用户` 与 `管理员` 两种口径混杂），
+    /// 操作日志里同一个人的记录会显示成两个名字，无法按人筛选核对。
+    /// 现在所有写操作都从这里取，日志里的名字与顶栏身份徽标永远一致。
+    pub fn operator(&self) -> &'static str {
+        self.role.map(|r| r.label()).unwrap_or("未登录")
     }
 
     /// 当前身份能否查看操作日志。现阶段与写权限一致（管理员）；
@@ -1260,10 +1271,11 @@ impl App {
         }
         if retry_audit {
             if let Some((ok, _)) = self.login_audit_warn.clone() {
+                let op = self.operator();
                 match self
                     .db
                     .as_ref()
-                    .map(|c| ctp_app::auth::log_login(c, ok, "管理员"))
+                    .map(|c| ctp_app::auth::log_login(c, ok, op))
                 {
                     Some(Ok(())) => {
                         self.login_audit_warn = None;

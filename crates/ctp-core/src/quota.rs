@@ -33,13 +33,13 @@ impl PayLimit {
 ///
 /// 两条规则（业务方 2026-11-05 确认）：
 /// 1. **所有未交工合同**：累计付款不得超过有效计价基准的 80%；
-/// 2. **施工合同**：须已登记审计价、且交工日期距本次开单日期**严格超过 2 个自然年**，
+/// 2. **工程合同**：须已登记审计价、且交工日期距本次开单日期**严格超过 2 个自然年**，
 ///    才允许付到 100%；否则同样按 80% 封顶。
 ///
-/// 非施工合同只要登记了交工日期即可付清。
+/// 非工程合同只要登记了交工日期即可付清。
 pub fn pay_limit(contract: &Contract, base: Money, pay_date: &str) -> Result<PayLimit> {
     pay_limit_for(
-        contract.contract_type == ContractType::Construct,
+        contract.contract_type == ContractType::Engineering,
         contract.is_audited(),
         contract.delivery_date.as_deref(),
         base,
@@ -49,7 +49,7 @@ pub fn pay_limit(contract: &Contract, base: Money, pay_date: &str) -> Result<Pay
 
 /// 同 `pay_limit`，但不依赖 `Contract`——供视图行（`ContractSummary`）复用同一套口径。
 pub fn pay_limit_for(
-    is_construct: bool,
+    is_engineering: bool,
     is_audited: bool,
     delivery_date: Option<&str>,
     base: Money,
@@ -68,12 +68,12 @@ pub fn pay_limit_for(
         return capped("未登记交工日期，累计付款不得超过有效计价基准的 80%");
     };
 
-    if is_construct {
+    if is_engineering {
         if !is_audited {
-            return capped("施工合同未登记审计价，累计付款不得超过有效计价基准的 80%");
+            return capped("工程合同未登记审计价，累计付款不得超过有效计价基准的 80%");
         }
         if !date::years_elapsed_over(delivery, pay_date, SETTLE_YEARS) {
-            return capped("施工合同交工未满 2 年，累计付款不得超过有效计价基准的 80%");
+            return capped("工程合同交工未满 2 年，累计付款不得超过有效计价基准的 80%");
         }
     }
 
@@ -267,7 +267,7 @@ mod tests {
     use super::*;
     use crate::contract::{ContractStatus, ContractType};
 
-    /// 默认合同：非施工 + 已登记交工日期，不受付清条件封顶。
+    /// 默认合同：非工程类 + 已登记交工日期，不受付清条件封顶。
     /// 这样既有用例继续验证「基准 + 容差」的原始额度口径。
     fn contract(amount: i64, audit: Option<i64>) -> Contract {
         Contract {
@@ -275,7 +275,7 @@ mod tests {
             project_id: "PJ-1".into(),
             contract_no: "HT-2026-001".into(),
             contract_name: "测试合同".into(),
-            contract_type: ContractType::Supervise,
+            contract_type: ContractType::Service,
             contract_category_code: "FW".into(),
             party_a: "甲方".into(),
             contractor_id: "ORG-1".into(),
@@ -289,10 +289,10 @@ mod tests {
         }
     }
 
-    /// 施工合同：显式控制审计价与交工日期。
+    /// 工程合同：显式控制审计价与交工日期。
     fn construct(amount: i64, audit: Option<i64>, delivery: Option<&str>) -> Contract {
         Contract {
-            contract_type: ContractType::Construct,
+            contract_type: ContractType::Engineering,
             contract_category_code: "GC".into(),
             delivery_date: delivery.map(str::to_string),
             ..contract(amount, audit)
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn 非施工合同交工后即可付清() {
+    fn 非工程合同交工后即可付清() {
         let c = contract(1_000, None);
         let q = PaymentQuota::for_new_payment(&c, yuan(300), Rate::ZERO, PAY_DATE).unwrap();
         assert_eq!(q.cap_bp, 10_000);
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn 施工合同付清需审定且交工满两年() {
+    fn 工程合同付清需审定且交工满两年() {
         // 未审定 → 80%
         let c = construct(1_000, None, Some("2020-01-01"));
         let q = PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, PAY_DATE).unwrap();

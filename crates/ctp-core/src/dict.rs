@@ -17,6 +17,7 @@ pub const CONTRACT_CATEGORIES: &[(&str, &str)] = &[
     ("SB", "设备款"),
     ("CL", "材料款"),
     ("FW", "监理费"),
+    ("SJ", "设计费"),
     ("JC", "检测费"),
 ];
 
@@ -72,9 +73,11 @@ mod tests {
     }
 
     #[test]
-    fn 合同类别包含监理费与检测费() {
+    fn 合同类别包含监理费设计费与检测费() {
         assert_eq!(contract_category_name("FW"), Some("监理费"));
+        assert_eq!(contract_category_name("SJ"), Some("设计费"));
         assert_eq!(contract_category_name("JC"), Some("检测费"));
+        assert!(is_valid_contract_category("SJ"));
         assert!(is_valid_contract_category("JC"));
     }
 

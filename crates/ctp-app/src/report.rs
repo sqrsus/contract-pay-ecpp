@@ -72,9 +72,7 @@ impl ReportKind {
             ReportKind::SummaryContract => {
                 "按合同归集（只列区间内有拨款的合同），仅统计已实付单据（作废单不计）"
             }
-            ReportKind::SummaryContractType => {
-                "按合同类型归集（施工/监理/设计/勘察/货物/服务），仅统计已实付单据"
-            }
+            ReportKind::SummaryContractType => "按合同类型归集（工程/货物/服务），仅统计已实付单据",
             ReportKind::ContractLedger => "按合同汇总金额与支付进度（数据源 V1 视图）",
             ReportKind::PaymentLedger => "按合同列出拨款单，作废单保留记录、不计入合计",
         }

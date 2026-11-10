@@ -308,7 +308,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 } else {
                                                     p.text
                                                 };
-                                                let r = widgets::clipped_text(
+                                                let r = widgets::marquee_sense(
                                                     ui,
                                                     &cname,
                                                     (name_w - 22.0).max(20.0),
@@ -317,7 +317,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                     egui::Sense::click(),
                                                 )
                                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .on_hover_text("点击展开 / 收起该合同的拨款明细");
+                                                .on_hover_text(
+                                                    "点击展开 / 收起该合同的拨款明细；名称过长时悬停自动滚动",
+                                                );
                                                 if r.clicked() {
                                                     expand = Some(s.contract_id.clone());
                                                 }
@@ -328,13 +330,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             if !compact {
                                                 table_cell(ui, c_contractor, false, |ui| {
                                                     let contractor = text_of("contractor_name");
-                                                    widgets::clipped_text(
+                                                    widgets::marquee(
                                                         ui,
                                                         &contractor,
                                                         (c_contractor - 8.0).max(20.0),
                                                         12.0,
                                                         p.text_muted,
-                                                        egui::Sense::hover(),
                                                     );
                                                 });
                                                 table_cell(ui, c_amount, true, |ui| {
@@ -535,7 +536,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(Act::Activate) => {
             if let Some(id) = app.selected.clone() {
-                match app.exec(|conn| service::activate_contract(conn, &id, "界面用户")) {
+                let op = app.operator();
+                match app.exec(|conn| service::activate_contract(conn, &id, op)) {
                     Ok(c) => {
                         app.refresh();
                         app.select(&c.id);
@@ -757,14 +759,12 @@ fn expand_panel(
                                     );
                                 }
                                 "reason" => {
-                                    let w = ui.available_width().max(24.0);
-                                    widgets::clipped_text(
+                                    widgets::cell_marquee(
                                         ui,
                                         text.as_str(),
-                                        w,
                                         11.5,
                                         p.text_muted,
-                                        egui::Sense::hover(),
+                                        egui::Align::LEFT,
                                     );
                                 }
                                 "status" => {

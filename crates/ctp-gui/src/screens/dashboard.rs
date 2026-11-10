@@ -57,7 +57,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if widgets::primary_button(ui, &p, "载入演示数据", true).clicked() {
-                    match app.exec(|c| ctp_app::demo::seed_demo(c, "界面用户")) {
+                    let op = app.operator();
+                    match app.exec(|c| ctp_app::demo::seed_demo(c, op)) {
                         Ok(()) => {
                             app.refresh();
                             app.success("演示数据已载入");

@@ -571,7 +571,7 @@ pub struct ContractForm {
     pub retention: String,
     pub terms: String,
     pub remark: String,
-    /// 招标方式下拉索引：0 = 未选，1/2/3 对应公开招标/政府采购/直接发包。
+    /// 招标方式下拉索引：0/1/2 对应公开招标/政府采购/直接发包（R-57 去掉「未选」，默认 0）。
     pub bid_method_idx: usize,
     /// 开标时间（YYYY-MM-DD），选填。
     pub open_bid_date: String,
@@ -609,7 +609,7 @@ impl Default for ContractForm {
             retention: "3".into(),
             terms: "按月计量支付，进度款支付至已完工程量的 80%，竣工验收后支付至 97%，质保金 3% 满一年退还。".into(),
             remark: String::new(),
-            bid_method_idx: 1,
+            bid_method_idx: 0,
             open_bid_date: String::new(),
             project_leader: String::new(),
             contact_info: String::new(),
@@ -698,10 +698,11 @@ impl EditContractForm {
             Some(PricingMethod::CostPlus) => 3,
         };
         let bid_method_idx = match c.bid_method {
-            None => 0,
-            Some(BidMethod::Open) => 1,
-            Some(BidMethod::Government) => 2,
-            Some(BidMethod::Direct) => 3,
+            // R-57：下拉不再有「未选」；历史空值在修改窗里预选「公开招标」，
+            // 但只有用户点保存才会写库，详情页仍按实际值显示「—」。
+            None | Some(BidMethod::Open) => 0,
+            Some(BidMethod::Government) => 1,
+            Some(BidMethod::Direct) => 2,
         };
 
         Self {
@@ -807,21 +808,17 @@ pub struct AmountForm {
     pub reason: String,
 }
 
-const PAY_METHODS: [PayMethod; 4] = [
-    PayMethod::Transfer,
-    PayMethod::Acceptance,
-    PayMethod::Cash,
-    PayMethod::Other,
-];
+const PAY_METHODS: [PayMethod; 3] = [PayMethod::Transfer, PayMethod::Cash, PayMethod::Other];
 
-const CONTRACT_TYPES: [ContractType; 6] = [
-    ContractType::Construct,
-    ContractType::Supervise,
-    ContractType::Design,
-    ContractType::Survey,
-    ContractType::Supply,
-    ContractType::Service,
-];
+const CONTRACT_TYPES: [ContractType; 3] = ContractType::ALL;
+
+/// 招标方式下拉顺序（R-57 起没有「未选」，默认公开招标）。
+const BID_METHODS: [BidMethod; 3] = [BidMethod::Open, BidMethod::Government, BidMethod::Direct];
+
+/// 下拉索引 → 招标方式；越界一律按公开招标。
+fn bid_method_of(idx: usize) -> BidMethod {
+    BID_METHODS.get(idx).copied().unwrap_or(BidMethod::Open)
+}
 
 const PRICING: [&str; 4] = ["未填写", "总价", "单价", "成本加酬金"];
 
@@ -1714,7 +1711,6 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                     ui.vertical(|ui| {
                                         widgets::field_label(ui, &p, "招标方式");
                                         let bid_labels: Vec<String> = vec![
-                                            "（未选）".into(),
                                             "公开招标".into(),
                                             "政府采购".into(),
                                             "直接发包".into(),
@@ -2001,7 +1997,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         let ctype = CONTRACT_TYPES
             .get(f.ctype_idx)
             .copied()
-            .unwrap_or(ContractType::Construct);
+            .unwrap_or(ContractType::Engineering);
         let cat_code = dict::CONTRACT_CATEGORIES
             .get(f.category_idx)
             .map(|(c, _)| c.to_string())
@@ -2020,12 +2016,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         let delivery_date = opt(&f.delivery_date);
         let terms = f.terms.trim().to_string();
         let remark = opt(&f.remark);
-        let bid_method = match f.bid_method_idx {
-            1 => Some(BidMethod::Open),
-            2 => Some(BidMethod::Government),
-            3 => Some(BidMethod::Direct),
-            _ => None,
-        };
+        let bid_method = Some(bid_method_of(f.bid_method_idx));
         let open_bid_date = opt(&f.open_bid_date);
         let project_leader = opt(&f.project_leader);
         let contact_info = opt(&f.contact_info);
@@ -2037,6 +2028,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
             .map(|a| (a.kind, a.file_name.clone(), a.mime.clone(), a.bytes.clone()))
             .collect();
 
+        let op = app.operator();
         let created = app.exec(move |conn| {
             let c = service::create_contract(
                 conn,
@@ -2070,18 +2062,10 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                     contact_info,
                     bid_agent_text,
                 },
-                "界面用户",
+                op,
             )?;
             for (kind, fname, mime, bytes) in &atts {
-                service::save_attachment(
-                    conn,
-                    &c.id,
-                    *kind,
-                    fname,
-                    mime.as_deref(),
-                    bytes,
-                    "界面用户",
-                )?;
+                service::save_attachment(conn, &c.id, *kind, fname, mime.as_deref(), bytes, op)?;
             }
             Ok(c)
         });
@@ -2091,7 +2075,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                 let cid = c.id.clone();
                 let cno = c.contract_no.clone();
                 let act_err = if activate {
-                    app.exec(|conn| service::activate_contract(conn, &cid, "界面用户"))
+                    app.exec(|conn| service::activate_contract(conn, &cid, op))
                         .err()
                 } else {
                     None
@@ -2362,7 +2346,6 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                                 ui.vertical(|ui| {
                                     widgets::field_label(ui, &p, "招标方式");
                                     let labels: Vec<String> = vec![
-                                        "（未选）".into(),
                                         "公开招标".into(),
                                         "政府采购".into(),
                                         "直接发包".into(),
@@ -2457,7 +2440,7 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                     let ctype = CONTRACT_TYPES
                         .get(form.ctype_idx)
                         .copied()
-                        .unwrap_or(ContractType::Construct);
+                        .unwrap_or(ContractType::Engineering);
                     let cat_code = dict::CONTRACT_CATEGORIES
                         .get(form.category_idx)
                         .map(|(c, _)| c.to_string())
@@ -2468,12 +2451,7 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                         2 => Some(PricingMethod::UnitPrice),
                         _ => Some(PricingMethod::CostPlus),
                     };
-                    let bid_method = match form.bid_method_idx {
-                        1 => Some(BidMethod::Open),
-                        2 => Some(BidMethod::Government),
-                        3 => Some(BidMethod::Direct),
-                        _ => None,
-                    };
+                    let bid_method = Some(bid_method_of(form.bid_method_idx));
                     submit = Some((
                         EditContract {
                             contract_name: form.name.trim().to_string(),
@@ -2514,8 +2492,9 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
     if let Some((input, reason)) = submit {
         // 弹窗里要显示原因，但 reason 会被 move 进闭包，先留一份
         let reason_text = reason.clone();
+        let op = app.operator();
         match app.exec(move |conn| {
-            service::update_contract_master(conn, &contract_id, input, &reason, "界面用户")
+            service::update_contract_master(conn, &contract_id, input, &reason, op)
         }) {
             Ok(outcome) => {
                 app.dialog = Dialog::None;
@@ -2808,7 +2787,8 @@ fn delivery_date(app: &mut App, ctx: &egui::Context) {
     }
     if submit {
         let date = app.delivery_form.trim().to_string();
-        match app.exec(move |conn| service::set_delivery_date(conn, &cid, &date, "界面用户")) {
+        let op = app.operator();
+        match app.exec(move |conn| service::set_delivery_date(conn, &cid, &date, op)) {
             Ok(c) => {
                 app.refresh();
                 app.select(&c.id);
@@ -2933,17 +2913,9 @@ fn audit_price(app: &mut App, ctx: &egui::Context) {
             let org = opt(&app.audit_form.org);
             let report = opt(&app.audit_form.report_no);
             let reason = app.audit_form.reason.trim().to_string();
+            let op = app.operator();
             let res = app.exec(move |conn| {
-                service::register_audit_price(
-                    conn,
-                    &id,
-                    price,
-                    date,
-                    org,
-                    report,
-                    &reason,
-                    "界面用户",
-                )
+                service::register_audit_price(conn, &id, price, date, org, report, &reason, op)
             });
             match res {
                 Ok(c) => {
@@ -3040,9 +3012,9 @@ fn edit_amount(app: &mut App, ctx: &egui::Context) {
         if let Some(id) = id {
             let amount = Money::parse_yuan(&app.amount_form.amount).unwrap_or(Money::ZERO);
             let reason = app.amount_form.reason.trim().to_string();
-            let res = app.exec(move |conn| {
-                service::edit_contract_amount(conn, &id, amount, &reason, "界面用户")
-            });
+            let op = app.operator();
+            let res =
+                app.exec(move |conn| service::edit_contract_amount(conn, &id, amount, &reason, op));
             match res {
                 Ok(c) => {
                     app.refresh();
@@ -3948,6 +3920,7 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
         match pick_attachment(kind) {
             Ok(att) => {
                 let cid2 = cid.clone();
+                let op = app.operator();
                 let res = app.exec(move |conn| {
                     service::save_attachment(
                         conn,
@@ -3956,7 +3929,7 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
                         &att.file_name,
                         att.mime.as_deref(),
                         &att.bytes,
-                        "界面用户",
+                        op,
                     )
                 });
                 match res {
@@ -3976,7 +3949,8 @@ fn attachments(app: &mut App, ctx: &egui::Context) {
     if let Some(a) = op_del {
         let id = a.id.clone();
         let name = a.file_name.clone();
-        match app.exec(move |conn| service::delete_attachment(conn, &id, "界面用户")) {
+        let op = app.operator();
+        match app.exec(move |conn| service::delete_attachment(conn, &id, op)) {
             Ok(_) => {
                 app.reload_attachments();
                 app.success(format!("已删除 {name}"));
@@ -4045,16 +4019,17 @@ fn confirm_void(app: &mut App, ctx: &egui::Context) {
     if submit {
         let reason = app.confirm_reason.trim().to_string();
         let action = app.confirm.take();
+        let op = app.operator();
         let res = match action {
             Some(crate::Confirm::VoidPayment(pay)) => {
                 let id = pay.id.clone();
-                app.exec(move |conn| service::void_payment(conn, &id, &reason, "界面用户"))
+                app.exec(move |conn| service::void_payment(conn, &id, &reason, op))
                     .map(|_| format!("拨款单 {} 已作废", pay.payment_no))
             }
             Some(crate::Confirm::VoidContract(c)) => {
                 let id = c.id.clone();
                 let no = c.contract_no.clone();
-                app.exec(move |conn| service::void_contract(conn, &id, "界面用户"))
+                app.exec(move |conn| service::void_contract(conn, &id, op))
                     .map(|_| format!("合同 {no} 已作废"))
             }
             None => Ok(String::new()),
@@ -4123,6 +4098,17 @@ mod tests {
 
     fn pv(stage: PrintStage, msg: &str) -> PrintFailureView {
         classify_print_failure(stage, &PrintError::Print(msg.into()))
+    }
+
+    /// R-57：招标方式只剩三项，新建表单默认「公开招标」，越界索引也按公开招标兜底。
+    #[test]
+    fn 招标方式没有未选且默认公开招标() {
+        assert_eq!(bid_method_of(0), BidMethod::Open);
+        assert_eq!(bid_method_of(1), BidMethod::Government);
+        assert_eq!(bid_method_of(2), BidMethod::Direct);
+        assert_eq!(bid_method_of(9), BidMethod::Open, "越界不应退化成空值");
+        assert_eq!(ContractForm::default().bid_method_idx, 0);
+        assert_eq!(BID_METHODS.len(), 3);
     }
 
     #[test]

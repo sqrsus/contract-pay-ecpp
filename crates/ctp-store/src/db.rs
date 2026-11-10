@@ -50,6 +50,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     // 先补列、再建视图：视图会引用新增列，顺序反了存量库会报 no such column。
     migrate_contract_columns(conn)?;
     migrate_audit_log_columns(conn)?;
+    // 枚举收口要赶在建视图与首次读取之前：旧码一旦被 `from_code` 拒绝，
+    // 未迁移的行会让整个台账读取失败。
+    migrate_retired_enums(conn)?;
     {
         let tx = conn.transaction()?;
         // `CREATE VIEW IF NOT EXISTS` 不会覆盖已有视图定义；视图列变化时
@@ -136,6 +139,31 @@ fn migrate_audit_log_columns(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
     conn.execute_batch("ALTER TABLE sys_audit_log ADD COLUMN target_label TEXT")?;
+    Ok(())
+}
+
+/// R-57：合同类型与支付方式的枚举收口。
+///
+/// 枚举删除后 `from_code` 不再接受旧码，若库里仍留着旧值，`repo` 读取会直接报错、
+/// 整个台账打不开。因此这里做一次性改写（幂等）：
+///
+/// * `SUPERVISE / DESIGN / SURVEY` → `CONSTRUCT`（界面显示为「工程」）；
+/// * `ACCEPTANCE`（承兑）→ `TRANSFER`（转账）。
+///
+/// 存量库的 CHECK 约束是旧集合，对旧值只是「允许」而非「要求」，改写不需要重建表；
+/// 新库 DDL 已是新集合，两句 UPDATE 影响 0 行。
+fn migrate_retired_enums(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE ct_contract SET contract_type = 'CONSTRUCT' \
+         WHERE contract_type IN ('SUPERVISE','DESIGN','SURVEY')",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE pay_payment SET pay_method = 'TRANSFER' WHERE pay_method = 'ACCEPTANCE'",
+        [],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -399,5 +427,43 @@ mod tests {
             conn.execute_batch(&format!("SELECT * FROM {name} LIMIT 1"))
                 .unwrap_or_else(|e| panic!("视图 {name} 不可用：{e}"));
         }
+    }
+
+    /// R-57：新库的 CHECK 不再接受退场的枚举值。
+    ///
+    /// 存量库不会重建表（旧 CHECK 是「超集」，只是放行旧值），因此这里只校验新库；
+    /// 存量库的旧值由 `migrate_retired_enums` 一次性改写后，读取路径不会再遇到它们。
+    #[test]
+    fn 新库拒绝已退场的合同类型与支付方式() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let contract_ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ct_contract'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for retired in ["'SUPERVISE'", "'DESIGN'", "'SURVEY'"] {
+            assert!(
+                !contract_ddl.contains(retired),
+                "合同类型 CHECK 仍含 {retired}"
+            );
+        }
+        let payment_ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pay_payment'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !payment_ddl.contains("'ACCEPTANCE'"),
+            "支付方式 CHECK 仍含已退场的承兑"
+        );
+
+        // 迁移函数对全新库是幂等的空操作，连续跑两次不应报错
+        migrate_retired_enums(&mut conn).unwrap();
+        migrate_retired_enums(&mut conn).unwrap();
     }
 }

@@ -177,13 +177,14 @@ pub fn seed_demo(conn: &mut Connection, operator: &str) -> Result<()> {
     p.reason = Some("2026 年 6 月进度款".into());
     service::register_payment(conn, p, operator)?;
 
-    // 合同二：监理服务，已审定（审计价低于合同价），一笔拨款
+    // 合同二：监理服务（R-57 起合同类型只剩工程/货物/服务，该合同归入「服务」），
+    // 已审定（审计价低于合同价），一笔拨款
     let c2 = service::create_contract(
         conn,
         NewContract {
             project_id: "PJ-1".into(),
             contract_name: "道路工程施工监理服务".into(),
-            contract_type: ctp_core::contract::ContractType::Supervise,
+            contract_type: ctp_core::contract::ContractType::Service,
             contract_category_code: "FW".into(),
             category_id: Some("C04".into()),
             party_a: "某建设单位".into(),

@@ -137,7 +137,7 @@ pub fn write_template(
             &format!(
                 "只填后 4 列；前 5 列是导出时点的系统快照，导入时不采信。\
                  本次金额为 0 或留空的行跳过；开单日期留空按当天（YYYY-MM-DD）；\
-                 事由留空按「拨付进度款」；支付方式留空按转账，也可填 转账/承兑/现金/其他。\
+                 事由留空按「拨付进度款」；支付方式留空按转账，也可填 转账/现金/其他。\
                  导出时间 {generated_at}"
             ),
             &note_fmt,
@@ -296,17 +296,12 @@ fn cell_pay_method(row: &[calamine::Data], col: usize) -> std::result::Result<Pa
     if t.is_empty() {
         return Ok(PayMethod::Transfer);
     }
-    for m in [
-        PayMethod::Transfer,
-        PayMethod::Acceptance,
-        PayMethod::Cash,
-        PayMethod::Other,
-    ] {
+    for m in [PayMethod::Transfer, PayMethod::Cash, PayMethod::Other] {
         if t == m.label() || t.eq_ignore_ascii_case(m.code()) {
             return Ok(m);
         }
     }
-    Err(format!("支付方式「{t}」无法识别，可填 转账/承兑/现金/其他"))
+    Err(format!("支付方式「{t}」无法识别，可填 转账/现金/其他"))
 }
 
 /// 读取并导入。整张表先过校验标记，再逐行写入。
