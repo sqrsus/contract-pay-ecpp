@@ -445,11 +445,20 @@ fn 金额编辑留痕_已审定不改基准() {
     assert_eq!(c.effective_base().cent(), 90_000, "BR-14：已审定不改变基准");
     assert_eq!(c.audit_reduction().cent(), 20_000);
 
-    let hist = ctp_app::history::load(&conn, ctp_app::history::KEY_CONTRACT_AMOUNT).unwrap();
-    assert_eq!(hist.len(), 1);
-    assert_eq!(hist[0]["old_cent"], 100_000);
-    assert_eq!(hist[0]["new_cent"], 110_000);
-    assert_eq!(hist[0]["reason"], "设计变更增加工程量");
+    // R-68（C8）：金额变更历史进独立历史表（带合同归属），不再读全局 JSON 键
+    let hist: (i64, i64, i64, String) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(old_cent), MAX(new_cent), MAX(reason) \
+             FROM ct_contract_change_history \
+             WHERE contract_id = ?1 AND change_type = 'AMOUNT'",
+            [&cid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(hist.0, 1);
+    assert_eq!(hist.1, 100_000);
+    assert_eq!(hist.2, 110_000);
+    assert_eq!(hist.3, "设计变更增加工程量");
 }
 
 #[test]
@@ -1184,6 +1193,7 @@ fn 信息修改只动主档并写审计留痕() {
             project_leader: Some("张三".into()),
             contact_info: None,
             bid_agent_text: None,
+            confirm_type_change: false,
         },
         "合同名称笔误更正",
         "t",
@@ -1255,11 +1265,12 @@ fn 信息修改拒绝空原因与无改动() {
         retention_rate_bp: c.retention_rate_bp,
         payment_terms: c.payment_terms.clone(),
         remark: c.remark.clone(),
-        bid_method: c.bid_method,
+        bid_method: c.bid_method.clone(),
         open_bid_date: c.open_bid_date.clone(),
         project_leader: c.project_leader.clone(),
         contact_info: c.contact_info.clone(),
         bid_agent_text: None,
+        confirm_type_change: false,
     };
 
     let err = service::update_contract_master(&mut conn, &cid, same(), "   ", "t").unwrap_err();
@@ -1305,11 +1316,12 @@ fn edit_like(c: &ctp_core::contract::Contract, project_text: &str) -> EditContra
         retention_rate_bp: c.retention_rate_bp,
         payment_terms: c.payment_terms.clone(),
         remark: c.remark.clone(),
-        bid_method: c.bid_method,
+        bid_method: c.bid_method.clone(),
         open_bid_date: c.open_bid_date.clone(),
         project_leader: c.project_leader.clone(),
         contact_info: c.contact_info.clone(),
         bid_agent_text: None,
+        confirm_type_change: false,
     }
 }
 
@@ -1452,9 +1464,14 @@ fn 同值提交不写历史也不顶口径违例() {
     )
     .unwrap();
     let logs_before = action_count(&conn, "SET_AUDIT_PRICE");
-    let hist_before = ctp_app::history::load(&conn, ctp_app::history::KEY_AUDIT_PRICE)
-        .unwrap()
-        .len();
+    let hist_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ct_contract_change_history \
+             WHERE contract_id = ?1 AND change_type = 'AUDIT_PRICE'",
+            [&cid],
+            |r| r.get(0),
+        )
+        .unwrap();
     let err = service::register_audit_price(
         &mut conn,
         &cid,
@@ -1475,9 +1492,13 @@ fn 同值提交不写历史也不顶口径违例() {
         "同值不该多写一条日志"
     );
     assert_eq!(
-        ctp_app::history::load(&conn, ctp_app::history::KEY_AUDIT_PRICE)
-            .unwrap()
-            .len(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM ct_contract_change_history \
+             WHERE contract_id = ?1 AND change_type = 'AUDIT_PRICE'",
+            [&cid],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
         hist_before,
         "同值不该多写一条审计价历史"
     );
@@ -1691,4 +1712,320 @@ fn 替换附件后库文件回落且只留一条() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+// ==================== R-68 数据安全回归 ====================
+// 每条对应风险清单里的一个修复点：先构造「修复前会写坏数据」的场景，
+// 再断言被挡下 / 落库正确。
+
+/// C1：编辑金额不得低于累计已付，否则支付率倒挂、该合同此后再也付不出款。
+#[test]
+fn r68_金额编辑不得低于累计已付() {
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 800_000).unwrap();
+
+    let err = service::edit_contract_amount(
+        &mut conn,
+        &cid,
+        Money::from_cent(50_000_000),
+        "工程量核减",
+        "t",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.domain(),
+            Some(DomainError::AmountBelowFloor { floor, .. }) if *floor == 80_000_000
+        ),
+        "应报「金额低于下限」且下限=已付，实得 {err}"
+    );
+    assert_eq!(
+        repo::get_contract(&conn, &cid)
+            .unwrap()
+            .original_amount_cent
+            .cent(),
+        100_000_000,
+        "被拒的编辑不能改库"
+    );
+
+    // 恰好等于已付（正好付清）是允许的
+    service::edit_contract_amount(
+        &mut conn,
+        &cid,
+        Money::from_cent(80_000_000),
+        "按实结算",
+        "t",
+    )
+    .unwrap();
+}
+
+/// C1：审计价同样是下限，低于审定结论会与结算口径冲突。
+#[test]
+fn r68_金额编辑不得低于审计价() {
+    let (mut conn, cid) = fixture(1_000_000);
+    service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(90_000_000)),
+        Some("2026-06-01".into()),
+        Some("审计局".into()),
+        Some("RPT-1".into()),
+        "结算审定",
+        "t",
+    )
+    .unwrap();
+
+    let err =
+        service::edit_contract_amount(&mut conn, &cid, Money::from_cent(85_000_000), "下调", "t")
+            .unwrap_err();
+    assert!(
+        matches!(
+            err.domain(),
+            Some(DomainError::AmountBelowFloor { floor, .. }) if *floor == 90_000_000
+        ),
+        "下限应取审计价，实得 {err}"
+    );
+}
+
+/// C2：作废合同不得再改任何计价类字段（此前只有金额 / 交工日期有守卫）。
+#[test]
+fn r68_作废合同拒绝一切计价类变更() {
+    let (mut conn, cid) = fixture(1_000_000);
+    service::void_contract(&mut conn, &cid, "t").unwrap();
+
+    let cases = [
+        (
+            "合同金额",
+            service::edit_contract_amount(
+                &mut conn,
+                &cid,
+                Money::from_cent(90_000_000),
+                "复核",
+                "t",
+            )
+            .unwrap_err(),
+        ),
+        (
+            "审计价",
+            service::register_audit_price(
+                &mut conn,
+                &cid,
+                Some(Money::from_cent(90_000_000)),
+                None,
+                None,
+                None,
+                "复核",
+                "t",
+            )
+            .unwrap_err(),
+        ),
+        (
+            "交工日期",
+            service::set_delivery_date(&mut conn, &cid, "2026-06-01", "t").unwrap_err(),
+        ),
+    ];
+    for (tag, err) in cases {
+        assert!(
+            matches!(err.domain(), Some(DomainError::IllegalState(_))),
+            "{tag} 应被作废守卫拦下，实得 {err}"
+        );
+    }
+    let c = repo::get_contract(&conn, &cid).unwrap();
+    assert_eq!(c.original_amount_cent.cent(), 100_000_000);
+    assert!(c.audit_price().is_none(), "审计价不能被写进作废合同");
+}
+
+/// C9：合同类型决定封顶规则，变更必须二次确认且首次不得落库。
+#[test]
+fn r68_合同类型变更必须二次确认() {
+    use ctp_core::contract::ContractType;
+    let (mut conn, cid) = fixture(1_000_000);
+    let c = repo::get_contract(&conn, &cid).unwrap();
+    assert_eq!(c.contract_type, ContractType::Service);
+    let mut input = edit_like(&c, "XAJT");
+    input.contract_type = ContractType::Engineering;
+
+    let err = service::update_contract_master(&mut conn, &cid, input.clone(), "类型纠正", "t")
+        .unwrap_err();
+    assert!(
+        matches!(err.domain(), Some(DomainError::NeedConfirm(_))),
+        "首次提交应要求确认，实得 {err}"
+    );
+    assert_eq!(
+        repo::get_contract(&conn, &cid).unwrap().contract_type,
+        ContractType::Service,
+        "未确认不该落库"
+    );
+
+    input.confirm_type_change = true;
+    let edited = service::update_contract_master(&mut conn, &cid, input, "类型纠正", "t").unwrap();
+    assert_eq!(edited.contract.contract_type, ContractType::Engineering);
+}
+
+/// C11：合同改项目后，拨款归集跟着合同的当前项目走，不再停在签约快照。
+#[test]
+fn r68_拨款归集按合同当前项目() {
+    let (mut conn, cid) = fixture(1_000_000);
+    add_project(&conn, "PJ-2", "PRJ-2026-002", "另一个项目");
+    pay(&mut conn, &cid, 100_000).unwrap();
+    let c = repo::get_contract(&conn, &cid).unwrap();
+    service::update_contract_master(
+        &mut conn,
+        &cid,
+        edit_like(&c, "另一个项目"),
+        "项目调整",
+        "t",
+    )
+    .unwrap();
+
+    for (view, label) in [
+        ("v_payment_period", "期间统计"),
+        ("v_payment_ledger", "拨款台账"),
+    ] {
+        let pid: String = conn
+            .query_row(&format!("SELECT project_id FROM {view} LIMIT 1"), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pid, "PJ-2", "{label} 不该停在签约时的旧项目 PJ-1");
+    }
+}
+
+/// C12：作废合同仍在台账里看得见，但不进合计，且合计行 / 副标题写明口径。
+#[test]
+fn r68_台账合计排除作废合同并标注() {
+    let mut conn = db::open_in_memory().unwrap();
+    db::migrate(&mut conn).unwrap();
+    ctp_store::seed::seed_reference(&conn, "t").unwrap();
+    project_and_org(&conn);
+
+    let mut ids = Vec::new();
+    for name in ["正常合同", "作废合同"] {
+        let c = service::create_contract(
+            &mut conn,
+            NewContract {
+                project_id: "PJ-1".into(),
+                contract_name: name.into(),
+                contract_type: ctp_core::contract::ContractType::Service,
+                contract_category_code: "FW".into(),
+                category_id: Some("C04".into()),
+                party_a: "某建设单位".into(),
+                contractor_id: "ORG-1".into(),
+                sign_date: "2026-01-10".into(),
+                original_amount: Money::from_cent(10_000_000),
+                payment_terms: "按月计量".into(),
+                ..Default::default()
+            },
+            "t",
+        )
+        .unwrap();
+        ids.push(c.id);
+    }
+    service::void_contract(&mut conn, &ids[1], "t").unwrap();
+
+    let rows = repo::summaries(&conn).unwrap();
+    assert_eq!(rows.len(), 2, "作废合同仍要在台账里看得见");
+    let r =
+        ctp_app::report::ReportResult::contract_ledger(&rows, ctp_app::report::LedgerColumns::FULL);
+    assert_eq!(r.totals[0].display(), "合计（不含作废 1 份）");
+    assert!(
+        r.subtitle.contains("合计不含作废 1 份"),
+        "导出副标题要说明口径：{}",
+        r.subtitle
+    );
+    // 金额合计只累加未作废的那一份（10_000_000 分 = 100,000 元）
+    assert!(
+        r.totals[3].display().contains("100,000"),
+        "两份都算会变成 200,000：{}",
+        r.totals[3].display()
+    );
+}
+
+/// #5：附件替换走 upsert（主键不变），审计日志必须指向真实存在的那条记录。
+#[test]
+fn r68_附件替换日志不指向幽灵id() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let saved = service::save_attachment(
+        &mut conn,
+        &cid,
+        AttachmentKind::Contract,
+        "合同正本-更名.pdf",
+        Some("application/pdf"),
+        b"%PDF-1.4 replaced",
+        "t",
+    )
+    .unwrap();
+
+    let logged_id: String = conn
+        .query_row(
+            "SELECT target_id FROM sys_audit_log \
+             WHERE action='UPSERT' AND target_type='ct_contract_attachment' \
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(logged_id, saved.id, "日志 id 必须是 upsert 后的真实主键");
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ct_contract_attachment WHERE id=?1",
+            [&saved.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "日志指向的附件必须真实存在");
+}
+
+/// C15：作废最后一笔已付后合同回退「生效」；通用「生效」入口不得被反向放行。
+#[test]
+fn r68_作废最后一笔后状态回退且不可重复生效() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let p = pay(&mut conn, &cid, 100_000).unwrap();
+    assert_eq!(
+        repo::get_contract(&conn, &cid).unwrap().status,
+        ContractStatus::Performing
+    );
+    assert!(
+        service::activate_contract(&mut conn, &cid, "t").is_err(),
+        "履行中合同不能被通用生效入口反向放行"
+    );
+
+    service::void_payment(&mut conn, &p.id, "登记有误", "t").unwrap();
+    assert_eq!(
+        repo::get_contract(&conn, &cid).unwrap().status,
+        ContractStatus::Active,
+        "已付清零应回退生效"
+    );
+    pay(&mut conn, &cid, 50_000).unwrap();
+    assert_eq!(
+        repo::get_contract(&conn, &cid).unwrap().status,
+        ContractStatus::Performing,
+        "重新付款应再次推进履行中"
+    );
+}
+
+/// C8：变更历史按合同隔离，不再挤在全局 50 条上限的 JSON 数组里。
+#[test]
+fn r68_变更历史按合同分表且带前后值() {
+    let (mut conn, cid) = fixture(1_000_000);
+    for (cent, reason) in [(110_000_000, "变更一"), (120_000_000, "变更二")] {
+        service::edit_contract_amount(&mut conn, &cid, Money::from_cent(cent), reason, "t")
+            .unwrap();
+    }
+    let (n, old, new): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(old_cent), MAX(new_cent) FROM ct_contract_change_history \
+             WHERE contract_id=?1 AND change_type='AMOUNT'",
+            [&cid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "两条变更都要留在本合同名下");
+    assert_eq!(old, 100_000_000);
+    assert_eq!(new, 120_000_000);
+    let legacy = ctp_app::history::load(&conn, ctp_app::history::KEY_CONTRACT_AMOUNT).unwrap();
+    assert!(
+        legacy.is_empty(),
+        "新变更不应再写全局 JSON 数组（旧键仅保留兼容读）"
+    );
 }

@@ -60,6 +60,19 @@ impl LogFilter {
             self.keyword.trim().to_string(),
         ]
     }
+
+    /// 四个条件全空 = 「全部清理」（R-68 / C14：只有这种情况受保底条数约束）。
+    pub fn is_empty(&self) -> bool {
+        self.from.trim().is_empty()
+            && self.to.trim().is_empty()
+            && self
+                .action
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self.keyword.trim().is_empty()
+    }
 }
 
 const SELECT_COLS: &str = "id, target_type, target_id, target_label, action, detail, operator_id, \
@@ -125,11 +138,33 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+/// 「全部清理」至少保留的最近条数（R-68 / C14-A）。
+///
+/// 全删不可恢复，误触一次就把审计链清零；按条件清理不受此限
+/// （用户明确指定了范围），只有「全部清理」兜住最近这么多条。
+pub const AUDIT_KEEP_MIN: usize = 200;
+
 /// 删除符合条件的日志，返回删除条数。
-pub fn clear(conn: &Connection, f: &LogFilter) -> Result<usize> {
-    let sql = format!("DELETE FROM sys_audit_log {}", LogFilter::where_clause());
+///
+/// `keep_recent_min = true`（全部清理）时，按日志 id 序保留最近
+/// [`AUDIT_KEEP_MIN`] 条不删——id 形如 LOG-{毫秒}-{序号}，固定宽度使
+/// 字典序即时间序，与 `db::insert_audit_log` 的裁剪口径一致。
+pub fn clear(conn: &Connection, f: &LogFilter, keep_recent_min: bool) -> Result<usize> {
     let p = f.params();
-    let n = conn.execute(&sql, rusqlite::params![p[0], p[1], p[2], p[3]])?;
+    let n = if keep_recent_min {
+        let sql = format!(
+            "DELETE FROM sys_audit_log {} \
+             AND id NOT IN (SELECT id FROM sys_audit_log ORDER BY id DESC LIMIT ?5)",
+            LogFilter::where_clause()
+        );
+        conn.execute(
+            &sql,
+            rusqlite::params![p[0], p[1], p[2], p[3], AUDIT_KEEP_MIN as i64],
+        )?
+    } else {
+        let sql = format!("DELETE FROM sys_audit_log {}", LogFilter::where_clause());
+        conn.execute(&sql, rusqlite::params![p[0], p[1], p[2], p[3]])?
+    };
     Ok(n)
 }
 
@@ -211,8 +246,32 @@ mod tests {
             action: Some("VOID".into()),
             ..Default::default()
         };
-        assert_eq!(clear(&conn, &f).unwrap(), 1);
+        assert_eq!(clear(&conn, &f, false).unwrap(), 1);
         assert_eq!(total(&conn).unwrap(), 1);
         assert_eq!(actions(&conn).unwrap(), vec!["CREATE".to_string()]);
+    }
+
+    /// R-68（C14）：全部清理保底保留最近 200 条，按条件清理不受限。
+    #[test]
+    fn 全部清理保留最近两百条() {
+        let conn = fixture();
+        for i in 0..205 {
+            add(&conn, "HT-001", "CREATE", &format!("第 {i} 条"));
+        }
+        // 按条件清理（指定类型）不受保底约束，应全删命中行
+        let f = LogFilter {
+            action: Some("CREATE".into()),
+            ..Default::default()
+        };
+        assert_eq!(clear(&conn, &f, false).unwrap(), 205);
+        for i in 0..205 {
+            add(&conn, "HT-001", "CREATE", &format!("第 {i} 条"));
+        }
+        // 全部清理（keep_recent_min）保留最近 200 条
+        assert_eq!(clear(&conn, &LogFilter::default(), true).unwrap(), 5);
+        assert_eq!(total(&conn).unwrap(), 200);
+        // 留下的是最新的那些（detail 带行号，按 id 序倒排取第一条）
+        let rows = list(&conn, &LogFilter::default(), 1).unwrap();
+        assert_eq!(rows[0].detail.as_deref(), Some("第 204 条"));
     }
 }

@@ -12,10 +12,11 @@
 //! 失败的行跳过并记下行号，成功的行已经落库——按 2026-11-06 确认的口径。
 
 use crate::service::{self, NewPayment};
-use ctp_core::date::{is_iso_date, today_iso};
+use ctp_core::date::{is_iso_date, today_local_iso};
+use ctp_core::ids;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
-use ctp_store::{repo, Result, StoreError};
+use ctp_store::{db, repo, Result, StoreError};
 use rusqlite::Connection;
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
 use std::collections::HashMap;
@@ -408,9 +409,9 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
             }
             let amount = cell_money(row, 5)?;
             let date_raw = cell(row, 6);
-            // 留空按当天（R-33）；其余仍必须是合法 ISO 日期
+            // 留空按当天（R-33，东八区口径 R-68 / C6）；其余仍必须是合法 ISO 日期
             let date = if date_raw.is_empty() {
-                today_iso()
+                today_local_iso()
             } else {
                 date_raw
             };
@@ -437,6 +438,30 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
             Err(message) => report.failures.push(ImportFailure { line, message }),
         }
     }
+
+    // R-68（#14）：整批导入留一条批次日志——批次号 + 文件名 + 结果统计。
+    // 逐行写入只有 CREATE / REGISTER 日志，缺一条「这批是同一次导入」的归属；
+    // 有了批次号，重传 / 回溯 / 对账都能按批定位。留痕失败不影响导入结果。
+    let batch_no = ids::new_id("IMP");
+    let file_label = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = db::insert_audit_log(
+        conn,
+        "import",
+        &batch_no,
+        Some(&file_label),
+        "IMPORT",
+        Some(&format!(
+            "批次 {batch_no}｜批量拨款导入｜成功 {} 行，跳过 {} 行，失败 {} 行｜{}",
+            report.imported,
+            report.skipped,
+            report.failures.len(),
+            path.display()
+        )),
+        operator,
+    );
 
     Ok(report)
 }
@@ -569,7 +594,7 @@ mod tests {
         assert_eq!(report.skipped, 1, "金额为 0 的行跳过且不算失败");
         assert!(report.failures.is_empty(), "{:?}", report.failures);
 
-        let today = today_iso();
+        let today = today_local_iso();
         let p = repo::list_payments(&conn, None)
             .unwrap()
             .into_iter()

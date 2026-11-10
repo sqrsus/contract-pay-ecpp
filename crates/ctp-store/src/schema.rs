@@ -15,13 +15,21 @@
 //! 本期建表 13 张 + 视图 4 个；文档目标态为 21 张，其余随移出模块或二期补建。
 
 /// 结构版本，写入 `PRAGMA user_version` 的伴生元数据键 `schema_version`。
-pub const SCHEMA_VERSION: &str = "1.6.0-rv26";
+///
+/// R-68 起版本守卫：库内版本**新于**本常量时 `migrate` 拒绝执行（旧程序开新库
+/// 只读不动结构）；版本相同则跳过建表 / 重建视图，避免多实例互相打断；
+/// 版本较旧才执行迁移并回写新版本号。
+pub const SCHEMA_VERSION: &str = "1.6.0-rv27";
 
 /// 计入「已付净额」的单据状态（**唯一口径**，视图与仓储共用）。
 pub const PAID_STATUS_SQL: &str = "'PAID'";
 
 /// DB-06 豁免清单：追加型日志表不要求 `updated_*` 与 `version`。
-pub const AUDIT_COLUMN_EXEMPT: &[&str] = &["sys_audit_log"];
+///
+/// R-68（C8）：`ct_contract_change_history` 与 `sys_audit_log` 同为「只插不改」
+/// 的事件表，一行就是一次历史变更，没有「更新」和「并发版本」的语义；
+/// 强行塞 `version` 反而会让人误以为记录可改。
+pub const AUDIT_COLUMN_EXEMPT: &[&str] = &["sys_audit_log", "ct_contract_change_history"];
 
 /// 已付净额子查询。`contract_col` 为合同列名（子查询内固定把 `pay_payment` 别名成 `pm`，
 /// 故传 `"pm.contract_id"`）。
@@ -36,12 +44,25 @@ pub fn paid_net_subquery(contract_col: &str) -> String {
 /// 支付比率的 SQL 表达式，与 `Rate::ratio` 逐位一致：
 /// 展开 `(n*2 ± d)/(d*2)` 得 `(numer*20000 ± denom) / (denom*2)`。
 /// **`*2` 必须在分母里**——评审 H1 的原始缺陷就是写成了「除完再乘 2」。
+///
+/// R-68（#16）：`numer * 20000` 在 i64 下溢出时 SQLite 会把整个表达式转成 REAL，
+/// `Rate::from_bp(i32)` 随即转换失败、**整张台账打不开**。这里加前置闸门：
+/// 超过安全乘积上限的病态比率（倒挂数百倍）直接钳到 `i32` 可表示的封顶值，
+/// 保住「表能打开」，具体哪份合同倒挂由 `is_inverted` 列另行标出。
 pub fn rate_bp_expr(numer: &str, denom: &str) -> String {
+    // i64::MAX / 20000 ≈ 4.6e14，留一档余量
+    const SAFE_NUMER: i64 = 400_000_000_000_000;
+    // 封顶值：2,000,000,000 bp = 2 万倍，远超任何真实支付率，仍在 i32 范围内
+    const CAPPED_BP: i64 = 2_000_000_000;
     format!(
         "CASE WHEN {denom} > 0 \
-         THEN CASE WHEN {numer} >= 0 \
-              THEN ({numer} * 20000 + {denom}) / ({denom} * 2) \
-              ELSE ({numer} * 20000 - {denom}) / ({denom} * 2) END \
+         THEN CASE \
+              WHEN {numer} > {SAFE_NUMER} THEN {CAPPED_BP} \
+              WHEN {numer} < -{SAFE_NUMER} THEN -{CAPPED_BP} \
+              ELSE CASE WHEN {numer} >= 0 \
+                   THEN ({numer} * 20000 + {denom}) / ({denom} * 2) \
+                   ELSE ({numer} * 20000 - {denom}) / ({denom} * 2) END \
+              END \
          ELSE 0 END"
     )
 }
@@ -69,6 +90,7 @@ pub fn table_statements() -> Vec<(&'static str, &'static str)> {
         ("ct_contract", CT_CONTRACT),
         ("ct_contract_item", CT_CONTRACT_ITEM),
         ("ct_contract_attachment", CT_CONTRACT_ATTACHMENT),
+        ("ct_contract_change_history", CT_CONTRACT_CHANGE_HISTORY),
         ("pay_payment", PAY_PAYMENT),
     ]
 }
@@ -88,6 +110,11 @@ pub fn index_statements() -> Vec<&'static str> {
         "CREATE INDEX IF NOT EXISTS ix_ct_item_category ON ct_contract_item(category_id)",
         // 每类附件只允许一份：唯一索引兜底，界面替换时走 UPDATE 而非新增
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_attachment_kind ON ct_contract_attachment(contract_id, att_type)",
+        // R-68（C10）：单位名唯一（仅对未删除行生效）。自动建档是「先查后插」，
+        // 没有约束时并发 / 双实例会建出同名档案且系统无合并入口。
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_contractor_name ON org_contractor(contractor_name) WHERE is_deleted = 0",
+        // R-68（C8）：按合同查变更历史
+        "CREATE INDEX IF NOT EXISTS ix_change_history_contract ON ct_contract_change_history(contract_id, created_at)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_no ON pay_payment(payment_no) WHERE is_deleted = 0",
         "CREATE INDEX IF NOT EXISTS ix_payment_date ON pay_payment(pay_date, status)",
         "CREATE INDEX IF NOT EXISTS ix_payment_contract ON pay_payment(contract_id, pay_date)",
@@ -335,8 +362,30 @@ CREATE TABLE IF NOT EXISTS ct_contract_attachment (
 )
 "#;
 
+/// 合同变更历史（R-68 / C8）。
+///
+/// 取代 `sys_meta` 里的全局 JSON 数组（`contract_amount_history` /
+/// `audit_price_history`）：那两个键**跨合同共享 50 条上限**且条目不带合同 id，
+/// 合同一多先变更的记录就被挤掉，审计链断开。这里一行一条、带合同外键与索引，
+/// 保留期不再共享。旧 JSON 键保留只读，迁移时能归属到合同的操作日志记录
+/// 会被搬进来（以日志 id 作主键，天然幂等）。
+const CT_CONTRACT_CHANGE_HISTORY: &str = r#"
+CREATE TABLE IF NOT EXISTS ct_contract_change_history (
+    id           TEXT PRIMARY KEY,
+    contract_id  TEXT NOT NULL REFERENCES ct_contract(id) ON DELETE CASCADE,
+    change_type  TEXT NOT NULL CHECK (change_type IN ('AMOUNT','AUDIT_PRICE')),
+    old_cent     INTEGER,
+    new_cent     INTEGER,
+    reason       TEXT,
+    operator_id  TEXT,
+    created_at   TEXT NOT NULL
+)
+"#;
+
 /// 拨款单（本期唯一支付表）。
 /// 评审 H3：无 `application_id`；评审 H5：无 `reversal_of`，`status ∈ ('PAID','VOID')`。
+/// R-68（C13-B）：`print_count` 列移除——全库从无自增入口、恒为 0，留着只会
+/// 在验收时被当成缺陷；存量库由 `migrate_drop_retired_columns` 一并 DROP。
 const PAY_PAYMENT: &str = r#"
 CREATE TABLE IF NOT EXISTS pay_payment (
     id              TEXT PRIMARY KEY,
@@ -356,7 +405,6 @@ CREATE TABLE IF NOT EXISTS pay_payment (
     receive_account TEXT,
     status          TEXT NOT NULL DEFAULT 'PAID' CHECK (status IN ('PAID','VOID')),
     operator_id     TEXT NOT NULL,
-    print_count     INTEGER NOT NULL DEFAULT 0 CHECK (print_count >= 0),
     remark          TEXT,
     is_deleted      INTEGER NOT NULL DEFAULT 0 CHECK (is_deleted IN (0,1)),
     created_at      TEXT NOT NULL,
@@ -415,6 +463,10 @@ WHERE c.is_deleted = 0
     let v2 = r#"
 CREATE VIEW IF NOT EXISTS v_payment_ledger AS
 SELECT
+    -- R-68（C11）：项目一律取合同的**当前**项目（c.project_id），
+    -- 不用单据上的签约快照 pm.project_id——合同改项目后两处口径会打架。
+    -- 同时把 project_id 暴露成列，按项目过滤不再依赖不存在的隐式列。
+    c.project_id           AS project_id,
     pm.pay_date            AS pay_date,
     pm.payment_no          AS payment_no,
     pm.status              AS payment_status,
@@ -435,7 +487,7 @@ SELECT
     cs.pay_rate_bp         AS pay_rate_bp
 FROM pay_payment pm
 JOIN ct_contract c       ON c.id = pm.contract_id
-JOIN prj_project pj      ON pj.id = pm.project_id
+JOIN prj_project pj      ON pj.id = c.project_id
 JOIN org_contractor o    ON o.id = c.contractor_id
 LEFT JOIN ct_category cat ON cat.id = c.category_id
 LEFT JOIN v_contract_summary cs ON cs.contract_id = c.id
@@ -511,13 +563,15 @@ LEFT JOIN paid ON paid.project_id = amt.project_id AND paid.category_id = amt.ca
         r#"
 CREATE VIEW IF NOT EXISTS v_payment_period AS
 SELECT
-    pm.project_id                      AS project_id,
+    -- R-68（C11）：期间归集同样按合同当前项目，与 v_payment_ledger 同口径
+    c.project_id                      AS project_id,
     substr(pm.pay_date, 1, 7)          AS period_month,
     COUNT(*)                           AS payment_count,
     SUM(pm.amount_cent)                AS amount_cent
 FROM pay_payment pm
+JOIN ct_contract c ON c.id = pm.contract_id
 WHERE pm.is_deleted = 0 AND pm.status IN ({paid_status})
-GROUP BY pm.project_id, substr(pm.pay_date, 1, 7)
+GROUP BY c.project_id, substr(pm.pay_date, 1, 7)
 "#,
         paid_status = PAID_STATUS_SQL
     );

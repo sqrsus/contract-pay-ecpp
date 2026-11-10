@@ -230,6 +230,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         let mut cancel = false;
         let mut submit = false;
         let n = app.read(|c| logs::count(c, &filter)).unwrap_or(0);
+        // R-68（C14）：「全部清理」双保险——须输入确认词「清空」；且服务层
+        // 会保底保留最近 200 条，这里提前告知用户。
+        let is_clear_all = filter.is_empty();
+        let word_ok = !is_clear_all || app.log_clear_word.trim() == "清空";
         egui::Window::new("确认清理日志")
             .collapsible(false)
             .resizable(false)
@@ -251,10 +255,38 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new(format!("将删除 {n} 条日志，删除后不可恢复。"))
-                        .size(12.5)
-                        .color(if n > 0 { p.danger } else { p.text_muted }),
+                    RichText::new(format!(
+                        "将删除 {n} 条日志，删除后不可恢复。{}",
+                        if is_clear_all {
+                            "系统会保底保留最近 200 条及本条清理留痕。"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .size(12.5)
+                    .color(if n > 0 { p.danger } else { p.text_muted }),
                 );
+                if is_clear_all {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "「全部清理」影响面大，请输入「清空」二字确认（已输入：{}）",
+                            if app.log_clear_word.trim().is_empty() {
+                                "—"
+                            } else {
+                                app.log_clear_word.trim()
+                            }
+                        ))
+                        .size(11.5)
+                        .color(p.text_muted),
+                    );
+                    ui.add_sized(
+                        [ui.available_width(), 26.0],
+                        egui::TextEdit::singleline(&mut app.log_clear_word)
+                            .hint_text("输入：清空")
+                            .margin(egui::Margin::symmetric(8.0, 4.0)),
+                    );
+                }
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("清理完成后会自动留一条「清理日志」记录，写明范围与条数。")
@@ -263,7 +295,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if widgets::danger_solid_button(ui, &p, "确认清理", n > 0).clicked() {
+                    if widgets::danger_solid_button(ui, &p, "确认清理", n > 0 && word_ok).clicked()
+                        && n > 0
+                        && word_ok
+                    {
                         submit = true;
                     }
                     if widgets::ghost_button(ui, &p, "取消").clicked() {
@@ -273,9 +308,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             });
         if cancel {
             app.log_clear = None;
+            app.log_clear_word.clear();
         }
         if submit && n > 0 {
             app.log_clear = None;
+            app.log_clear_word.clear();
             let op = app.operator();
             match app.exec(move |c| logs::clear(c, &filter, op)) {
                 Ok(n) => {

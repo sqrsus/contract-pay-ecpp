@@ -140,8 +140,22 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 }
 
 /// 今天（UTC），`YYYY-MM-DD`。
+///
+/// 只用于与 [`now_iso`] 同口径的场合（审计、内部键）。**业务默认日期**
+/// （签订日默认值、开单日默认值、报表区间上界）一律用 [`today_local_iso`]，
+/// 否则东八区每天 0:00–8:00 录入的默认日期会少一天。
 pub fn today_iso() -> String {
     let secs = unix_secs();
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 今天（东八区），`YYYY-MM-DD`：业务默认日期的唯一口径（R-68 / C6）。
+///
+/// 固定 +8 而非读系统时区：单机账目跨机器迁移时口径不能漂移，
+/// 且与操作日志 `datetime(created_at, '+8 hours')` 的换算一致。
+pub fn today_local_iso() -> String {
+    let secs = unix_secs() + LOCAL_OFFSET_SECS;
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     format!("{y:04}-{m:02}-{d:02}")
 }
@@ -211,6 +225,15 @@ mod tests {
         assert!(is_iso_date(&t), "today_iso 输出不合法: {t}");
         assert_eq!(period_of("2026-11-04"), "2026-11");
         assert_eq!(now_iso().len(), 20);
+    }
+
+    /// R-68（C6）：业务默认日期用东八区；本地日期只能是同一天或比 UTC 大一天。
+    #[test]
+    fn 本地今天不早于_utc_今天() {
+        let local = today_local_iso();
+        let utc = today_iso();
+        assert!(is_iso_date(&local));
+        assert!(local >= utc, "本地 {local} 应 ≥ UTC {utc}");
     }
 
     #[test]

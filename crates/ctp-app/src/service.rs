@@ -1,7 +1,6 @@
-use crate::history;
 use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::{BidMethod, Contract, ContractStatus, ContractType, PricingMethod};
-use ctp_core::date::{now_iso, validate_iso_date};
+use ctp_core::date::{now_iso, today_local_iso, validate_iso_date};
 use ctp_core::dict;
 use ctp_core::digest;
 use ctp_core::error::DomainError;
@@ -75,7 +74,7 @@ impl Default for NewContract {
             project_text: None,
             contractor_text: None,
             building_id: None,
-            sign_date: ctp_core::date::today_iso(),
+            sign_date: today_local_iso(),
             original_amount: Money::ZERO,
             duration_days: 0,
             planned_start: None,
@@ -127,6 +126,11 @@ pub struct EditContract {
     pub contact_info: Option<String>,
     /// 招标代理名称：空表示清空代理关系
     pub bid_agent_text: Option<String>,
+    /// 合同类型变更的二次确认（R-68）。
+    ///
+    /// 类型决定付清条件与 80% 封顶规则，静默改类型可能让历史付款瞬间「超付」。
+    /// 首次提交传 `false`，服务层返回 `NeedConfirm`；界面弹框确认后带 `true` 重交。
+    pub confirm_type_change: bool,
 }
 
 /// 拨款单登记入参（FR-PAY-06，单级登记、无申请单）。
@@ -444,14 +448,27 @@ pub fn create_contract(
         .transpose()?;
 
     let year = year_of(&input.sign_date);
-    let seq = db::next_sequence(&tx, &format!("contract_no:{year}"))?;
-    let contract_no = ids::contract_no(&year, seq);
-
-    if repo::find_contract_by_no(&tx, &contract_no)?.is_some() {
-        return Err(StoreError::Inconsistent(format!(
-            "合同编号 {contract_no} 已存在（编号唯一约束）"
-        )));
-    }
+    // R-68（C7）：取号撞号时跳过重取，而不是报错回滚。
+    // 取号在事务内自增，事务因别的原因回滚后序号不前进；若库里已有同号合同
+    // （备份恢复、历史手工补录），直接报错会让「下一个号」永远发不出去。
+    // 启动时的 `calibrate_sequences` 已按库内最大编号校准过序号表，
+    // 这里再兜一层：连续撞号 5 次仍失败才认定为数据异常。
+    let (seq, contract_no) = {
+        let mut got = None;
+        for _ in 0..5 {
+            let s = db::next_sequence(&tx, &format!("contract_no:{year}"))?;
+            let no = ids::contract_no(&year, s);
+            if repo::find_contract_by_no(&tx, &no)?.is_none() {
+                got = Some((s, no));
+                break;
+            }
+        }
+        got.ok_or_else(|| {
+            StoreError::Inconsistent(format!(
+                "合同编号连续 5 次撞号（{year} 年度），请检查 ct_contract 与 sys_sequence 是否一致"
+            ))
+        })?
+    };
     if let Some(cat) = &input.category_id {
         if !repo::category_exists(&tx, cat)? {
             return Err(StoreError::DictMissing(format!("会计分类 {cat}")));
@@ -583,8 +600,25 @@ pub fn update_contract_master(
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
-    if c.status == ContractStatus::Void {
-        return Err(DomainError::IllegalState("作废合同不可修改信息".into()).into());
+    // R-68（C2）：作废合同仍允许补充说明性信息（名称 / 备注 / 联系方式等）。
+    // 计价类字段（金额 / 审计价 / 交工日期）本来就不在本入口的可改字段里，
+    // 它们各自另走 `ensure_pricing_mutable` 守卫。已删除合同一律拒绝。
+    if c.is_deleted {
+        return Err(DomainError::IllegalState("合同已删除，不能修改信息".into()).into());
+    }
+    // R-68（C9）：类型变更会改变付清条件与封顶规则，必须先二次确认。
+    if input.contract_type != c.contract_type && !input.confirm_type_change {
+        let note = if input.contract_type == ContractType::Engineering {
+            "改为工程类后，该合同将受「已审定 + 交工满 2 年」与 80% 封顶约束，已有付款可能变成超付"
+        } else {
+            "改为货物 / 服务类后，付清条件与封顶规则随之变化，请确认历史付款仍然合规"
+        };
+        return Err(DomainError::NeedConfirm(format!(
+            "合同类型将由「{}」改为「{}」：{note}",
+            c.contract_type.label(),
+            input.contract_type.label()
+        ))
+        .into());
     }
 
     // 三个文本档案与新建同路径：命中就复用，未命中就自动建档
@@ -711,8 +745,15 @@ pub fn update_contract_master(
     note_long!("备注", dash(&c.remark), dash(&input.remark));
     note!(
         "招标方式",
-        c.bid_method.map(|x| x.label()).unwrap_or("—"),
-        input.bid_method.map(|x| x.label()).unwrap_or("—")
+        c.bid_method
+            .as_ref()
+            .map(|x| x.label())
+            .unwrap_or_else(|| "—".to_string()),
+        input
+            .bid_method
+            .as_ref()
+            .map(|x| x.label())
+            .unwrap_or_else(|| "—".to_string())
     );
     note!(
         "开标时间",
@@ -922,19 +963,21 @@ pub fn save_attachment(
         version: 1,
     };
     repo::upsert_attachment(&tx, &a, content)?;
+    // 覆盖已有行时主键仍是旧 id（ON CONFLICT DO UPDATE 不换主键），
+    // 先回读拿真实记录再写日志，否则日志会指向一条不存在的新 id（R-68 幽灵日志）。
+    let saved = repo::list_attachments(&tx, contract_id)?
+        .into_iter()
+        .find(|x| x.kind_code == kind_code);
+    let logged = saved.as_ref().unwrap_or(&a);
     db::insert_audit_log(
         &tx,
         "ct_contract_attachment",
-        &a.id,
+        &logged.id,
         Some(name),
         "UPSERT",
         Some(&format!("{} · {}", kind.label(), name)),
         operator,
     )?;
-    // 覆盖已有行时主键仍是旧 id，回读一次拿真实记录
-    let saved = repo::list_attachments(&tx, contract_id)?
-        .into_iter()
-        .find(|x| x.kind_code == kind_code);
     tx.commit()?;
     // R-67：只有「换成更小的文件」才压缩。SQLite 只把旧 BLOB 占的页挂回 freelist，
     // 文件高水位不回落（10 MB 换成 1 MB，库仍是 10 MB）；变大时压缩纯属白等一次全库重写。
@@ -957,9 +1000,13 @@ pub fn attachment_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
 ///
 /// R-67：删完再压缩。附件是库里最大的对象，删掉 7 MB 扫描件后若不 VACUUM，
 /// 文件大小一点都不会变，用户看到的就是「删了也不省空间」。
+/// R-68（#21）：只在**真的删掉了**（命中 ≥ 1 行）才压缩；删不存在的 id
+/// 不再白跑一次全库重写。
 pub fn delete_attachment(conn: &mut Connection, id: &str, operator: &str) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    if let Some((kind, name)) = repo::delete_attachment(&tx, id)? {
+    let deleted = repo::delete_attachment(&tx, id)?;
+    let had_deleted = deleted.is_some();
+    if let Some((kind, name)) = deleted {
         db::insert_audit_log(
             &tx,
             "ct_contract_attachment",
@@ -971,8 +1018,10 @@ pub fn delete_attachment(conn: &mut Connection, id: &str, operator: &str) -> Res
         )?;
     }
     tx.commit()?;
-    // 压缩失败不影响删除结果（记录已经没了），只是空间暂时还挂在 freelist 上
-    let _ = db::compact(conn);
+    if had_deleted {
+        // 压缩失败不影响删除结果（记录已经没了），只是空间暂时还挂在 freelist 上
+        let _ = db::compact(conn);
+    }
     Ok(())
 }
 
@@ -1016,13 +1065,25 @@ pub fn edit_contract_amount(
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
-    if c.status == ContractStatus::Void {
-        return Err(DomainError::IllegalState("作废合同不可编辑金额".into()).into());
-    }
+    ensure_pricing_mutable(&c, "编辑金额")?;
     let old = c.original_amount_cent;
     if old == new_amount {
         // R-52：不是口径问题，也不是「填错」，只是没有变化；不顶「口径违例」的帽子
         return Err(DomainError::NoChange("金额未变化，没有修改任何内容，无需留痕".into()).into());
+    }
+    // R-68：金额有下限——累计已付与审计价取大者。
+    // 低于已付会让支付率倒挂（已付 > 基准），该合同可付额度转负、此后既不能拨款
+    // 也不能靠再改金额回到可用状态；低于审计价则与审定结论冲突。
+    // 必须在事务内读，金额校验与写入用同一份快照，避免两次读之间插入付款。
+    let paid = repo::paid_net(&tx, &c.id)?;
+    let audit = c.audit_price().map(|m| m.cent()).unwrap_or(0);
+    let floor = paid.cent().max(audit);
+    if new_amount.cent() < floor {
+        return Err(DomainError::AmountBelowFloor {
+            requested: new_amount.cent(),
+            floor,
+        }
+        .into());
     }
     let at = now_iso();
     c.original_amount_cent = new_amount;
@@ -1030,11 +1091,19 @@ pub fn edit_contract_amount(
     c.updated_by = Some(operator.to_string());
     repo::update_contract(&tx, &c)?;
 
-    history::append(
+    // C8：变更历史进独立历史表（带合同 id、不限全局条数），
+    // 取代 sys_meta 里跨合同共享 50 条上限的 JSON 数组
+    repo::insert_change_history(
         &tx,
-        history::KEY_CONTRACT_AMOUNT,
-        history::amount_entry(&at, old.cent(), new_amount.cent(), reason, operator),
-        operator,
+        &repo::ChangeHistoryEntry {
+            contract_id: &c.id,
+            change_type: "AMOUNT",
+            old_cent: Some(old.cent()),
+            new_cent: Some(new_amount.cent()),
+            reason,
+            operator_id: operator,
+            created_at: &at,
+        },
     )?;
     db::insert_audit_log(
         &tx,
@@ -1051,6 +1120,21 @@ pub fn edit_contract_amount(
     )?;
     tx.commit()?;
     Ok(c)
+}
+
+/// 计价类字段（合同金额 / 审计价 / 交工日期）的变更守卫。
+///
+/// 统一成一处：作废与已删除合同一律拒绝，提示语带上具体动作名。
+/// 之前每个入口各写一句，`register_audit_price` 就漏了作废判定——
+/// 作废合同仍能被改审计价，连带改写视图里的基准与支付率。
+fn ensure_pricing_mutable(c: &Contract, action: &str) -> Result<()> {
+    if c.is_deleted {
+        return Err(DomainError::IllegalState(format!("合同已删除，不能{action}")).into());
+    }
+    if c.status == ContractStatus::Void {
+        return Err(DomainError::IllegalState(format!("作废合同不能{action}")).into());
+    }
+    Ok(())
 }
 
 /// 可选文本的落库口径：去首尾空白，全空视为「未填」。
@@ -1091,6 +1175,9 @@ pub fn register_audit_price(
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
+    // R-68：作废 / 已删除合同不得再改审计价。审计价是计价基准，改它会连带改变
+    // 视图里的基准金额与支付率，让作废合同重新参与台账与报表口径。
+    ensure_pricing_mutable(&c, "登记审计价")?;
     let old = c.audit_price().map(|m| m.cent());
     // 归一：<= 0 一律按未审定处理（4.2.7）；字符串字段也先 trim 再落库，
     // 让「同值判定」和「实际写入」用同一份值，避免多打一个空格就多一条留痕（R-52）。
@@ -1116,17 +1203,17 @@ pub fn register_audit_price(
     c.updated_by = Some(operator.to_string());
     repo::update_contract(&tx, &c)?;
 
-    history::append(
+    repo::insert_change_history(
         &tx,
-        history::KEY_AUDIT_PRICE,
-        history::audit_entry(
-            &c.updated_at,
-            old,
-            normalized.map(|m| m.cent()),
+        &repo::ChangeHistoryEntry {
+            contract_id: &c.id,
+            change_type: "AUDIT_PRICE",
+            old_cent: old,
+            new_cent: normalized.map(|m| m.cent()),
             reason,
-            operator,
-        ),
-        operator,
+            operator_id: operator,
+            created_at: &c.updated_at,
+        },
     )?;
     let detail = match normalized {
         Some(p) => format!(
@@ -1152,10 +1239,16 @@ pub fn register_audit_price(
 
 /// R-67：该合同最近一次登记审计价时填的「变更原因」，仅用于弹窗回填。
 ///
-/// 历史数组 `audit_price_history` 是全局单键、不带合同 id，没法按合同取；
-/// 这里读操作日志里该合同最近一条 `SET_AUDIT_PRICE` 的 detail
-/// （格式「审计价 X（原 Y）：原因」），取最后一个中文冒号之后的部分。
+/// C8 起优先读变更历史表（按合同归属、不再被别的合同挤掉）；
+/// 历史表没铺开前的旧数据回退读操作日志里最近一条 `SET_AUDIT_PRICE` 的
+/// detail（格式「审计价 X（原 Y）：原因」），取最后一个中文冒号之后的部分。
 pub fn last_audit_reason(conn: &Connection, contract_id: &str) -> Option<String> {
+    if let Some(r) = repo::last_change_reason(conn, contract_id, "AUDIT_PRICE")
+        .ok()
+        .flatten()
+    {
+        return Some(r);
+    }
     let detail: Option<String> = conn
         .query_row(
             "SELECT detail FROM sys_audit_log \
@@ -1186,10 +1279,8 @@ pub fn set_delivery_date(
     let d = date.trim();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut c = repo::get_contract(&tx, contract_id)?;
-    if c.is_deleted {
-        // 这是状态非法，不是口径违例（与 edit_contract_amount 的 Void 判定同类）
-        return Err(DomainError::IllegalState("合同已删除，不能登记交工".into()).into());
-    }
+    // 交工日期直接决定「交工满 2 年」的付清条件，与金额同级，同样不许在作废后改
+    ensure_pricing_mutable(&c, "登记交工日期")?;
     let old = c.delivery_date.clone();
     if old.as_deref().map(str::trim) == Some(d) {
         // 同日期重复提交：不写日志、不改档案（R-52 / P4）
@@ -1242,8 +1333,29 @@ pub fn register_payment(
 
     let now = now_iso();
     let year = year_of(&input.pay_date);
-    let seq = db::next_sequence(&tx, &format!("payment_no:{year}"))?;
-    let payment_no = ids::payment_no(&year, seq);
+    // R-68（C7）：与合同号同款兜底——唯一索引 ux_payment_no 命中时不再让整个
+    // 事务（连同取号）回滚，跳过重取，5 次仍撞号才报数据异常。
+    let (seq, payment_no) = {
+        let mut got = None;
+        for _ in 0..5 {
+            let s = db::next_sequence(&tx, &format!("payment_no:{year}"))?;
+            let no = ids::payment_no(&year, s);
+            let taken: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pay_payment WHERE payment_no = ?1 AND is_deleted = 0",
+                [&no],
+                |r| r.get(0),
+            )?;
+            if taken == 0 {
+                got = Some((s, no));
+                break;
+            }
+        }
+        got.ok_or_else(|| {
+            StoreError::Inconsistent(format!(
+                "拨款单号连续 5 次撞号（{year} 年度），请检查 pay_payment 与 sys_sequence 是否一致"
+            ))
+        })?
+    };
 
     let p = Payment {
         id: ids::new_id("PM"),
@@ -1262,7 +1374,6 @@ pub fn register_payment(
         receive_account: input.receive_account,
         status: PaymentStatus::Paid,
         operator_id: operator.to_string(),
-        print_count: 0,
         remark: input.remark,
         is_deleted: false,
         version: 1,
@@ -1303,6 +1414,9 @@ pub fn register_payment(
 }
 
 /// 拨款单作废（评审 H5：以「作废 + 重登」替代红冲）。作废后不再计入已付净额。
+///
+/// R-68（C15）：作废的是该合同**最后一笔**已付单据时，合同从「履行中」回退到
+/// 「生效」——状态与事实保持一致；该状态迁移已加入状态机白名单。
 pub fn void_payment(
     conn: &mut Connection,
     payment_id: &str,
@@ -1327,6 +1441,26 @@ pub fn void_payment(
         Some(&format!("作废 {}：{reason}", p.payment_no)),
         operator,
     )?;
+    // C15：已付清零的「履行中」合同回退「生效」；回退本身也留痕
+    let mut c = repo::get_contract(&tx, &p.contract_id)?;
+    if c.status == ContractStatus::Performing && repo::paid_payment_count(&tx, &c.id)? == 0 {
+        c.revert_performing_to_active()?;
+        c.updated_at = p.updated_at.clone();
+        c.updated_by = Some(operator.to_string());
+        repo::update_contract(&tx, &c)?;
+        db::insert_audit_log(
+            &tx,
+            "ct_contract",
+            &c.id,
+            Some(&format!("{} {}", c.contract_no, c.contract_name)),
+            "ACTIVATE",
+            Some(&format!(
+                "作废最后一笔已付 {}，合同回退「生效」：{reason}",
+                p.payment_no
+            )),
+            operator,
+        )?;
+    }
     tx.commit()?;
     Ok(p)
 }
@@ -1335,7 +1469,7 @@ pub fn void_payment(
 
 /// 当前可付额度（展示用，不在事务内加锁）。按「今天」判定付清条件。
 pub fn quota_of(conn: &Connection, contract_id: &str) -> Result<PaymentQuota> {
-    quota_on(conn, contract_id, &ctp_core::date::today_iso())
+    quota_on(conn, contract_id, &today_local_iso())
 }
 
 /// 指定开单日期的可付额度：界面按表单里填的开单日期实时展示，
@@ -1344,7 +1478,7 @@ pub fn quota_on(conn: &Connection, contract_id: &str, pay_date: &str) -> Result<
     let c = repo::get_contract(conn, contract_id)?;
     let paid = repo::paid_net(conn, contract_id)?;
     let tolerance = Rate::ZERO;
-    let today = ctp_core::date::today_iso();
+    let today = today_local_iso();
     let date = if ctp_core::date::is_iso_date(pay_date) {
         pay_date
     } else {
@@ -1475,9 +1609,9 @@ fn range_filter((from, to): (String, String)) -> ctp_core::ledger::SummaryFilter
     }
 }
 
-/// 汇总统计的默认区间：本年 1 月 1 日 ~ 今天。
+/// 汇总统计的默认区间：本年 1 月 1 日 ~ 今天（东八区，R-68 / C6）。
 pub fn default_summary_range() -> (String, String) {
-    let today = ctp_core::date::today_iso();
+    let today = today_local_iso();
     let year = today.get(0..4).unwrap_or("2026");
     (format!("{year}-01-01"), today)
 }

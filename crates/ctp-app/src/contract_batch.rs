@@ -24,8 +24,9 @@ use crate::service::{self, NewContract};
 use ctp_core::contract::{planned_end_for, BidMethod, ContractType, PricingMethod};
 use ctp_core::date::is_iso_date;
 use ctp_core::dict;
+use ctp_core::ids;
 use ctp_core::money::Money;
-use ctp_store::{repo, Result, StoreError};
+use ctp_store::{db, repo, Result, StoreError};
 use rusqlite::Connection;
 use rust_xlsxwriter::{Color, DataValidation, Format, FormatAlign, FormatBorder, Workbook};
 use std::collections::HashMap;
@@ -297,27 +298,40 @@ fn row_is_blank(row: &[calamine::Data]) -> bool {
     row.iter().all(|d| cell_text(d).is_empty())
 }
 
-/// 合同金额：必填、必须大于 0（与新建表单的 `amount_ok` 同一口径）。
+/// 合同金额：必填、必须大于 0，且不得超过单笔上限。
+///
+/// 上限与「新建合同」表单、批量拨款共用 `Money::MAX_SINGLE_CENT`：
+/// Excel 里填 `1e16` 时 `f64 as i64` 会饱和到 `i64::MAX` 原样入库，
+/// 台账合计被钳成边界值、视图比率溢出成 REAL，整张台账与报表都打不开。
 fn cell_contract_money(row: &[calamine::Data], col: usize) -> std::result::Result<Money, String> {
-    let raw = row.get(col);
-    let money = match raw {
+    // 三种单元格格式最后统一走 check：只要有一个分支忘了判上限，
+    // 用户把 Excel 那一格改成「数值 / 整数 / 文本」就能绕过（R-68 / C4）。
+    let check = |cent: i64| -> std::result::Result<Money, String> {
+        if cent <= 0 {
+            return Err("合同金额必须大于 0".into());
+        }
+        if cent > Money::MAX_SINGLE_CENT {
+            return Err(format!(
+                "合同金额超过单笔上限 {} 元",
+                Money::from_cent(Money::MAX_SINGLE_CENT).format_yuan()
+            ));
+        }
+        Ok(Money::from_cent(cent))
+    };
+    let cent = match row.get(col) {
         Some(calamine::Data::Float(f)) => {
             if !f.is_finite() || *f < 0.0 {
                 return Err("合同金额不是有效数字".into());
             }
-            Money::from_cent((*f * 100.0).round() as i64)
+            Money::from_yuan_f64(*f).map_err(|e| e.to_string())?.cent()
         }
-        Some(calamine::Data::Int(v)) => Money::from_cent(
-            v.checked_mul(100)
-                .ok_or_else(|| "合同金额过大".to_string())?,
-        ),
-        Some(calamine::Data::String(s)) => Money::parse_yuan(s).map_err(|e| e.to_string())?,
+        Some(calamine::Data::Int(v)) => v
+            .checked_mul(100)
+            .ok_or_else(|| "合同金额过大".to_string())?,
+        Some(calamine::Data::String(s)) => Money::parse_yuan(s).map_err(|e| e.to_string())?.cent(),
         _ => return Err("合同金额为空".into()),
     };
-    if money.cent() <= 0 {
-        return Err("合同金额必须大于 0".into());
-    }
-    Ok(money)
+    check(cent)
 }
 
 fn cell_duration(row: &[calamine::Data], col: usize) -> std::result::Result<i64, String> {
@@ -630,6 +644,28 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
         }
     }
 
+    // R-68（#14）：与批量拨款同款——批次号 + 文件名 + 结果统计整批留痕
+    let batch_no = ids::new_id("IMP");
+    let file_label = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = db::insert_audit_log(
+        conn,
+        "import",
+        &batch_no,
+        Some(&file_label),
+        "IMPORT",
+        Some(&format!(
+            "批次 {batch_no}｜批量合同导入｜成功 {} 行，跳过 {} 行，失败 {} 行｜{}",
+            report.imported,
+            report.skipped,
+            report.failures.len(),
+            path.display()
+        )),
+        operator,
+    );
+
     Ok(report)
 }
 
@@ -645,6 +681,31 @@ fn non_empty(s: String) -> Option<String> {
 mod tests {
     use super::*;
     use ctp_store::{db, seed};
+
+    /// R-68（C4）：三种单元格格式都受单笔上限约束，尤其是整数格——
+    /// 之前只判 i64 溢出，`1e13 元` 能原样入库把台账合计钳成边界值。
+    #[test]
+    fn 合同金额三种格式都受单笔上限约束() {
+        let huge = (Money::MAX_SINGLE_CENT / 100 + 1) as f64;
+        let cases = [
+            calamine::Data::Float(huge),
+            calamine::Data::Int(huge as i64),
+            calamine::Data::String(format!("{huge:.0}")),
+        ];
+        for cell in cases {
+            let row = vec![cell];
+            let r = cell_contract_money(&row, 0);
+            assert!(r.is_err(), "超大金额必须被挡下，实得 {r:?}");
+        }
+        // 整数格单独确认提示的是「单笔上限」而不是含糊的溢出
+        let err = cell_contract_money(&[calamine::Data::Int(huge as i64)], 0).unwrap_err();
+        assert!(err.contains("上限"), "整数格的错误提示：{err}");
+        // 合法金额仍要能正常解析
+        let ok = vec![calamine::Data::Float(123_456.78)];
+        assert_eq!(cell_contract_money(&ok, 0).unwrap().cent(), 12_345_678);
+        let int_ok = vec![calamine::Data::Int(1000)];
+        assert_eq!(cell_contract_money(&int_ok, 0).unwrap().cent(), 100_000);
+    }
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

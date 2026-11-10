@@ -314,6 +314,8 @@ pub struct App {
     pub log_key: Option<(String, String, Option<String>, String)>,
     /// 待确认的清理动作（筛选条件 + 一句人话描述）
     pub log_clear: Option<(ctp_store::audit::LogFilter, String)>,
+    /// 「全部清理」的确认词输入（R-68 / C14-B）：须输入「清空」二字才能提交。
+    pub log_clear_word: String,
 
     pub dialog: Dialog,
     /// 批量导入结果弹窗的数据（与 `Dialog::ImportResult` 配套，保持 Dialog 可 Copy）
@@ -462,6 +464,7 @@ impl App {
             log_actions: Vec::new(),
             log_key: None,
             log_clear: None,
+            log_clear_word: String::new(),
             dialog: Dialog::None,
             import_result: None,
             export_columns: None,

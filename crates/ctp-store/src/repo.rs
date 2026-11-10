@@ -192,10 +192,10 @@ fn map_contract(row: &Row) -> rusqlite::Result<Contract> {
         created_by: row.get(31)?,
         updated_at: row.get(32)?,
         updated_by: row.get(33)?,
+        // R-68（C3）：未知编码包成 BidMethod::Unknown 原样带回，不再静默变 None
         bid_method: row
             .get::<_, Option<String>>(34)?
-            .as_deref()
-            .and_then(BidMethod::from_code),
+            .map(|s| BidMethod::from_code_keep(&s)),
         open_bid_date: row.get(35)?,
         project_leader: row.get(36)?,
         contact_info: row.get(37)?,
@@ -250,7 +250,7 @@ pub fn insert_contract(conn: &Connection, c: &Contract) -> Result<()> {
             c.updated_at,
             c.updated_by,
             c.version,
-            c.bid_method.map(|b| b.code()),
+            c.bid_method.as_ref().map(|b| b.code()),
             c.open_bid_date,
             c.project_leader,
             c.contact_info,
@@ -310,7 +310,7 @@ pub fn update_contract(conn: &Connection, c: &Contract) -> Result<()> {
             c.is_deleted as i32,
             c.updated_at,
             c.updated_by,
-            c.bid_method.map(|b| b.code()),
+            c.bid_method.as_ref().map(|b| b.code()),
             c.open_bid_date,
             c.project_leader,
             c.contact_info,
@@ -417,7 +417,7 @@ pub fn list_contractors(conn: &Connection) -> Result<Vec<Contractor>> {
 
 const PAYMENT_COLS: &str = "id, payment_no, title, sort_no, period_no, contract_id, project_id, \
 pay_date, amount_cent, reason, pay_method, bank_serial_no, pay_account, receive_account, status, \
-operator_id, print_count, remark, is_deleted, version, created_at, created_by, updated_at, updated_by";
+operator_id, remark, is_deleted, version, created_at, created_by, updated_at, updated_by";
 
 fn map_payment(row: &Row) -> rusqlite::Result<Payment> {
     Ok(Payment {
@@ -443,14 +443,13 @@ fn map_payment(row: &Row) -> rusqlite::Result<Payment> {
             "status",
         )?,
         operator_id: row.get(15)?,
-        print_count: row.get(16)?,
-        remark: row.get(17)?,
-        is_deleted: row.get::<_, i32>(18)? != 0,
-        version: row.get(19)?,
-        created_at: row.get(20)?,
-        created_by: row.get(21)?,
-        updated_at: row.get(22)?,
-        updated_by: row.get(23)?,
+        remark: row.get(16)?,
+        is_deleted: row.get::<_, i32>(17)? != 0,
+        version: row.get(18)?,
+        created_at: row.get(19)?,
+        created_by: row.get(20)?,
+        updated_at: row.get(21)?,
+        updated_by: row.get(22)?,
     })
 }
 
@@ -459,9 +458,9 @@ pub fn insert_payment(conn: &Connection, p: &Payment) -> Result<()> {
     conn.execute(
         "INSERT INTO pay_payment(id, payment_no, title, sort_no, period_no, contract_id, \
             project_id, pay_date, amount_cent, reason, pay_method, bank_serial_no, pay_account, \
-            receive_account, status, operator_id, print_count, remark, is_deleted, \
+            receive_account, status, operator_id, remark, is_deleted, \
             created_at, created_by, updated_at, updated_by, version) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         rusqlite::params![
             p.id,
             p.payment_no,
@@ -479,7 +478,6 @@ pub fn insert_payment(conn: &Connection, p: &Payment) -> Result<()> {
             p.receive_account,
             p.status.code(),
             p.operator_id,
-            p.print_count,
             p.remark,
             p.is_deleted as i32,
             p.created_at,
@@ -496,8 +494,8 @@ pub fn update_payment(conn: &Connection, p: &Payment) -> Result<()> {
     let n = conn.execute(
         "UPDATE pay_payment SET title=?3, sort_no=?4, period_no=?5, contract_id=?6, project_id=?7, \
             pay_date=?8, amount_cent=?9, reason=?10, pay_method=?11, bank_serial_no=?12, \
-            pay_account=?13, receive_account=?14, status=?15, operator_id=?16, print_count=?17, \
-            remark=?18, is_deleted=?19, updated_at=?20, updated_by=?21, version = version + 1 \
+            pay_account=?13, receive_account=?14, status=?15, operator_id=?16, \
+            remark=?17, is_deleted=?18, updated_at=?19, updated_by=?20, version = version + 1 \
          WHERE id=?1 AND version=?2",
         rusqlite::params![
             p.id,
@@ -516,7 +514,6 @@ pub fn update_payment(conn: &Connection, p: &Payment) -> Result<()> {
             p.receive_account,
             p.status.code(),
             p.operator_id,
-            p.print_count,
             p.remark,
             p.is_deleted as i32,
             p.updated_at,
@@ -765,7 +762,9 @@ pub fn payment_summary(
     // 看着像项目编码，容易被当成名称；空串则与「未选」混在一起。
     let (key_expr, label_expr, sub_expr) = match dim {
         D::Project => (
-            "p.project_id",
+            // R-68（C11）：项目维度按合同的当前项目归集，与 v_payment_period 同口径；
+            // p.project_id 是签约快照，合同改项目后两处会给出不同答案
+            "c.project_id",
             "COALESCE(pj.project_name, '—')".to_string(),
             "NULL",
         ),
@@ -1100,4 +1099,63 @@ pub fn attachment_count(conn: &Connection, contract_id: &str) -> Result<i64> {
         |r| r.get(0),
     )?;
     Ok(n)
+}
+
+// ---------------------------------------------------------------- 变更历史
+
+/// C8：写一条合同变更历史（金额 `AMOUNT` / 审计价 `AUDIT_PRICE`）。
+///
+/// 与业务更新在**同一个事务**内调用，取代 `sys_meta` 里的全局 JSON 数组——
+/// 那两个键跨合同共享 50 条上限且不带合同 id，合同一多审计链就被挤断。
+/// `old_cent` / `new_cent` 为 `None` 表示「未审定 → 有值」或「清空回未审定」。
+///
+/// 用具名结构体而不是一串位置参数：这两个都是 `Option<i64>`，按位置传极易
+/// 前后颠倒，而历史表写反了不会报错、只在几个月后对账时才暴露。
+pub struct ChangeHistoryEntry<'a> {
+    pub contract_id: &'a str,
+    pub change_type: &'a str,
+    pub old_cent: Option<i64>,
+    pub new_cent: Option<i64>,
+    pub reason: &'a str,
+    pub operator_id: &'a str,
+    pub created_at: &'a str,
+}
+
+pub fn insert_change_history(conn: &Connection, e: &ChangeHistoryEntry<'_>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO ct_contract_change_history \
+            (id, contract_id, change_type, old_cent, new_cent, reason, operator_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            ctp_core::ids::new_id("CHH"),
+            e.contract_id,
+            e.change_type,
+            e.old_cent,
+            e.new_cent,
+            e.reason,
+            e.operator_id,
+            e.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// 某合同最近一条指定类型变更的原因（弹窗回填用；`change_type` 传
+/// `AMOUNT` / `AUDIT_PRICE`）。没有历史时返回 `None`。
+pub fn last_change_reason(
+    conn: &Connection,
+    contract_id: &str,
+    change_type: &str,
+) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT reason FROM ct_contract_change_history \
+             WHERE contract_id = ?1 AND change_type = ?2 AND reason IS NOT NULL \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            rusqlite::params![contract_id, change_type],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.filter(|s| !s.trim().is_empty()))
 }

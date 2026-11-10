@@ -698,15 +698,28 @@ impl ReportResult {
             })
             .collect();
 
-        let sum = |f: fn(&ctp_core::ledger::ContractSummary) -> i64| -> i64 {
-            Money::sum_saturating(rows.iter().map(f))
+        // R-68（C12）：合计排除作废合同——作废单据本就不计入已付，让作废合同的
+        // 金额继续参与合计会出现「金额计入、付款不计入」的半吊子口径。
+        // 行数据仍保留作废合同（台账要能看到它们），只有合计行剔除。
+        let live = |s: &ctp_core::ledger::ContractSummary| s.status != "VOID";
+        let sum_live = |f: fn(&ctp_core::ledger::ContractSummary) -> i64| -> i64 {
+            Money::sum_saturating(rows.iter().filter(|s| live(s)).map(f))
         };
-        let total_amount = sum(|s| s.total_amount.cent());
-        let audit = sum(|s| s.audit_price.map(|m| m.cent()).unwrap_or(0));
-        let paid = sum(|s| s.paid_amount.cent());
-        let base = sum(|s| s.base_amount.cent());
+        let voided = rows.iter().filter(|s| !live(s)).count();
+        let total_amount = sum_live(|s| s.total_amount.cent());
+        let audit = sum_live(|s| s.audit_price.map(|m| m.cent()).unwrap_or(0));
+        let paid = sum_live(|s| s.paid_amount.cent());
+        let base = sum_live(|s| s.base_amount.cent());
         let total_bp = ratio_bp(paid, base);
-        let mut totals = vec![Cell::Text("合计".to_string()), Cell::Text(String::new())];
+        // 屏幕合计行与导出副标题共用「不含作废 n 份」标注（C12）
+        let mut totals = vec![
+            Cell::Text(if voided > 0 {
+                format!("合计（不含作废 {voided} 份）")
+            } else {
+                "合计".to_string()
+            }),
+            Cell::Text(String::new()),
+        ];
         if visible.wide {
             totals.push(Cell::Text(String::new()));
             totals.push(Cell::Money(Money::from_cent(total_amount)));
@@ -722,7 +735,14 @@ impl ReportResult {
         ReportResult {
             kind,
             title: kind.title(),
-            subtitle: format!("{}（共 {} 份合同）", kind.subtitle(), rows.len()),
+            subtitle: {
+                let base_sub = format!("{}（共 {} 份合同）", kind.subtitle(), rows.len());
+                if voided > 0 {
+                    format!("{base_sub}，合计不含作废 {voided} 份")
+                } else {
+                    base_sub
+                }
+            },
             unit_note: "金额单位：元",
             columns,
             rows: data,

@@ -15,6 +15,14 @@ pub enum DomainError {
     #[error("金额不能为负：{0} 分")]
     NegativeAmount(i64),
 
+    /// 编辑合同金额时低于「累计已付」或「审计价」。
+    ///
+    /// 低于累计已付会让支付率倒挂（已付 > 基准），该合同此后算出的可付额度为负，
+    /// 既不能登记拨款、也无法通过正常编辑回到可用状态；低于审计价则与审定结论冲突。
+    /// 单独成变体，界面据此提示差额而不是一句泛泛的「保存失败」。
+    #[error("金额低于下限：新金额 {requested} 分，下限 {floor} 分（取累计已付与审计价的较大者）")]
+    AmountBelowFloor { requested: i64, floor: i64 },
+
     #[error("必备字段缺失：{0}")]
     MissingField(&'static str),
 
@@ -58,6 +66,14 @@ pub enum DomainError {
     /// 「没有修改任何内容，无需留痕」，而不是一句像出错的诊断。
     #[error("{0}")]
     NoChange(String),
+
+    /// 操作本身合法，但会改变已有单据的适用规则，需要用户二次确认。
+    ///
+    /// 目前只有一处：合同类型从工程改为货物 / 服务（或反向），会改变付清条件
+    /// （工程类受 80% 封顶 + 交工满 2 年限制），原本合规的历史付款可能瞬间「超付」。
+    /// 界面收到该错误后弹确认框，确认后带 `confirmed = true` 重新提交。
+    #[error("{0}")]
+    NeedConfirm(String),
 }
 
 pub type Result<T> = std::result::Result<T, DomainError>;

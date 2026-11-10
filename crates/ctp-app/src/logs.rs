@@ -66,22 +66,36 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
     audit::actions(conn)
 }
 
+/// 「全部清理」至少保留的最近条数（R-68 / C14-A）。
+///
+/// 全删不可恢复，误触一次就把审计链清零；按条件清理不受此限
+/// （用户明确指定了范围），只有「全部清理」兜住最近 [`AUDIT_KEEP_MIN`] 条。
+pub use ctp_store::audit::AUDIT_KEEP_MIN;
+
 /// 清理日志并留痕，返回删除条数。
 ///
 /// `filter` 四个条件全空即「全部清理」；否则按条件清理（例如只清某个时间范围）。
 /// R-39：删除与 `CLEAR` 留痕放在同一个 IMMEDIATE 事务里，
 /// 否则「删光了但留痕写入失败」会得到一个没有来源说明的空日志表。
+/// R-68（C14）：「全部清理」至少保留最近 [`AUDIT_KEEP_MIN`] 条（按日志 id 序，
+/// 与裁剪口径一致）；按条件清理不动这个底线——用户给定了明确范围。
 pub fn clear(conn: &mut Connection, filter: &LogFilter, operator: &str) -> Result<usize> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let n = audit::clear(&tx, filter)?;
+    let keep_min = filter.is_empty();
+    let n = audit::clear(&tx, filter, keep_min)?;
     let scope = describe(filter);
+    let kept_note = if keep_min {
+        format!("，保留最近 {AUDIT_KEEP_MIN} 条")
+    } else {
+        String::new()
+    };
     db::insert_audit_log(
         &tx,
         "sys_audit_log",
         "sys_audit_log",
         Some("操作日志"),
         "CLEAR",
-        Some(&format!("{scope}，共 {n} 条")),
+        Some(&format!("{scope}，共 {n} 条{kept_note}")),
         operator,
     )?;
     tx.commit()?;
@@ -146,18 +160,21 @@ mod tests {
     }
 
     #[test]
-    fn 全部清理会留一条清理日志() {
+    fn 全部清理保留最近两百条并留痕() {
         let mut conn = fixture();
-        add(&conn, "CREATE", "HT-001 道路改造");
-        add(&conn, "VOID", "HT-001 道路改造");
+        for i in 0..205 {
+            add(&conn, "CREATE", &format!("HT-00{i} 合同"));
+        }
         let n = clear(&mut conn, &LogFilter::default(), "管理员").unwrap();
-        assert_eq!(n, 2);
-        // 清完只剩那条留痕
-        assert_eq!(total(&conn).unwrap(), 1);
+        // 205 条只删掉最旧的 5 条，最近 200 条保底保留
+        assert_eq!(n, 5);
+        assert_eq!(total(&conn).unwrap(), 201); // 200 条 + 1 条留痕
         let rows = list(&conn, &LogFilter::default(), 10).unwrap();
         assert_eq!(rows[0].action, "CLEAR");
-        assert!(rows[0].detail.as_deref().unwrap().contains("全部清理"));
-        assert!(rows[0].detail.as_deref().unwrap().contains("2 条"));
+        let detail = rows[0].detail.as_deref().unwrap();
+        assert!(detail.contains("全部清理"), "{detail}");
+        assert!(detail.contains("保留最近 200 条"), "{detail}");
+        assert!(detail.contains("5 条"), "{detail}");
     }
 
     #[test]

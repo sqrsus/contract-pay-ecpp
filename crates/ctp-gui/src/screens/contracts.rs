@@ -932,7 +932,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // 批量合同：模板 21 列 = 新建合同表单的全部字段；导入每行独立事务、失败行单独提示。
     // 与「拨款管理」的批量入口共用体检（校验表 / 上限 / 结果弹窗），只是落库模块不同。
     if export_contract_tpl {
-        let name = format!("批量合同模板_{}.xlsx", ctp_core::date::today_iso());
+        let name = format!("批量合同模板_{}.xlsx", ctp_core::date::today_local_iso());
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name(&name)
             .add_filter("Excel 工作簿", &["xlsx"])
@@ -1660,12 +1660,12 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                 );
                 // R-66：合同类型 / 开标时间 / 招标代理三行已移除 ——
                 // 侧栏改为常驻后高度更紧张，这三项在「合同信息修改」里都能看到
-                widgets::kv(
-                    ui,
-                    &p,
-                    "招标方式",
-                    d.bid_method.map(|b| b.label()).unwrap_or("—"),
-                );
+                let bid_label = d
+                    .bid_method
+                    .as_ref()
+                    .map(|b| b.label())
+                    .unwrap_or_else(|| "—".to_string());
+                widgets::kv(ui, &p, "招标方式", &bid_label);
                 widgets::kv(
                     ui,
                     &p,

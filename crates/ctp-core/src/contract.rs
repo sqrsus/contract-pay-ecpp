@@ -135,7 +135,12 @@ impl PricingMethod {
 }
 
 /// 招标方式（新建合同页下拉，3 个固定值）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// R-68（C3）：新增 [`BidMethod::Unknown`] —— 库里出现无法识别的编码时**保留原码**，
+/// 不再静默读成 `None`（`None` 会被下一次整表保存写成 NULL，造成无痕数据丢失）。
+/// 因此本枚举不再 `Copy`；写回时 `Unknown` 原样落库，界面显示「未知(XXX)」。
+/// 新库的 CHECK 约束本就拒绝未知码，这里属于纵深防御（防手工改库 / 约束被绕过）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BidMethod {
     /// 公开招标
     #[default]
@@ -144,22 +149,26 @@ pub enum BidMethod {
     Government,
     /// 直接发包
     Direct,
+    /// 未识别的历史编码，`String` 为原码
+    Unknown(String),
 }
 
 impl BidMethod {
-    pub fn code(self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             BidMethod::Open => "OPEN",
             BidMethod::Government => "GOV_PROC",
             BidMethod::Direct => "DIRECT",
+            BidMethod::Unknown(raw) => raw.as_str(),
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            BidMethod::Open => "公开招标",
-            BidMethod::Government => "政府采购",
-            BidMethod::Direct => "直接发包",
+            BidMethod::Open => "公开招标".into(),
+            BidMethod::Government => "政府采购".into(),
+            BidMethod::Direct => "直接发包".into(),
+            BidMethod::Unknown(raw) => format!("未知({raw})"),
         }
     }
 
@@ -170,6 +179,12 @@ impl BidMethod {
             "DIRECT" => BidMethod::Direct,
             _ => return None,
         })
+    }
+
+    /// 读路径专用：未知编码不丢弃，包成 [`BidMethod::Unknown`] 原样带回，
+    /// 让「读 → 改别的字段 → 保存」一轮下来不丢这份数据。
+    pub fn from_code_keep(s: &str) -> Self {
+        BidMethod::from_code(s).unwrap_or_else(|| BidMethod::Unknown(s.to_string()))
     }
 }
 
@@ -379,6 +394,23 @@ impl Contract {
         Ok(())
     }
 
+    /// R-68（C15）：作废最后一笔已付单据后，把「履行中」补偿回退为「生效」。
+    ///
+    /// 刻意**不进** `can_transition_to`：`transit(Active)` 是「生效」入口的通用
+    /// 迁移规则，一旦放行 `Performing → Active`，`activate_contract` 就会允许
+    /// 对已履行中的合同重复生效。回退是一次性补偿动作，只由 `void_payment`
+    /// 在「已付笔数归零」时调用，单独走这里。
+    pub fn revert_performing_to_active(&mut self) -> Result<()> {
+        if self.status != ContractStatus::Performing {
+            return Err(DomainError::IllegalState(format!(
+                "只有履行中的合同可回退生效，当前 {}",
+                self.status.code()
+            )));
+        }
+        self.status = ContractStatus::Active;
+        Ok(())
+    }
+
     /// 保存前校验：覆盖 FR-CT-01 必录项、日期合法性、比率区间与时间倒序。
     pub fn validate(&self) -> Result<()> {
         if self.id.trim().is_empty() {
@@ -482,6 +514,36 @@ pub fn planned_end_for(planned_start: &str, duration_days: i64) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-68（C3）：未知招标方式码读出来不能被静默丢成 None，
+    /// 否则用户只改个备注点保存，就会把原值覆盖成 NULL 且审计里没有痕迹。
+    #[test]
+    fn 未知招标方式码原样往返() {
+        let m = BidMethod::from_code_keep("LEGACY_X");
+        assert_eq!(m, BidMethod::Unknown("LEGACY_X".into()));
+        assert_eq!(m.code(), "LEGACY_X", "写回时必须是原码");
+        assert_eq!(m.label(), "未知(LEGACY_X)");
+        // 已知码不受影响
+        assert_eq!(BidMethod::from_code_keep("GOV_PROC"), BidMethod::Government);
+        assert_eq!(BidMethod::from_code("LEGACY_X"), None);
+    }
+
+    /// C15：回退是补偿动作，不能把「生效」入口的通用状态机放宽。
+    #[test]
+    fn 状态回退不走通用迁移表() {
+        use ContractStatus::*;
+        assert!(
+            !Performing.can_transition_to(Active),
+            "通用迁移不许反向放行"
+        );
+        let mut c = sample();
+        c.status = Performing;
+        c.revert_performing_to_active().unwrap();
+        assert_eq!(c.status, Active);
+        // 非履行中不能调用补偿回退
+        c.status = Draft;
+        assert!(c.revert_performing_to_active().is_err());
+    }
 
     fn sample() -> Contract {
         Contract {

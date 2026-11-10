@@ -214,8 +214,8 @@ pub fn summary(app: &mut App, ui: &mut egui::Ui) {
                 .margin(egui::Margin::symmetric(7.0, 4.0)),
         );
 
-        // 三个常用区间，省得手打日期；「全部」清空两端
-        let today = ctp_core::date::today_iso();
+        // 三个常用区间，省得手打日期；「全部」清空两端（今天按东八区，R-68 / C6）
+        let today = ctp_core::date::today_local_iso();
         let year = today.get(0..4).unwrap_or("2026").to_string();
         for (label, from, to) in [
             ("本月", format!("{}-01", &today[0..7]), today.clone()),

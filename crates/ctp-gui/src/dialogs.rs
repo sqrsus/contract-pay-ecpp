@@ -10,7 +10,7 @@ use ctp_app::report::{ReportColumnError, ReportResult};
 use ctp_app::service::{self, EditContract, NewContract, NewPayment};
 use ctp_core::attachment::{Attachment, AttachmentKind};
 use ctp_core::contract::{BidMethod, Contract, ContractType, PricingMethod};
-use ctp_core::date::{is_iso_date, today_iso};
+use ctp_core::date::{is_iso_date, today_local_iso};
 use ctp_core::dict;
 use ctp_core::money::Money;
 use ctp_core::payment::PayMethod;
@@ -597,7 +597,8 @@ impl Default for ContractForm {
             party_a: String::new(),
             ctype_idx: 0,
             category_idx: 0,
-            sign_date: today_iso(),
+            // R-68（C6）：业务默认日期按东八区，0–8 点不再少一天
+            sign_date: today_local_iso(),
             amount: String::new(),
             duration: String::new(),
             planned_start: String::new(),
@@ -636,6 +637,11 @@ pub struct EditContractForm {
     pub contractor_text: String,
     pub party_a: String,
     pub ctype_idx: usize,
+    /// 原合同类型（R-68 / C9）：类型决定付清条件与封顶规则，变更需两击确认。
+    pub orig_type: ContractType,
+    /// 已确认过的目标类型：只有再次点击时选的仍是它才放行提交；
+    /// 用户确认后又改选别的类型，回到「重新确认」。
+    pub confirmed_type: Option<ContractType>,
     pub category_idx: usize,
     pub sign_date: String,
     pub duration: String,
@@ -647,7 +653,9 @@ pub struct EditContractForm {
     pub retention: String,
     pub terms: String,
     pub remark: String,
-    pub bid_method_idx: usize,
+    /// 招标方式当前值（R-68 / C3）：直接持有 `BidMethod`，库里若是未知编码
+    /// （`Unknown("XX")`）则原样保着，不改下拉就原样写回，不会丢成 NULL。
+    pub bid_method: BidMethod,
     pub open_bid_date: String,
     pub project_leader: String,
     pub contact_info: String,
@@ -697,13 +705,10 @@ impl EditContractForm {
             Some(PricingMethod::UnitPrice) => 2,
             Some(PricingMethod::CostPlus) => 3,
         };
-        let bid_method_idx = match c.bid_method {
-            // R-57：下拉不再有「未选」；历史空值在修改窗里预选「公开招标」，
-            // 但只有用户点保存才会写库，详情页仍按实际值显示「—」。
-            None | Some(BidMethod::Open) => 0,
-            Some(BidMethod::Government) => 1,
-            Some(BidMethod::Direct) => 2,
-        };
+        // R-57：历史空值在修改窗里预选「公开招标」，但只有用户点保存才会写库，
+        // 详情页仍按实际值显示「—」。R-68（C3）：未知编码（Unknown）原样保留，
+        // 下拉显示「未知(XXX)」，不改就不会被写成 NULL。
+        let bid_method = c.bid_method.clone().unwrap_or(BidMethod::Open);
 
         Self {
             contract_id: c.id.clone(),
@@ -713,6 +718,8 @@ impl EditContractForm {
             contractor_text,
             party_a: c.party_a.clone(),
             ctype_idx,
+            orig_type: c.contract_type,
+            confirmed_type: None,
             category_idx,
             sign_date: c.sign_date.clone(),
             duration: if c.duration_days > 0 {
@@ -728,7 +735,7 @@ impl EditContractForm {
             retention: bp_text(c.retention_rate_bp),
             terms: c.payment_terms.clone(),
             remark: c.remark.clone().unwrap_or_default(),
-            bid_method_idx,
+            bid_method,
             open_bid_date: c.open_bid_date.clone().unwrap_or_default(),
             project_leader: c.project_leader.clone().unwrap_or_default(),
             contact_info: c.contact_info.clone().unwrap_or_default(),
@@ -773,7 +780,8 @@ impl Default for PayForm {
     fn default() -> Self {
         Self {
             amount: String::new(),
-            date: today_iso(),
+            // R-68（C6）：开单日默认值按东八区
+            date: today_local_iso(),
             reason: String::new(),
             method_idx: 0,
         }
@@ -793,7 +801,8 @@ impl Default for AuditForm {
     fn default() -> Self {
         Self {
             amount: String::new(),
-            date: today_iso(),
+            // R-68（C6）：审定日期默认值按东八区
+            date: today_local_iso(),
             org: String::new(),
             report_no: String::new(),
             reason: "结算审定".into(),
@@ -812,7 +821,7 @@ impl AuditForm {
     pub fn from_contract(c: &Contract, last_reason: Option<String>) -> Self {
         Self {
             amount: c.audit_price().map(|m| m.format_yuan()).unwrap_or_default(),
-            date: c.audit_date.clone().unwrap_or_else(today_iso),
+            date: c.audit_date.clone().unwrap_or_else(today_local_iso),
             org: c.audit_org.clone().unwrap_or_default(),
             report_no: c.audit_report_no.clone().unwrap_or_default(),
             reason: last_reason.unwrap_or_else(|| "结算审定".into()),
@@ -836,7 +845,7 @@ const BID_METHODS: [BidMethod; 3] = [BidMethod::Open, BidMethod::Government, Bid
 
 /// 下拉索引 → 招标方式；越界一律按公开招标。
 fn bid_method_of(idx: usize) -> BidMethod {
-    BID_METHODS.get(idx).copied().unwrap_or(BidMethod::Open)
+    BID_METHODS.get(idx).cloned().unwrap_or(BidMethod::Open)
 }
 
 const PRICING: [&str; 4] = ["未填写", "总价", "单价", "成本加酬金"];
@@ -956,6 +965,20 @@ fn combo(
         .show_ui(ui, |ui| {
             for (i, l) in labels.iter().enumerate() {
                 ui.selectable_value(sel, i, l);
+            }
+        });
+}
+
+/// 修改窗的招标方式下拉（R-68 / C3）：直接读写 `BidMethod` 值。
+/// 当前值是 `Unknown(原码)` 时显示「未知(XXX)」；三个常规选项可选，
+/// 不碰下拉就原样保留，不会把未知码写成 NULL。
+fn bid_method_combo(ui: &mut egui::Ui, id: &str, width: f32, sel: &mut BidMethod) {
+    egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for m in &BID_METHODS {
+                ui.selectable_value(sel, m.clone(), m.label());
             }
         });
 }
@@ -2364,18 +2387,11 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
                                     widgets::field_label(ui, &p, "招标方式");
-                                    let labels: Vec<String> = vec![
-                                        "公开招标".into(),
-                                        "政府采购".into(),
-                                        "直接发包".into(),
-                                    ];
-                                    combo(
+                                    bid_method_combo(
                                         ui,
                                         "edit_bid_method",
                                         300.0,
-                                        form.bid_method_idx,
-                                        labels,
-                                        &mut form.bid_method_idx,
+                                        &mut form.bid_method,
                                     );
                                 });
                                 date_field(
@@ -2460,41 +2476,61 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                         .get(form.ctype_idx)
                         .copied()
                         .unwrap_or(ContractType::Engineering);
-                    let cat_code = dict::CONTRACT_CATEGORIES
-                        .get(form.category_idx)
-                        .map(|(c, _)| c.to_string())
-                        .unwrap_or_default();
-                    let pricing = match form.pricing_idx {
-                        0 => None,
-                        1 => Some(PricingMethod::LumpSum),
-                        2 => Some(PricingMethod::UnitPrice),
-                        _ => Some(PricingMethod::CostPlus),
-                    };
-                    let bid_method = Some(bid_method_of(form.bid_method_idx));
-                    submit = Some((
-                        EditContract {
-                            contract_name: form.name.trim().to_string(),
-                            project_text: form.project_text.trim().to_string(),
-                            contractor_text: form.contractor_text.trim().to_string(),
-                            party_a: form.party_a.trim().to_string(),
-                            contract_type: ctype,
-                            contract_category_code: cat_code,
-                            sign_date: form.sign_date.trim().to_string(),
-                            duration_days: form.duration.trim().parse::<i64>().unwrap_or(0),
-                            planned_start: opt(&form.planned_start),
-                            planned_end: opt(&form.planned_end),
-                            pricing_method: pricing,
-                            retention_rate_bp: pct_to_bp(&form.retention),
-                            payment_terms: form.terms.trim().to_string(),
-                            remark: opt(&form.remark),
-                            bid_method,
-                            open_bid_date: opt(&form.open_bid_date),
-                            project_leader: opt(&form.project_leader),
-                            contact_info: opt(&form.contact_info),
-                            bid_agent_text: opt(&form.bid_agent_text),
-                        },
-                        form.reason.trim().to_string(),
-                    ));
+                    // R-68（C9）：类型变更两击确认——第一击不提交，只亮提示；
+                    // 确认后又改选别的类型，回到「重新确认」。服务层另有
+                    // NeedConfirm 守卫兜底（CLI / 批量入口）。
+                    let need_confirm = ctype != form.orig_type
+                        && form.confirmed_type != Some(ctype);
+                    if need_confirm {
+                        form.confirmed_type = Some(ctype);
+                        let note = if ctype == ContractType::Engineering {
+                            "改为工程类后，该合同将受「已审定 + 交工满 2 年」与 80% 封顶约束，已有付款可能变成超付"
+                        } else {
+                            "改为货物 / 服务类后，付清条件与封顶规则随之变化，请确认历史付款仍然合规"
+                        };
+                        form.error = Some(format!(
+                            "合同类型将由「{}」改为「{}」：{note}。再次点击「保存修改」确认提交。",
+                            form.orig_type.label(),
+                            ctype.label()
+                        ));
+                    } else {
+                        let cat_code = dict::CONTRACT_CATEGORIES
+                            .get(form.category_idx)
+                            .map(|(c, _)| c.to_string())
+                            .unwrap_or_default();
+                        let pricing = match form.pricing_idx {
+                            0 => None,
+                            1 => Some(PricingMethod::LumpSum),
+                            2 => Some(PricingMethod::UnitPrice),
+                            _ => Some(PricingMethod::CostPlus),
+                        };
+                        let bid_method = Some(form.bid_method.clone());
+                        submit = Some((
+                            EditContract {
+                                contract_name: form.name.trim().to_string(),
+                                project_text: form.project_text.trim().to_string(),
+                                contractor_text: form.contractor_text.trim().to_string(),
+                                party_a: form.party_a.trim().to_string(),
+                                contract_type: ctype,
+                                contract_category_code: cat_code,
+                                sign_date: form.sign_date.trim().to_string(),
+                                duration_days: form.duration.trim().parse::<i64>().unwrap_or(0),
+                                planned_start: opt(&form.planned_start),
+                                planned_end: opt(&form.planned_end),
+                                pricing_method: pricing,
+                                retention_rate_bp: pct_to_bp(&form.retention),
+                                payment_terms: form.terms.trim().to_string(),
+                                remark: opt(&form.remark),
+                                bid_method,
+                                open_bid_date: opt(&form.open_bid_date),
+                                project_leader: opt(&form.project_leader),
+                                contact_info: opt(&form.contact_info),
+                                bid_agent_text: opt(&form.bid_agent_text),
+                                confirm_type_change: ctype != form.orig_type,
+                            },
+                            form.reason.trim().to_string(),
+                        ));
+                    }
                 }
                 if widgets::ghost_button(ui, &p, "取消").clicked() {
                     cancel = true;
@@ -3537,7 +3573,12 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                                     ui,
                                     &p,
                                     "招标方式",
-                                    c.bid_method.map(|b| b.label()).unwrap_or("—"),
+                                    // R-68（C3）：未知编码显示「未知(XXX)」而不是「—」，
+                                    // 让库里有的东西可见，不再静默丢成 NULL
+                                    &c.bid_method
+                                        .as_ref()
+                                        .map(|b| b.label())
+                                        .unwrap_or_else(|| "—".into()),
                                     200.0,
                                 );
                                 ro_field(
@@ -4512,6 +4553,22 @@ mod tests {
         assert_eq!(f.project_text, "测试项目", "不能把编码也塞进输入框");
     }
 
+    /// R-68（C3）：库里是未知招标方式编码时，修改窗原样保留（显示「未知(XXX)」、
+    /// 不改下拉就原样写回）；历史空值仍按 R-57 预选公开招标。
+    #[test]
+    fn 修改窗保留未知招标方式编码() {
+        let mut c = ctp_core::contract::Contract {
+            bid_method: Some(BidMethod::Unknown("TENDER_X".into())),
+            ..Default::default()
+        };
+        let f = EditContractForm::from_contract(&c, &[], &[]);
+        assert_eq!(f.bid_method, BidMethod::Unknown("TENDER_X".into()));
+        assert_eq!(f.bid_method.label(), "未知(TENDER_X)");
+        c.bid_method = None;
+        let f2 = EditContractForm::from_contract(&c, &[], &[]);
+        assert_eq!(f2.bid_method, BidMethod::Open);
+    }
+
     /// R-56：合同详情与修改窗预填共用同一取值口径——只给名称，不带项目编号；
     /// 详情查不到时兜底「—」，修改窗兜底空串。
     #[test]
@@ -4623,7 +4680,8 @@ mod tests {
         c.audit_report_no = None;
         let f = AuditForm::from_contract(&c, None);
         assert!(f.amount.is_empty());
-        assert_eq!(f.date, today_iso());
+        // R-68（C6）：默认日期按东八区
+        assert_eq!(f.date, today_local_iso());
         assert!(f.org.is_empty());
         assert!(f.report_no.is_empty());
         assert_eq!(f.reason, "结算审定");

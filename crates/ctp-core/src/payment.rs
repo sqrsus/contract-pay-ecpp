@@ -109,7 +109,6 @@ pub struct Payment {
     pub receive_account: Option<String>,
     pub status: PaymentStatus,
     pub operator_id: String,
-    pub print_count: i64,
     pub remark: Option<String>,
     pub is_deleted: bool,
     pub version: i64,

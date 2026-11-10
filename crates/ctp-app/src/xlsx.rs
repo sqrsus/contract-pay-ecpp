@@ -167,7 +167,22 @@ pub fn write_report(result: &ReportResult, path: &Path, operator: &str) -> Resul
     );
     ws.set_footer(footer.as_str());
 
-    workbook.save(path).map_err(xerr)?;
+    // R-68（#13）：先写临时文件再原子改名，覆盖已有导出时不留半截。
+    // 直接 `save(path)` 写一半失败（磁盘满 / 被占用）会把目标文件毁成打不开的
+    // 残档；`std::fs::rename` 在 Windows 上带 REPLACE_EXISTING，替换是原子的。
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    if let Err(e) = workbook.save(&tmp) {
+        // 临时文件写坏了就顺手清掉，别在导出目录留一堆 .tmp 残档
+        let _ = std::fs::remove_file(&tmp);
+        return Err(xerr(e));
+    }
+    std::fs::rename(&tmp, path).map_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+        xerr(format!(
+            "替换导出文件失败（可能正被 Excel 打开）：{}",
+            path.display()
+        ))
+    })?;
     Ok((result.rows.len(), ncols))
 }
 
@@ -264,6 +279,39 @@ mod tests {
         // xlsx 是 zip：头两个字节必须是 PK
         let head = std::fs::read(&path).unwrap();
         assert_eq!(&head[0..2], b"PK");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// R-68（#13）：覆盖已有导出走「临时文件 + 原子改名」，
+    /// 目标始终是完整 xlsx，且导出目录不留 .tmp 残档。
+    #[test]
+    fn 覆盖导出走原子改名且不留临时文件() {
+        use calamine::Reader;
+        let path = tmp_path("atomic");
+        let _ = std::fs::remove_file(&path);
+        let result = ReportResult::period(&period_rows());
+        write_report(&result, &path, "测试").unwrap();
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(&first[0..2], b"PK");
+
+        let mut short = period_rows();
+        short.truncate(1);
+        let small = ReportResult::period(&short);
+        assert_eq!(write_report(&small, &path, "测试").unwrap(), (1, 4));
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(&after[0..2], b"PK", "覆盖后仍必须是完整 xlsx");
+        assert_ne!(after, first, "覆盖后内容应换成新报表");
+        assert!(
+            !std::path::PathBuf::from(format!("{}.tmp", path.display())).exists(),
+            "不能留 .tmp 残档"
+        );
+        let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&path).unwrap();
+        let range = wb.worksheet_range("期间统计").unwrap();
+        assert!(
+            !cell_text(range.get_value((2, 0))).is_empty(),
+            "覆盖后的文件必须仍能正常打开并读到表头"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

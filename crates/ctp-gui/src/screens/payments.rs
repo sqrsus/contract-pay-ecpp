@@ -770,7 +770,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         if rows.is_empty() {
             app.error("还没有合同，无法生成批量拨款模板");
         } else {
-            let name = format!("批量拨款模板_{}.xlsx", ctp_core::date::today_iso());
+            let name = format!("批量拨款模板_{}.xlsx", ctp_core::date::today_local_iso());
             if let Some(path) = rfd::FileDialog::new()
                 .set_file_name(&name)
                 .add_filter("Excel 工作簿", &["xlsx"])

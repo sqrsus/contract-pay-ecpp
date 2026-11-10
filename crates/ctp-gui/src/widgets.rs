@@ -3,7 +3,6 @@
 //! 所有组件只依赖 `Palette`，因此浅色/深色两套主题下表现一致。
 
 use crate::theme::Palette;
-use ctp_core::date::today_iso;
 use eframe::egui::{self, Color32, Margin, Response, RichText, Rounding, Stroke, Ui, Vec2};
 
 /// 语义色调。
@@ -1375,7 +1374,8 @@ fn parse_ym(s: &str) -> Option<(i32, u32)> {
 }
 
 fn today_parts() -> (i32, u32, u32) {
-    let t = today_iso();
+    // R-68（C6）：日历高亮的「今天」按东八区，与业务默认日期同口径
+    let t = ctp_core::date::today_local_iso();
     let y = t.get(0..4).and_then(|x| x.parse().ok()).unwrap_or(2026);
     let m = t.get(5..7).and_then(|x| x.parse().ok()).unwrap_or(1);
     let d = t.get(8..10).and_then(|x| x.parse().ok()).unwrap_or(1);

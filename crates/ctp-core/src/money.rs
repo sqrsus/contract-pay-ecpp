@@ -109,6 +109,22 @@ impl Money {
         Money::parse_yuan(s).unwrap_or(Money::ZERO)
     }
 
+    /// 由「元」浮点值换算成分，**导入（Excel 数值格）的唯一入口**。
+    ///
+    /// `f64 as i64` 在 Rust 里是饱和转换：`1e16 * 100` 会直接变成 `i64::MAX` 原样入库，
+    /// 之后账目合计被钳成 i64 边界、视图比率溢出成 REAL，整张台账打不开。
+    /// 这里先做有限性与上限判断，再转换，任何越界都返回错误交给「该行失败」处理。
+    pub fn from_yuan_f64(yuan: f64) -> Result<Money> {
+        if !yuan.is_finite() || yuan < 0.0 {
+            return Err(DomainError::MoneyFormat(format!("{yuan}")));
+        }
+        let cent = (yuan * 100.0).round();
+        if cent > Money::MAX_SINGLE_CENT as f64 {
+            return Err(DomainError::MoneyOverflow);
+        }
+        Ok(Money(cent as i64))
+    }
+
     pub fn checked_add(self, o: Money) -> Result<Money> {
         self.0
             .checked_add(o.0)
