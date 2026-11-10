@@ -149,6 +149,8 @@ fn sort_summaries(rows: &mut [ctp_core::ledger::ContractSummary], key: LedgerSor
 }
 
 enum Act {
+    /// 点击行内任意位置（字段以外）：只把右侧栏切到该行，不打开任何弹窗（R-66）
+    SelectRow(String),
     /// 点击合同名称：选中该行并打开只读详情弹窗
     DetailModal(String),
     /// 点击累计已付金额：选中并展开 / 收起拨款明细
@@ -173,6 +175,37 @@ const STATUSES: [ContractStatus; 2] = [ContractStatus::Performing, ContractStatu
 
 /// 落位容差：小于这个位移不值得补，免得为亚像素反复触发滚动（R-61 / R-62）
 const ANCHOR_EPSILON: f32 = 0.5;
+
+/// 右侧栏不再随「是否选中」出现 / 消失，只有窗口窄到连 5 列都放不下时才让位。
+/// 这个宽度是反推出来的：侧栏 344 + 间距 12 + 卡片内边距 34 + 5 列最小需求 514 ≈ 904（R-66）
+const DETAIL_MIN_W: f32 = 920.0;
+
+/// 右侧栏是否显示（R-66）。单独成函数是为了让阈值可以被测试钉住 ——
+/// 这里一旦写反，要么窄窗口把表格挤爆，要么侧栏又变成「点了才有」。
+fn detail_visible(avail_w: f32) -> bool {
+    avail_w >= DETAIL_MIN_W
+}
+
+/// 进台账时的默认焦点（R-66）：已选中就保持不变，没选中就落到当前列表首行。
+/// 只读纯函数，避免在绘制里写「如果没有选中就 select」这种容易每帧重查数据库的分支。
+fn initial_focus(
+    rows: &[ctp_core::ledger::ContractSummary],
+    selected: Option<&str>,
+) -> Option<String> {
+    match selected {
+        Some(id) => Some(id.to_string()),
+        None => rows.first().map(|s| s.contract_id.clone()),
+    }
+}
+
+/// 行高记忆的 key：整行可点区域必须在行内容之前注册（否则会抢走字段的点击），
+/// 所以只能用上一帧实测的行高（R-66）
+fn row_h_id() -> egui::Id {
+    egui::Id::new("contract_ledger_row_h")
+}
+
+/// 首帧还没有实测值时用的兜底行高：单行文字 + 上下各 3px 内边距（R-66）
+const ROW_H_FALLBACK: f32 = 26.0;
 
 /// 点开一行的落位补偿量：正数表示内容需要向下移动（滚动条向上）。
 ///
@@ -252,7 +285,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui,
         &p,
         "合同台账",
-        "点击合同名称看详情；点击累计已付金额展开拨款明细；点击承包单位看该单位的其他合同",
+        "点击合同名称看详情；点击累计已付金额展开拨款明细；点击承包单位看该单位的其他合同；点击行内任意位置切换右侧栏",
     );
 
     let mut action: Option<Act> = None;
@@ -344,8 +377,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // R-50：详情卡放了 5 个操作按钮（附件 / 审计价 / 交工 / 信息修改 / 拨款），
     // 300 放不下，加宽到 344；列表最小宽按 748 反推阈值。
     let detail_w = 344.0_f32;
-    // 详情卡要占 344 + 12，窗口太窄时先保证列表不被挤压：不显示详情卡
-    let show_detail = app.selected.is_some() && !app.narrow && avail_w > 1104.0;
+    // R-66：右侧栏始终可见（不再由「有没有选中」决定），窗口窄到装不下 5 列才让位。
+    // 因为侧栏宽度恒定，选中 / 切换焦点不会再改变表格宽度 → 不会触发降列、也不会让面板消失。
+    let show_detail = detail_visible(avail_w);
     let table_w = if show_detail {
         avail_w - detail_w - 12.0
     } else {
@@ -371,7 +405,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         return;
                     }
 
-                    // 选中合同后右侧详情卡会把表格压窄：按「列宽需求」逐级降列，
+                    // R-66：右侧栏始终可见 —— 没有选中任何合同时，焦点默认落在当前列表首行，
+                    // 保证进页面就能看到一份合同。已选中（哪怕被搜索 / 状态筛选隐藏）时不动，
+                    // 避免用户正在看的那份合同被悄悄换掉。
+                    if let Some(id) = initial_focus(&rows, app.selected.as_deref()) {
+                        if app.selected.as_deref() != Some(id.as_str()) {
+                            app.select(&id);
+                        }
+                    }
+
+                    // 右侧详情卡会把表格压窄：按「列宽需求」逐级降列，
                     // 避免固定列宽总和超出卡片，把详情卡挤出窗口右边界。
                     let c_no = 90.0;
                     let c_paid = 104.0;
@@ -462,6 +505,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let mut detail: Option<String> = None;
                     let mut expand: Option<String> = None;
                     let mut expand_contractor: Option<String> = None;
+                    // R-66：点中了行的空白处（没落到任何字段上）→ 只换右侧栏焦点
+                    let mut clicked_row: Option<String> = None;
                     let mut open_pay: Option<String> = None;
                     let mut keep_rect: Option<egui::Rect> = None;
                     // 本帧处于展开态的行序号与它面板的高度（互斥，最多一个）
@@ -514,7 +559,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
-                                egui::Frame::none()
+                                // R-66：整行可点 —— 点行内任意位置把右侧栏切到该行。
+                                // 注册顺序必须在这里（行内容之前）：egui 的命中判定取「最后注册」的那个
+                                // widget（hit_test.rs: hit_click = ...last()），先注册整行、再注册行内
+                                // 字段，字段自然优先，落在空白 / 纯展示文字上时才由整行响应接住。
+                                // 行高取上一帧实测值（单行高度固定），首帧用兜底值 —— 若按行间距一起算，
+                                // 相邻两行的可点区会叠在一起，点边界会落到下一行。
+                                let row_h = ui
+                                    .memory(|m| m.data.get_temp::<f32>(row_h_id()))
+                                    .unwrap_or(ROW_H_FALLBACK);
+                                let row_rect = egui::Rect::from_min_size(
+                                    egui::pos2(ui.cursor().left(), row_top),
+                                    egui::vec2(card_w.max(1.0), row_h),
+                                );
+                                let row_resp = ui
+                                    .interact(
+                                        row_rect,
+                                        ui.id().with(("ledger_row", &s.contract_id)),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let row_frame = egui::Frame::none()
                                     .fill(fill)
                                     .inner_margin(egui::Margin::symmetric(0.0, 3.0))
                                     .show(ui, |ui| {
@@ -714,6 +779,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             });
                                         });
                                     });
+                                // 本行实测高度留给下一帧的整行可点区域（R-66）
+                                ui.memory_mut(|m| {
+                                    m.data
+                                        .insert_temp(row_h_id(), row_frame.response.rect.height())
+                                });
+                                if row_resp.clicked() {
+                                    clicked_row = Some(s.contract_id.clone());
+                                }
                                 if expanded {
                                     let panel = expand_panel(
                                         ui,
@@ -808,12 +881,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         app.pending_offset_fix = Some(fix);
                     }
 
+                    // R-66：行内点击的优先级低于字段点击 —— 字段已经接管了这一帧的点击
+                    // （egui 一次按键只判给一个 widget），这里只兜住落在空白处的那些。
                     if let Some(id) = expand {
                         action = Some(Act::Expand(id));
                     } else if let Some(id) = expand_contractor {
                         action = Some(Act::ExpandContractor(id));
                     } else if let Some(id) = detail {
                         action = Some(Act::DetailModal(id));
+                    } else if let Some(id) = clicked_row {
+                        action = Some(Act::SelectRow(id));
                     }
                     if let Some(id) = open_pay {
                         action = Some(Act::OpenPayment(id));
@@ -909,6 +986,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     match action {
+        Some(Act::SelectRow(id)) => {
+            // R-66：点中行的空白处只换右侧栏焦点 —— 不展开、不弹窗、不动滚动位置
+            app.select(&id);
+        }
         Some(Act::DetailModal(id)) => {
             // R-60：点合同名称看详情时同时选中该行，右侧详情卡与弹窗保持同一份合同
             app.select(&id);
@@ -926,6 +1007,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             app.toggle_expand(&id);
         }
         Some(Act::ExpandContractor(id)) => {
+            // R-66：字段点击也同步切换焦点。侧栏宽度恒定后，选中不再引发降列，
+            // R-59 当初「不 select 以免面板消失」的顾虑已经不成立。
+            app.select(&id);
             if app.expanded_contractor.as_deref() != Some(id.as_str()) {
                 if let Some(top) = clicked_top {
                     app.pending_expand_settle = Some((id.clone(), top));
@@ -1466,6 +1550,23 @@ fn contractor_panel_body(
 fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f32) {
     let p = app.pal;
     let Some(s) = app.selected_summary() else {
+        // R-66：侧栏始终占位 —— 列表为空（筛选无结果 / 库为空）时给一句说明，
+        // 不留一块没有边界的空白，也不让「侧栏时有时无」回归
+        widgets::card(&p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("未选择合同")
+                    .size(13.0)
+                    .strong()
+                    .color(p.text_muted),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("点击左侧表格任意一行，这里显示该合同的金额、支付率与操作入口。")
+                    .size(11.5)
+                    .color(p.text_muted),
+            );
+        });
         return;
     };
     let d = app.detail.as_ref();
@@ -1561,7 +1662,8 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                     "交工日期",
                     d.delivery_date.as_deref().unwrap_or("—"),
                 );
-                widgets::kv(ui, &p, "合同类型", d.contract_type.label());
+                // R-66：合同类型 / 开标时间 / 招标代理三行已移除 ——
+                // 侧栏改为常驻后高度更紧张，这三项在「合同信息修改」里都能看到
                 widgets::kv(
                     ui,
                     &p,
@@ -1571,27 +1673,10 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
                 widgets::kv(
                     ui,
                     &p,
-                    "开标时间",
-                    d.open_bid_date.as_deref().unwrap_or("—"),
-                );
-                widgets::kv(
-                    ui,
-                    &p,
                     "项目负责人",
                     d.project_leader.as_deref().unwrap_or("—"),
                 );
                 widgets::kv(ui, &p, "联系方式", d.contact_info.as_deref().unwrap_or("—"));
-                let agent_name = d
-                    .bid_agent_id
-                    .as_ref()
-                    .and_then(|id| {
-                        app.contractors
-                            .iter()
-                            .find(|c| &c.id == id)
-                            .map(|c| c.contractor_name.clone())
-                    })
-                    .unwrap_or_else(|| "—".to_string());
-                widgets::kv(ui, &p, "招标代理", &agent_name);
             }
         }
 
@@ -1995,5 +2080,30 @@ mod tests {
         assert_eq!(v.label, "项目状态");
         assert!(!v.active);
         assert!(v.tip.is_empty());
+    }
+
+    /// R-66：右侧栏在常规宽度始终保留，只有窄到装不下 5 列时才让位
+    #[test]
+    fn 右侧栏在常规宽度始终可见() {
+        assert!(detail_visible(1400.0));
+        assert!(detail_visible(DETAIL_MIN_W));
+        // 差一个像素就不再挤表格：阈值必须是「大于等于」才显示
+        assert!(!detail_visible(DETAIL_MIN_W - 1.0));
+        assert!(!detail_visible(640.0));
+    }
+
+    /// R-66：默认焦点 —— 没选中时落到列表首行；已选中时一律不动，
+    /// 哪怕这份合同已经被搜索 / 状态筛选隐藏（用户正在看的东西不该被悄悄换掉）
+    #[test]
+    fn 未选中时默认聚焦列表首行() {
+        let rows = vec![
+            summary("C1", "HT-1", "一号", "甲", 100),
+            summary("C2", "HT-2", "二号", "乙", 200),
+        ];
+        assert_eq!(initial_focus(&rows, None), Some("C1".to_string()));
+        assert_eq!(initial_focus(&rows, Some("C2")), Some("C2".to_string()));
+        assert_eq!(initial_focus(&rows, Some("C9")), Some("C9".to_string()));
+        // 列表为空：没有可聚焦的行，交给侧栏的空态
+        assert_eq!(initial_focus(&[], None), None);
     }
 }
