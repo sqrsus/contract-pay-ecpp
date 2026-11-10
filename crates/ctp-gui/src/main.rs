@@ -203,10 +203,9 @@ pub struct App {
     /// 合同台账里展开「该单位其他合同」的那一行（合同 id）。
     /// 与 `expanded_contract` 同构：都按行 id 记，互斥，点空白处收起（R-59 / R-60）
     pub expanded_contractor: Option<String>,
-    /// 切换展开目标时的滚动锚点：(行 id, 点击时该行顶部的屏幕纵坐标)。
-    /// 被收起的面板会把它下方的行整体带上去一个面板高度，下一帧按这个锚点补偿滚动偏移，
-    /// 让被点击的那一行停在原处（R-61）
-    pub pending_expand_anchor: Option<(String, f32)>,
+    /// 点开某个展开入口后要落位的那一行：(行 id, 点击时该行顶部的屏幕纵坐标)。
+    /// 面板画完时按它算一次落位补偿：把行钉回点击时的位置，并把新面板夹进可视区（R-61 / R-62）
+    pub pending_expand_settle: Option<(String, f32)>,
     /// 合同台账列表上一帧的滚动偏移。下一帧预修正时以它为基准（R-61）
     pub ledger_offset: f32,
     /// 待应用的偏移修正量：被收起面板的高度（正数 = 内容需要往下挪这么多）。
@@ -402,7 +401,7 @@ impl App {
             detail: None,
             expanded_contract: None,
             expanded_contractor: None,
-            pending_expand_anchor: None,
+            pending_expand_settle: None,
             ledger_offset: 0.0,
             pending_offset_fix: None,
             pay_contract: None,

@@ -33,13 +33,44 @@ enum Act {
 
 const STATUSES: [ContractStatus; 2] = [ContractStatus::Performing, ContractStatus::Closed];
 
-/// 滚动锚定的容差：小于这个位移不值得补，免得为亚像素反复触发滚动（R-61）
+/// 落位容差：小于这个位移不值得补，免得为亚像素反复触发滚动（R-61 / R-62）
 const ANCHOR_EPSILON: f32 = 0.5;
 
-/// 锚定补偿量：正数表示内容要向下移动（被点击的行被上方收起的面板带上去了）。
-/// 单独成函数是为了让符号方向可以被测试钉住 —— 这里写反会让跳动翻倍（R-61）
-fn anchor_delta(anchor_y: f32, current_y: f32) -> f32 {
-    anchor_y - current_y
+/// 点开一行的落位补偿量：正数表示内容需要向下移动（滚动条向上）。
+///
+/// 一次算清两件事：① 被点击的行要停在点击时的屏幕位置（上方面板收起会把它带走）；
+/// ② 新展开的面板必须落在视口里 —— 行的位置钉死时面板只能往下长，长到视口下边界之外
+/// 就得把内容往上推，否则展开的东西全在可视区之外、要手动滚才能看到。
+/// 所以先定行的位置（放得下就钉回原位，放不下就贴顶），再把整块夹进视口（R-62）。
+///
+/// 单独成函数是为了让符号与边界可以被测试钉住 —— 这里写反会把面板推得更远。
+fn settle_delta(
+    row_top: f32,
+    block_bottom: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    anchor_top: f32,
+) -> f32 {
+    let view_h = (clip_bottom - clip_top).max(0.0);
+    let block_h = (block_bottom - row_top).max(0.0);
+
+    // ① 能整块放进视口：行回到点击时的位置；放不下：行贴视口顶部，尽可能多露面板
+    let mut top = if block_h <= view_h {
+        anchor_top
+    } else {
+        clip_top
+    };
+
+    // ② 整块往上夹：面板越出下边界时刚好贴着底边，不再多滚
+    if block_h <= view_h && top + block_h > clip_bottom {
+        top = clip_bottom - block_h;
+    }
+    // ③ 不越过上边界：点完之后用户又滚过一段时，锚点可能已经跑到视口外面
+    if top < clip_top {
+        top = clip_top;
+    }
+
+    top - row_top
 }
 
 /// 帧末是否要收起面板：只在点了面板以外的区域时才收，且「点展开入口」优先。
@@ -195,8 +226,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let rows = filtered_summaries(app);
 
                     if rows.is_empty() {
-                        // R-61：空列表不会再有锚定 / 预修正对象，清掉残留，避免筛选变化后误用旧坐标
-                        app.pending_expand_anchor = None;
+                        // R-61：空列表不会再有落位 / 预修正对象，清掉残留，避免筛选变化后误用旧坐标
+                        app.pending_expand_settle = None;
                         app.pending_offset_fix = None;
                         widgets::empty_state(ui, &p, "没有符合条件的合同");
                         return;
@@ -283,7 +314,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let mut open_panel_h: f32 = 0.0;
 
                     // R-61：切换展开目标时，被收起的面板会让它下方的行整体上移一个面板高度。
-                    // 这里在构造列表之前就把偏移补掉，切换那一帧就不跳；锚点只负责补残差。
+                    // 这里在构造列表之前就把偏移补掉，切换那一帧就不跳；
+                    // 残余的落位（含把新面板推进视口）由面板画完后的 settle 一次算清（R-62）。
                     let mut scroll = egui::ScrollArea::vertical()
                         .id_salt("contract_list_scroll")
                         .auto_shrink([false, false])
@@ -295,21 +327,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     let scroll_out = scroll
                         .show(ui, |ui| {
                             for (idx, s) in rows.iter().enumerate() {
-                                // R-61：本行顶部（与上一帧同一套坐标），滚动锚定按它对齐
+                                // 本行顶部（与上一帧同一套坐标），落位按它对齐（R-61 / R-62）
                                 let row_top = ui.cursor().top();
-                                // R-61：上一帧点了这一行的展开入口 → 它本该停在这里，
-                                // 但上方被收起的面板已把内容带偏，这里把偏移补回来
-                                if let Some((id, anchor_y)) = app.pending_expand_anchor.as_ref() {
-                                    if id == &s.contract_id {
-                                        let dy = anchor_delta(*anchor_y, row_top);
-                                        if dy.abs() > ANCHOR_EPSILON {
-                                            ui.scroll_with_delta_animation(
-                                                egui::vec2(0.0, dy),
-                                                egui::style::ScrollAnimation::none(),
-                                            );
-                                        }
-                                    }
-                                }
+                                // 本行面板的底边：没有展开面板时为 None（R-62）
+                                let mut panel_bottom: Option<f32> = None;
                                 // 本行所有显示文本来自 ReportResult；交互仍按列语义绘制
                                 let cells = &result.rows[idx];
                                 let text_of = |key: &str| -> String {
@@ -547,6 +568,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     keep_rect = Some(paid_rect.map_or(panel, |n| n.union(panel)));
                                     open_idx = Some(idx);
                                     open_panel_h = panel.height();
+                                    panel_bottom = Some(panel.bottom());
                                 }
                                 if contractor_open {
                                     // R-59：取全量台账（不受搜索 / 状态筛选影响），排除当前行
@@ -567,6 +589,31 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     keep_rect = Some(keep_rect.map_or(union, |k| k.union(union)));
                                     open_idx = Some(idx);
                                     open_panel_h = panel.height();
+                                    panel_bottom = Some(panel.bottom());
+                                }
+                                // R-62：落位。必须放在面板绘制之后 —— 面板里的 TableBuilder
+                                // 自带一层 ScrollArea，它在自己的 end() 里会无条件 take 掉本帧的
+                                // 滚动指令（egui 0.29 scroll_area.rs:820），在行顶部发出的补偿
+                                // 会被这层内嵌滚动区吞掉，只有这里才真正落到台账列表自己身上。
+                                if let (Some(panel_bottom), Some((id, anchor_top))) =
+                                    (panel_bottom, app.pending_expand_settle.as_ref())
+                                {
+                                    if id == &s.contract_id {
+                                        let clip = ui.clip_rect();
+                                        let delta = settle_delta(
+                                            row_top,
+                                            panel_bottom,
+                                            clip.top(),
+                                            clip.bottom(),
+                                            *anchor_top,
+                                        );
+                                        if delta.abs() > ANCHOR_EPSILON {
+                                            ui.scroll_with_delta_animation(
+                                                egui::vec2(0.0, delta),
+                                                egui::style::ScrollAnimation::none(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -595,8 +642,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     });
 
                     ui.memory_mut(|m| m.data.insert_temp(keep_id, keep_rect));
-                    // R-61：锚点只服务一帧 —— 绘制时已按它补偿过（或该行不在结果里），到此清掉
-                    app.pending_expand_anchor = None;
+                    // R-62：落位目标只服务一帧 —— 绘制时已按它补偿过（或该行不在结果里），到此清掉
+                    app.pending_expand_settle = None;
                     // R-61：被收起的面板在这一行之上，下一帧把这一个面板的高度补回去
                     let fix = offset_fix_for(open_idx, clicked_idx, open_panel_h);
                     if fix > 0.0 {
@@ -711,10 +758,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         Some(Act::Expand(id)) => {
             app.select(&id);
-            // R-61：从别的行切过来时才锚定 —— 收起自己不会移动本行，不需要补偿
+            // R-62：每一次「点开」都记落位目标。首次展开虽然没有旧面板可参照，
+            // 面板同样可能长在视口之外；只有再点一次收起（本行原本已展开）才不需要定位。
             if app.expanded_contract.as_deref() != Some(id.as_str()) {
                 if let Some(top) = clicked_top {
-                    app.pending_expand_anchor = Some((id.clone(), top));
+                    app.pending_expand_settle = Some((id.clone(), top));
                 }
             }
             app.toggle_expand(&id);
@@ -722,7 +770,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         Some(Act::ExpandContractor(id)) => {
             if app.expanded_contractor.as_deref() != Some(id.as_str()) {
                 if let Some(top) = clicked_top {
-                    app.pending_expand_anchor = Some((id.clone(), top));
+                    app.pending_expand_settle = Some((id.clone(), top));
                 }
             }
             app.toggle_contractor(&id);
@@ -1488,20 +1536,23 @@ mod tests {
         );
     }
 
-    /// R-61：锚定补偿的符号 —— 行被上方面板带上去（current 小于 anchor）时要往下补，
-    /// 写反会让跳动翻倍。位置没变时为零，落在容差内不触发滚动。
+    /// R-62：落位补偿 —— 放得下就把行钉回点击时的位置；面板越出下边界就把内容上推，
+    /// 刚好放下为止；块比视口还高就让行贴顶。符号写反会把面板推得更远。
     #[test]
-    fn 锚定按被点击行的原位置补偿() {
-        // 上方面板收起，行从 400 被带到 250：内容需要向下移 150
-        assert_eq!(anchor_delta(400.0, 250.0), 150.0);
-        assert!(anchor_delta(400.0, 250.0) > 0.0);
-        // 反向（内容被往下推）时为负
-        assert_eq!(anchor_delta(250.0, 400.0), -150.0);
-        // 位置没变：零补偿，且低于触发阈值
-        assert_eq!(anchor_delta(300.0, 300.0), 0.0);
-        assert!(anchor_delta(300.0, 300.0).abs() < ANCHOR_EPSILON);
-        // 亚像素位移也不补，避免为抖动反复滚动
-        assert!(anchor_delta(300.0, 300.2).abs() < ANCHOR_EPSILON);
+    fn 落位补偿把展开块留进视口() {
+        // 视口纵向范围 100..=600（高 500）
+        // 1) 行在中部、整块（行 300 → 面板底 420）本来就看得见：零补偿
+        assert_eq!(settle_delta(300.0, 420.0, 100.0, 600.0, 300.0), 0.0);
+        // 2) 行贴着底边、面板越出下边界 80：内容上移 80，面板刚好贴底
+        assert_eq!(settle_delta(500.0, 680.0, 100.0, 600.0, 500.0), -80.0);
+        // 3) 上方面板被收起，行从 300 被带到 100：内容下移 200 钉回原位
+        assert_eq!(settle_delta(100.0, 300.0, 100.0, 600.0, 300.0), 200.0);
+        // 4) 块比视口还高（700 > 500）：行贴顶，至少露出面板开头
+        assert_eq!(settle_delta(400.0, 1100.0, 100.0, 600.0, 400.0), -300.0);
+        // 5) 点完之后用户又滚过一段，锚点跑到视口之上：拉回到顶，不留空白
+        assert_eq!(settle_delta(80.0, 200.0, 100.0, 600.0, 40.0), 20.0);
+        // 6) 锚点与当前行只差 0.3px：落在容差内，不触发滚动
+        assert!(settle_delta(300.3, 420.0, 100.0, 600.0, 300.0).abs() < ANCHOR_EPSILON);
     }
 
     /// R-61：偏移预修正只在上方面板被收起时才给量 ——
