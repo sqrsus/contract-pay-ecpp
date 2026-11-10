@@ -15,6 +15,8 @@ enum Act {
     DetailModal(String),
     /// 点击合同名称：选中并展开 / 收起拨款明细
     Expand(String),
+    /// 点击承包单位：在该行下方展开 / 收起该单位的其他合同（R-59）：(单位名称, 当前行合同 id)
+    ExpandContractor(String, String),
     /// 展开区里点拨款单号：打开单据详情
     OpenPayment(String),
     New,
@@ -34,15 +36,17 @@ const STATUSES: [ContractStatus; 2] = [ContractStatus::Performing, ContractStatu
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
 
-    // 展开的拨款明细：点击名称/面板以外的区域自动收起（用上一帧的矩形判断）
+    // 展开的拨款明细 / 单位合同面板：点击面板以外区域自动收起（用上一帧的矩形判断）
     let keep_id = egui::Id::new("contract_expand_keep");
     let keep: Option<egui::Rect> = ui
         .memory(|m| m.data.get_temp::<Option<egui::Rect>>(keep_id))
         .flatten();
-    if app.expanded_contract.is_some() && ui.input(|i| i.pointer.any_pressed()) {
+    let any_panel = app.expanded_contract.is_some() || app.expanded_contractor.is_some();
+    if any_panel && ui.input(|i| i.pointer.any_pressed()) {
         if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
             if keep.is_none_or(|r| !r.contains(pos)) {
                 app.expanded_contract = None;
+                app.expanded_contractor = None;
             }
         }
     }
@@ -50,7 +54,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui,
         &p,
         "合同台账",
-        "点击编号查看详情；点击合同名称展开该合同的拨款明细",
+        "点击编号看详情；点击合同名称展开拨款明细；点击承包单位看该单位的其他合同",
     );
 
     let mut action: Option<Act> = None;
@@ -235,6 +239,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     let mut detail: Option<String> = None;
                     let mut expand: Option<String> = None;
+                    let mut expand_contractor: Option<(String, String)> = None;
                     let mut open_pay: Option<String> = None;
                     let mut keep_rect: Option<egui::Rect> = None;
 
@@ -259,7 +264,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 let selected = app.selected.as_deref() == Some(&s.contract_id);
                                 let expanded =
                                     app.expanded_contract.as_deref() == Some(&s.contract_id);
+                                // R-59：该行承包单位是否处于展开态（只认当前行，单位同名行不一起展开）
+                                let contractor_open = matches!(
+                                    app.expanded_contractor.as_ref(),
+                                    Some((c, a)) if c == &s.contractor_name && a == &s.contract_id
+                                );
                                 let mut name_rect: Option<egui::Rect> = None;
+                                let mut contractor_rect: Option<egui::Rect> = None;
                                 let fill = if idx % 2 == 1 {
                                     p.surface_alt
                                 } else {
@@ -330,14 +341,41 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             });
                                             if !compact {
                                                 table_cell(ui, c_contractor, false, |ui| {
-                                                    let contractor = text_of("contractor_name");
-                                                    widgets::marquee(
+                                                    // R-59：承包单位是「该单位其他合同」的入口，
+                                                    // 展开时用主色，便于一眼看出当前展开的是哪一行
+                                                    let contractor = s.contractor_name.clone();
+                                                    let is_open = matches!(
+                                                        app.expanded_contractor.as_ref(),
+                                                        Some((c, a))
+                                                            if c == &contractor
+                                                                && a == &s.contract_id
+                                                    );
+                                                    let color = if is_open {
+                                                        p.primary
+                                                    } else {
+                                                        p.text_muted
+                                                    };
+                                                    let r = widgets::marquee_sense(
                                                         ui,
                                                         &contractor,
                                                         (c_contractor - 8.0).max(20.0),
                                                         12.0,
-                                                        p.text_muted,
+                                                        color,
+                                                        egui::Sense::click(),
+                                                    )
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                    .on_hover_text(
+                                                        "点击查看该单位的其他合同；名称过长时悬停自动滚动",
                                                     );
+                                                    if r.clicked() {
+                                                        expand_contractor = Some((
+                                                            contractor.clone(),
+                                                            s.contract_id.clone(),
+                                                        ));
+                                                    }
+                                                    if is_open {
+                                                        contractor_rect = Some(r.rect);
+                                                    }
                                                 });
                                                 table_cell(ui, c_amount, true, |ui| {
                                                     ui.label(
@@ -413,6 +451,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                     );
                                     keep_rect = Some(name_rect.map_or(panel, |n| n.union(panel)));
                                 }
+                                if contractor_open {
+                                    // R-59：取全量台账（不受搜索 / 状态筛选影响），排除当前行
+                                    let others = other_contracts_of(
+                                        &app.summaries,
+                                        &s.contractor_name,
+                                        &s.contract_id,
+                                    );
+                                    let panel = contractor_panel(
+                                        ui,
+                                        &p,
+                                        &s.contract_id,
+                                        &s.contractor_name,
+                                        &others,
+                                        &mut detail,
+                                    );
+                                    let union = contractor_rect.map_or(panel, |c| c.union(panel));
+                                    keep_rect = Some(keep_rect.map_or(union, |k| k.union(union)));
+                                }
                             }
                         });
 
@@ -442,6 +498,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     if let Some(id) = expand {
                         action = Some(Act::Expand(id));
+                    } else if let Some((name, anchor)) = expand_contractor {
+                        action = Some(Act::ExpandContractor(name, anchor));
                     } else if let Some(id) = detail {
                         action = Some(Act::DetailModal(id));
                     }
@@ -530,6 +588,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             app.select(&id);
             app.toggle_expand(&id);
         }
+        Some(Act::ExpandContractor(name, anchor)) => app.toggle_contractor(&name, &anchor),
         Some(Act::OpenPayment(id)) => app.open_payment(&id),
         Some(Act::New) => {
             app.new_contract = crate::dialogs::ContractForm::default();
@@ -810,6 +869,207 @@ fn expand_panel(
     start.union(ui.min_rect())
 }
 
+/// R-59：同一承包单位的其他合同——按承包单位名称在全量台账里取，排除当前行。
+/// 单位名称在字典里不是唯一键，同名单位会被并到一起（台账本就按名称展示，界面无法再区分）。
+fn other_contracts_of<'a>(
+    all: &'a [ctp_core::ledger::ContractSummary],
+    contractor_name: &str,
+    current_id: &str,
+) -> Vec<&'a ctp_core::ledger::ContractSummary> {
+    all.iter()
+        .filter(|o| o.contractor_name == contractor_name && o.contract_id != current_id)
+        .collect()
+}
+
+/// R-59：点承包单位后在该行下方展开的面板，沿用「拨款明细」展开卡的同款样式。
+/// `anchor` 是当前行合同 id，只用来给面板内的表格划出独立 id 作用域——
+/// 同一帧里若有多张表，自动生成的 id 会撞车（egui 会报 “First/Second use of Table ID”）。
+/// 列：合同编号 / 合同名称 / 合同金额 / 审计价 / 支付率 / 项目状态；点编号或名称打开合同详情。
+fn contractor_panel(
+    ui: &mut egui::Ui,
+    p: &crate::theme::Palette,
+    anchor: &str,
+    contractor: &str,
+    others: &[&ctp_core::ledger::ContractSummary],
+    open: &mut Option<String>,
+) -> egui::Rect {
+    let start = ui.min_rect();
+    ui.push_id(("contractor_panel", anchor), |ui| {
+        contractor_panel_body(ui, p, contractor, others, open);
+    });
+    ui.add_space(3.0);
+    start.union(ui.min_rect())
+}
+
+fn contractor_panel_body(
+    ui: &mut egui::Ui,
+    p: &crate::theme::Palette,
+    contractor: &str,
+    others: &[&ctp_core::ledger::ContractSummary],
+    open: &mut Option<String>,
+) -> egui::Rect {
+    let start = ui.min_rect();
+    egui::Frame::none()
+        .fill(p.primary_soft)
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("承包单位其他合同 · {} 份", others.len()))
+                        .size(12.0)
+                        .strong()
+                        .color(p.text),
+                );
+                if !others.is_empty() {
+                    let total = Money::sum_saturating(others.iter().map(|o| o.total_amount.cent()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "合计合同金额 {} 元",
+                                Money::from_cent(total).format_yuan()
+                            ))
+                            .size(11.5)
+                            .color(p.text_muted),
+                        );
+                    });
+                }
+            });
+            ui.add_space(4.0);
+
+            if others.is_empty() {
+                ui.label(
+                    RichText::new(format!("{contractor} 名下暂无其他合同"))
+                        .size(11.5)
+                        .color(p.text_muted),
+                );
+                return;
+            }
+
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let tb = TableBuilder::new(ui)
+                .striped(false)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(90.0))
+                .column(Column::remainder().at_least(120.0))
+                .column(Column::auto().at_least(104.0))
+                .column(Column::auto().at_least(96.0))
+                .column(Column::auto().at_least(84.0))
+                .column(Column::auto().at_least(76.0));
+            tb.header(22.0, |mut h| {
+                for (title, right) in [
+                    ("合同编号", false),
+                    ("合同名称", false),
+                    ("合同金额", true),
+                    ("审计价", true),
+                    ("支付率", true),
+                    ("项目状态", false),
+                ] {
+                    h.col(|ui| {
+                        let text = RichText::new(title).size(11.5).color(p.text_muted);
+                        if right {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(text);
+                                },
+                            );
+                        } else {
+                            ui.label(text);
+                        }
+                    });
+                }
+            })
+            .body(|mut body| {
+                for o in others {
+                    body.row(24.0, |mut row| {
+                        row.col(|ui| {
+                            if widgets::link(ui, p, &o.contract_no, 11.5)
+                                .on_hover_text("查看合同详情")
+                                .clicked()
+                            {
+                                *open = Some(o.contract_id.clone());
+                            }
+                        });
+                        row.col(|ui| {
+                            let w = ui.available_width().max(20.0);
+                            let r = widgets::marquee_sense(
+                                ui,
+                                &o.contract_name,
+                                w,
+                                11.5,
+                                p.text,
+                                egui::Sense::click(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("查看合同详情；名称过长时悬停自动滚动");
+                            if r.clicked() {
+                                *open = Some(o.contract_id.clone());
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(o.total_amount.format_yuan())
+                                            .size(11.5)
+                                            .color(p.text),
+                                    );
+                                },
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(if o.is_audited {
+                                            o.audit_price
+                                                .map(|v| v.format_yuan())
+                                                .unwrap_or_else(|| "—".into())
+                                        } else {
+                                            "—".into()
+                                        })
+                                        .size(11.5)
+                                        .color(if o.is_audited { p.text } else { p.text_muted }),
+                                    );
+                                },
+                            );
+                        });
+                        row.col(|ui| {
+                            let frac = o.pay_rate.bp() as f32 / 10_000.0;
+                            let color = if o.is_inverted {
+                                p.danger
+                            } else if frac > 0.99 {
+                                p.warn
+                            } else {
+                                p.primary
+                            };
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(o.pay_rate.percent_string())
+                                            .size(11.5)
+                                            .color(color),
+                                    );
+                                },
+                            );
+                        });
+                        row.col(|ui| {
+                            let (st, tone) = project_status(o);
+                            widgets::badge(ui, p, st, tone);
+                        });
+                    });
+                }
+            });
+        });
+    start.union(ui.min_rect())
+}
+
 fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f32) {
     let p = app.pal;
     let Some(s) = app.selected_summary() else {
@@ -1005,4 +1265,71 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ctp_core::ledger::ContractSummary;
+    use ctp_core::rate::Rate;
+
+    fn summary(
+        id: &str,
+        no: &str,
+        name: &str,
+        contractor: &str,
+        amount_cent: i64,
+    ) -> ContractSummary {
+        ContractSummary {
+            contract_id: id.into(),
+            project_id: "P".into(),
+            contract_no: no.into(),
+            contract_name: name.into(),
+            status: "PERFORMING".into(),
+            contractor_name: contractor.into(),
+            contract_type: "CONSTRUCT".into(),
+            contract_category_code: "GC".into(),
+            category_code: None,
+            category_name: None,
+            total_amount: Money::from_cent(amount_cent),
+            audit_price: None,
+            is_audited: false,
+            base_amount: Money::from_cent(amount_cent),
+            audit_reduction: Money::ZERO,
+            paid_amount: Money::ZERO,
+            inflight_amount: Money::ZERO,
+            occupied_amount: Money::ZERO,
+            available_amount: Money::from_cent(amount_cent),
+            pay_rate: Rate::from_bp(0),
+            is_inverted: false,
+            planned_end: None,
+            duration_days: 0,
+            delivery_date: None,
+        }
+    }
+
+    /// R-59：单位面板只列同一承包单位的其他合同，当前行必须排除。
+    #[test]
+    fn 承包单位面板排除当前行且只取同单位() {
+        let all = [
+            summary("C1", "HT-001", "道路工程一标", "某建工集团", 1_000),
+            summary("C2", "HT-002", "桥梁加固", "某建工集团", 2_000),
+            summary("C3", "HT-003", "沥青采购", "某建材公司", 3_000),
+            summary("C4", "HT-004", "管网改造", "某建工集团", 4_000),
+        ];
+        let others = other_contracts_of(&all, "某建工集团", "C1");
+        let ids: Vec<&str> = others.iter().map(|o| o.contract_id.as_str()).collect();
+        assert_eq!(ids, vec!["C2", "C4"], "同单位其他合同应为 C2、C4");
+        assert!(others.iter().all(|o| o.contractor_name == "某建工集团"));
+        assert!(
+            others.iter().all(|o| o.contract_id != "C1"),
+            "当前行不得重复出现"
+        );
+
+        // 唯一的合同：面板给空态，而不是把当前行当作「其他合同」
+        let only = [summary("C9", "HT-009", "独立合同", "某设计院", 500)];
+        assert!(other_contracts_of(&only, "某设计院", "C9").is_empty());
+        // 单位名不匹配时不串台
+        assert!(other_contracts_of(&all, "某设备公司", "C1").is_empty());
+    }
 }

@@ -200,6 +200,9 @@ pub struct App {
     pub detail: Option<Contract>,
     /// 合同台账里展开拨款明细的合同（点击合同名称切换）
     pub expanded_contract: Option<String>,
+    /// 合同台账里展开「该单位其他合同」的承包单位面板：(承包单位名称, 当前行合同 id)。
+    /// 带上当前行 id 是为了只在该行下方展开——同一单位可能有多行，不能一起撑开（R-59）
+    pub expanded_contractor: Option<(String, String)>,
 
     pub pay_contract: Option<String>,
     /// 拨款管理页合同下拉的筛选词。它只是过滤条件，选中哪份合同以 `pay_contract` 为准（R-53）
@@ -389,6 +392,7 @@ impl App {
             selected: None,
             detail: None,
             expanded_contract: None,
+            expanded_contractor: None,
             pay_contract: None,
             pay_filter: String::new(),
             pay_open: false,
@@ -512,6 +516,27 @@ impl App {
             if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
                 self.select(&id);
                 self.expanded_contract = Some(id);
+                self.screen = Screen::Contracts;
+            }
+        }
+        // `CTP_EXPAND_ORG=1` 选中并展开承包单位面板（R-59）：挑一份「该单位还有其他合同」
+        // 的合同，用于核对单位面板的列宽、空态与合计行
+        if std::env::var("CTP_EXPAND_ORG").unwrap_or_default() == "1" {
+            let target = self
+                .summaries
+                .iter()
+                .find(|s| {
+                    self.summaries
+                        .iter()
+                        .filter(|o| o.contractor_name == s.contractor_name)
+                        .count()
+                        > 1
+                })
+                .map(|s| (s.contract_id.clone(), s.contractor_name.clone()));
+            if let Some((id, name)) = target {
+                // 不 select：详情卡一旦出现会把台账压成 7 列（没有承包单位列），
+                // 核对面板要看 8 列全宽态，这里只置展开态
+                self.expanded_contractor = Some((name, id));
                 self.screen = Screen::Contracts;
             }
         }
@@ -762,11 +787,27 @@ impl App {
     }
 
     /// 合同台账点击名称：展开 / 收起该合同的拨款明细。
+    /// 与「点击承包单位」的展开互斥（R-59）：同一时刻只保留一个面板，避免表格被顶得过长。
     pub fn toggle_expand(&mut self, id: &str) {
+        self.expanded_contractor = None;
         self.expanded_contract = if self.expanded_contract.as_deref() == Some(id) {
             None
         } else {
             Some(id.to_string())
+        };
+    }
+
+    /// 合同台账点击承包单位：展开 / 收起该单位在当前行下方的其他合同（R-59）。
+    pub fn toggle_contractor(&mut self, contractor: &str, anchor: &str) {
+        self.expanded_contract = None;
+        let same = matches!(
+            &self.expanded_contractor,
+            Some((c, a)) if c == contractor && a == anchor
+        );
+        self.expanded_contractor = if same {
+            None
+        } else {
+            Some((contractor.to_string(), anchor.to_string()))
         };
     }
 

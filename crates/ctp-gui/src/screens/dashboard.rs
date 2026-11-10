@@ -9,12 +9,12 @@ use eframe::egui::{self, RichText};
 /// 最近拨款一行：(单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额分, 是否作废)
 type RecentRow = (String, String, String, String, String, String, i64, bool);
 
-/// 「最近拨款」合同名称列宽：R-56 加宽到 1.3 倍（236 → 306.8），
-/// R-58 再按需求 ×1.2 → 368.16。表头、单元格与滚动宽度三处必须同值，否则文字与列边界会错位。
-const NAME_W: f32 = 368.16;
+/// 「最近拨款」合同名称列宽：R-56 加宽到 1.3 倍（236 → 306.8），R-58 ×1.2 → 368.16，
+/// R-59 再 ×1.1 → 404.98。表头、单元格与滚动宽度三处必须同值，否则文字与列边界会错位。
+const NAME_W: f32 = 404.98;
 
-/// 「最近拨款」承包单位列宽：130 × 1.2 = 156（R-58）。同样三处同值。
-const CONTRACTOR_W: f32 = 156.0;
+/// 「最近拨款」承包单位列宽：R-58 130 × 1.2 = 156，R-59 再 ×1.2 = 187.2。同样三处同值。
+const CONTRACTOR_W: f32 = 187.2;
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
@@ -248,7 +248,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             head_cell(ui, &p, 24.0, "", false);
             head_cell(ui, &p, 86.0, "开单日期", false);
             head_cell(ui, &p, 104.0, "拨款单号", false);
-            // R-58：合同名称 ×1.2（→ 368.16）、承包单位 ×1.2（→ 156），其余列宽不变
+            // R-59：合同名称 ×1.1（→ 404.98）、承包单位 ×1.2（→ 187.2），其余列宽不变
             head_cell(ui, &p, NAME_W, "合同名称", false);
             head_cell(ui, &p, CONTRACTOR_W, "承包单位", false);
             head_cell(ui, &p, 110.0, "金额", true);
