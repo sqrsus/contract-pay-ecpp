@@ -32,6 +32,7 @@ use dialogs::{
     offer_print_failure_exclusive, offer_print_success, print_busy, print_success_expired,
     success_for_outcome, AmountForm, AuditForm, ContractForm, Dialog, PayForm, PrintStage,
 };
+use screens::contracts::{next_sort_state, LedgerSortKey};
 use theme::{Palette, ThemeMode};
 use widgets::Tone;
 
@@ -211,6 +212,11 @@ pub struct App {
     /// 待应用的偏移修正量：被收起面板的高度（正数 = 内容需要往下挪这么多）。
     /// 用它让「切换展开目标」的那一帧就不跳，锚点只用来补残差（R-61）
     pub pending_offset_fix: Option<f32>,
+    /// 台账排序：(字段, 是否倒序)，None = 库返回的原始行序（R-64）。
+    /// 只存一个字段，换字段时旧字段自然失效，不会出现两个字段同时生效
+    pub ledger_sort: Option<(LedgerSortKey, bool)>,
+    /// 下一次绘制把台账列表滚回顶部。排序变化时置位（R-64）
+    pub ledger_scroll_top: bool,
 
     pub pay_contract: Option<String>,
     /// 拨款管理页合同下拉的筛选词。它只是过滤条件，选中哪份合同以 `pay_contract` 为准（R-53）
@@ -404,6 +410,8 @@ impl App {
             pending_expand_settle: None,
             ledger_offset: 0.0,
             pending_offset_fix: None,
+            ledger_sort: None,
+            ledger_scroll_top: false,
             pay_contract: None,
             pay_filter: String::new(),
             pay_open: false,
@@ -548,6 +556,25 @@ impl App {
                 // 不 select：详情卡一旦出现会把台账压成 7 列（没有承包单位列），
                 // 核对面板要看 8 列全宽态，这里只置展开态
                 self.expanded_contractor = Some(id);
+                self.screen = Screen::Contracts;
+            }
+        }
+        // `CTP_SORT=amount|audit|paid|rate[:asc]` 预设台账排序（不给 :asc 即倒序），
+        // 用于核对表头箭头、行序与合计行（R-64）
+        if let Ok(v) = std::env::var("CTP_SORT") {
+            let (name, asc) = match v.split_once(':') {
+                Some((n, d)) => (n, d == "asc"),
+                None => (v.as_str(), false),
+            };
+            let key = match name {
+                "amount" => Some(LedgerSortKey::Amount),
+                "audit" => Some(LedgerSortKey::Audit),
+                "paid" => Some(LedgerSortKey::Paid),
+                "rate" => Some(LedgerSortKey::Rate),
+                _ => None,
+            };
+            if let Some(k) = key {
+                self.ledger_sort = Some((k, !asc));
                 self.screen = Screen::Contracts;
             }
         }
@@ -817,6 +844,15 @@ impl App {
         } else {
             Some(id.to_string())
         };
+    }
+
+    /// R-64：点台账表头。同列翻转方向，换列则从倒序重新开始（`next_sort_state`）。
+    /// 行序整体变了，原滚动偏移已无意义 → 回顶部；展开面板按行 id 记状态，跟着它那一行走。
+    pub fn toggle_ledger_sort(&mut self, key: LedgerSortKey) {
+        self.ledger_sort = Some(next_sort_state(self.ledger_sort, key));
+        self.ledger_scroll_top = true;
+        self.pending_expand_settle = None;
+        self.pending_offset_fix = None;
     }
 
     /// 总览「新建拨款」：跳到拨款管理，并尽量定位到已选合同。

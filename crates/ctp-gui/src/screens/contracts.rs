@@ -10,6 +10,74 @@ use ctp_core::money::Money;
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 
+/// R-64：台账可排序的四个字段。排序状态是**单一值**（字段 + 方向），换字段即覆盖旧字段，
+/// 所以不可能出现「两个字段同时生效」或「旧列箭头没清掉」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LedgerSortKey {
+    /// 合同金额
+    Amount,
+    /// 审计价（未审计 = 无值）
+    Audit,
+    /// 累计已付
+    Paid,
+    /// 支付率
+    Rate,
+}
+
+impl LedgerSortKey {
+    /// 列 key（`ReportResult` 的 `ReportColumn.key`）→ 排序字段。
+    /// 只有这四列可排，其余（编号 / 名称 / 承包单位 / 交工日期 / 项目状态）返回 None，表头不可点。
+    pub fn of_column(key: &str) -> Option<Self> {
+        match key {
+            "total_amount" => Some(Self::Amount),
+            "audit_price" => Some(Self::Audit),
+            "paid_amount" => Some(Self::Paid),
+            "pay_rate" => Some(Self::Rate),
+            _ => None,
+        }
+    }
+}
+
+/// R-64：表头点击后的新排序状态。同列翻转方向；换列则从**倒序**重新开始（金额大的先看）。
+pub fn next_sort_state(
+    cur: Option<(LedgerSortKey, bool)>,
+    key: LedgerSortKey,
+) -> (LedgerSortKey, bool) {
+    match cur {
+        Some((k, desc)) if k == key => (k, !desc),
+        _ => (key, true),
+    }
+}
+
+/// 排序取值：统一折算成整数（金额取分、支付率取 bp），避免按显示文本比较。
+/// `None` 只出现在未审计的合同上 —— 排序时恒定沉底、不参与数值比较（R-64）。
+fn sort_value(s: &ctp_core::ledger::ContractSummary, key: LedgerSortKey) -> Option<i64> {
+    match key {
+        LedgerSortKey::Amount => Some(s.total_amount.cent()),
+        LedgerSortKey::Audit => s.audit_price.map(|m| m.cent()),
+        LedgerSortKey::Paid => Some(s.paid_amount.cent()),
+        LedgerSortKey::Rate => Some(s.pay_rate.bp() as i64),
+    }
+}
+
+/// R-64：按某一字段排序。`sort_by` 是稳定排序，等值行保持筛选原序，
+/// 同一份数据反复切换方向不会把等值行的相对位置打乱。
+fn sort_summaries(rows: &mut [ctp_core::ledger::ContractSummary], key: LedgerSortKey, desc: bool) {
+    rows.sort_by(|a, b| match (sort_value(a, key), sort_value(b, key)) {
+        (None, None) => std::cmp::Ordering::Equal,
+        // 空值（未审计）不论正序倒序都沉底：已审计的才值得横向比较
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(x), Some(y)) => {
+            if desc {
+                y.cmp(&x)
+            } else {
+                x.cmp(&y)
+            }
+        }
+    });
+}
+
 enum Act {
     /// 点击合同名称：选中该行并打开只读详情弹窗
     DetailModal(String),
@@ -299,7 +367,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             } else {
                                 c.screen_width
                             };
-                            table_head(ui, &p, w, c.title, c.right);
+                            // R-64：四列可点排序，其余列保持纯文本表头
+                            match LedgerSortKey::of_column(c.key) {
+                                Some(key) => {
+                                    let desc = app
+                                        .ledger_sort
+                                        .and_then(|(k, d)| (k == key).then_some(d));
+                                    if table_head_sortable(ui, &p, w, c.title, c.right, desc)
+                                        .clicked()
+                                    {
+                                        app.toggle_ledger_sort(key);
+                                    }
+                                }
+                                None => table_head(ui, &p, w, c.title, c.right),
+                            }
                         }
                     });
                     ui.add_space(2.0);
@@ -321,7 +402,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         .auto_shrink([false, false])
                         .max_height((page_h - 64.0).max(220.0))
                         .min_scrolled_height((page_h - 110.0).max(200.0));
-                    if let Some(fix) = app.pending_offset_fix.take() {
+                    if std::mem::take(&mut app.ledger_scroll_top) {
+                        // R-64：排序变了行序整体重排，停在原偏移只会落在无意义的位置，回顶部
+                        scroll = scroll.vertical_scroll_offset(0.0);
+                        app.ledger_offset = 0.0;
+                    } else if let Some(fix) = app.pending_offset_fix.take() {
                         scroll = scroll.vertical_scroll_offset((app.ledger_offset - fix).max(0.0));
                     }
                     let scroll_out = scroll
@@ -838,7 +923,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 /// 当前搜索词 + 项目状态筛选后的合同行（屏幕表格与导出共用同一份筛选结果）。
 fn filtered_summaries(app: &App) -> Vec<ctp_core::ledger::ContractSummary> {
     let kw = app.search.trim().to_lowercase();
-    app.summaries
+    let mut out: Vec<ctp_core::ledger::ContractSummary> = app
+        .summaries
         .iter()
         .filter(|s| {
             let hit = kw.is_empty()
@@ -853,7 +939,13 @@ fn filtered_summaries(app: &App) -> Vec<ctp_core::ledger::ContractSummary> {
             hit && st
         })
         .cloned()
-        .collect()
+        .collect();
+    // R-64：屏幕表格、合计行与 Excel 导出都从这一份行序出发，排序只能在这一层做，
+    // 三处才不会出现「屏幕变了、导出没变」。展开面板按行 id 记状态，跟着它那一行走。
+    if let Some((key, desc)) = app.ledger_sort {
+        sort_summaries(&mut out, key, desc);
+    }
+    out
 }
 
 /// 项目状态：支付率达 100% 自动「归档关闭」，否则「履行中」。
@@ -884,6 +976,44 @@ fn table_head(ui: &mut egui::Ui, p: &crate::theme::Palette, width: f32, text: &s
     table_cell(ui, width, right, |ui| {
         ui.label(RichText::new(text).size(12.0).color(p.text_muted));
     });
+}
+
+/// R-64：可排序表头。整格可点（不只是文字），激活列在标题后显示 ↑ / ↓ 并用正文色突出，
+/// 未激活列保持灰色但也接受点击 —— 否则用户看不出这四列能排。
+/// 箭头与文字拼在同一个字符串里：右对齐列是 `right_to_left` 布局，分开放会把箭头排到文字左边。
+fn table_head_sortable(
+    ui: &mut egui::Ui,
+    p: &crate::theme::Palette,
+    width: f32,
+    text: &str,
+    right: bool,
+    desc: Option<bool>,
+) -> egui::Response {
+    let layout = if right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    let inner = ui.allocate_ui_with_layout(egui::vec2(width, 26.0), layout, |ui| {
+        ui.set_width(width);
+        ui.add_space(4.0);
+        let (label, color) = match desc {
+            Some(true) => (format!("{text} ↓"), p.text),
+            Some(false) => (format!("{text} ↑"), p.text),
+            None => (text.to_string(), p.text_muted),
+        };
+        ui.label(RichText::new(label).size(12.0).color(color));
+    });
+    let resp = inner
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let tip = match desc {
+        Some(true) => format!("{text}：当前倒序（↓），点击切换为正序"),
+        Some(false) => format!("{text}：当前正序（↑），点击切换为倒序"),
+        None => format!("点击按「{text}」排序（首次为倒序）"),
+    };
+    resp.on_hover_text(tip)
 }
 
 /// 合同行下方展开的拨款明细面板：表头与「拨款管理 · 拨款明细」一致，已作废条目不再列出。
@@ -1608,5 +1738,108 @@ mod tests {
         assert_eq!(offset_fix_for(Some(3), None, 186.0), 0.0);
         // 没点到任何入口且没有展开行：不补
         assert_eq!(offset_fix_for(None, None, 186.0), 0.0);
+    }
+
+    /// R-64 的排序样本行：四列取值都可控（审计价 `None` = 未审计）
+    fn sort_row(
+        id: &str,
+        amount: i64,
+        audit: Option<i64>,
+        paid: i64,
+        rate_bp: i32,
+    ) -> ContractSummary {
+        let mut s = summary(id, "HT", "合同", "某建工集团", amount);
+        s.audit_price = audit.map(Money::from_cent);
+        s.is_audited = audit.is_some();
+        s.paid_amount = Money::from_cent(paid);
+        s.pay_rate = Rate::from_bp(rate_bp);
+        s
+    }
+
+    fn order(rows: &[ContractSummary], key: LedgerSortKey, desc: bool) -> Vec<String> {
+        let mut v = rows.to_vec();
+        sort_summaries(&mut v, key, desc);
+        v.iter().map(|s| s.contract_id.clone()).collect()
+    }
+
+    /// R-64：四列各按自己的数值排、方向可翻转；审计价未审计（无值）正序倒序都沉底；
+    /// 等值行保持筛选原序（稳定排序），反复切换方向不会把等值行的相对位置打乱。
+    #[test]
+    fn 台账排序四列独立且审计价空值沉底() {
+        let rows = vec![
+            sort_row("A", 300, Some(250), 100, 1_000),
+            sort_row("B", 100, None, 300, 9_000),
+            sort_row("C", 200, Some(150), 200, 5_000),
+            sort_row("D", 400, Some(250), 400, 5_000),
+        ];
+        // 合同金额
+        assert_eq!(
+            order(&rows, LedgerSortKey::Amount, true),
+            vec!["D", "A", "C", "B"]
+        );
+        assert_eq!(
+            order(&rows, LedgerSortKey::Amount, false),
+            vec!["B", "C", "A", "D"]
+        );
+        // 审计价：B 未审计，两个方向都排在最后；A / D 同为 250 保原序
+        assert_eq!(
+            order(&rows, LedgerSortKey::Audit, true),
+            vec!["A", "D", "C", "B"]
+        );
+        assert_eq!(
+            order(&rows, LedgerSortKey::Audit, false),
+            vec!["C", "A", "D", "B"]
+        );
+        // 累计已付
+        assert_eq!(
+            order(&rows, LedgerSortKey::Paid, true),
+            vec!["D", "B", "C", "A"]
+        );
+        assert_eq!(
+            order(&rows, LedgerSortKey::Paid, false),
+            vec!["A", "C", "B", "D"]
+        );
+        // 支付率：A(10%) 与 D(50%)、C(50%) 等值对，等值保持 C 在 D 前
+        assert_eq!(
+            order(&rows, LedgerSortKey::Rate, true),
+            vec!["B", "C", "D", "A"]
+        );
+        assert_eq!(
+            order(&rows, LedgerSortKey::Rate, false),
+            vec!["A", "C", "D", "B"]
+        );
+    }
+
+    /// R-64：同列再点翻转方向；换列时旧列（含它的方向）被覆盖、新列从倒序开始 ——
+    /// 保证「四个字段分别独立排序」不会变成「多个字段叠加」。
+    #[test]
+    fn 表头点击同列翻转换列重置() {
+        // 首次点任意列 → 倒序（金额大的先看）
+        assert_eq!(
+            next_sort_state(None, LedgerSortKey::Amount),
+            (LedgerSortKey::Amount, true)
+        );
+        assert_eq!(
+            next_sort_state(None, LedgerSortKey::Paid),
+            (LedgerSortKey::Paid, true)
+        );
+        // 同列再点 → 翻转
+        assert_eq!(
+            next_sort_state(Some((LedgerSortKey::Amount, true)), LedgerSortKey::Amount),
+            (LedgerSortKey::Amount, false)
+        );
+        assert_eq!(
+            next_sort_state(Some((LedgerSortKey::Amount, false)), LedgerSortKey::Amount),
+            (LedgerSortKey::Amount, true)
+        );
+        // 换列 → 旧列状态不保留，新列重新从倒序开始
+        assert_eq!(
+            next_sort_state(Some((LedgerSortKey::Amount, false)), LedgerSortKey::Rate),
+            (LedgerSortKey::Rate, true)
+        );
+        assert_eq!(
+            next_sort_state(Some((LedgerSortKey::Rate, true)), LedgerSortKey::Audit),
+            (LedgerSortKey::Audit, true)
+        );
     }
 }
