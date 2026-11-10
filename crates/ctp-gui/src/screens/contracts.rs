@@ -11,12 +11,12 @@ use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 
 enum Act {
-    /// 点击合同编号：打开只读详情弹窗
+    /// 点击合同名称：选中该行并打开只读详情弹窗
     DetailModal(String),
-    /// 点击合同名称：选中并展开 / 收起拨款明细
+    /// 点击累计已付金额：选中并展开 / 收起拨款明细
     Expand(String),
-    /// 点击承包单位：在该行下方展开 / 收起该单位的其他合同（R-59）：(单位名称, 当前行合同 id)
-    ExpandContractor(String, String),
+    /// 点击承包单位：在该行下方展开 / 收起该单位的其他合同（R-59，按合同 id 记状态）
+    ExpandContractor(String),
     /// 展开区里点拨款单号：打开单据详情
     OpenPayment(String),
     New,
@@ -54,7 +54,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui,
         &p,
         "合同台账",
-        "点击编号看详情；点击合同名称展开拨款明细；点击承包单位看该单位的其他合同",
+        "点击合同名称看详情；点击累计已付金额展开拨款明细；点击承包单位看该单位的其他合同",
     );
 
     let mut action: Option<Act> = None;
@@ -239,7 +239,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     let mut detail: Option<String> = None;
                     let mut expand: Option<String> = None;
-                    let mut expand_contractor: Option<(String, String)> = None;
+                    let mut expand_contractor: Option<String> = None;
                     let mut open_pay: Option<String> = None;
                     let mut keep_rect: Option<egui::Rect> = None;
 
@@ -265,11 +265,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 let expanded =
                                     app.expanded_contract.as_deref() == Some(&s.contract_id);
                                 // R-59：该行承包单位是否处于展开态（只认当前行，单位同名行不一起展开）
-                                let contractor_open = matches!(
-                                    app.expanded_contractor.as_ref(),
-                                    Some((c, a)) if c == &s.contractor_name && a == &s.contract_id
-                                );
-                                let mut name_rect: Option<egui::Rect> = None;
+                                let contractor_open =
+                                    app.expanded_contractor.as_deref() == Some(&s.contract_id);
+                                let mut paid_rect: Option<egui::Rect> = None;
                                 let mut contractor_rect: Option<egui::Rect> = None;
                                 let fill = if idx % 2 == 1 {
                                     p.surface_alt
@@ -283,33 +281,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 0.0;
                                             table_cell(ui, c_no, false, |ui| {
+                                                // R-60：合同编号不再承担任何点击交互，
+                                                // 也不再使用主色，避免看起来仍像链接
                                                 let mut txt = RichText::new(text_of("contract_no"))
                                                     .size(12.5)
-                                                    .color(p.primary);
+                                                    .color(p.text);
                                                 if selected {
                                                     txt = txt.strong().underline();
                                                 }
-                                                let r = ui
-                                                    .add(
-                                                        egui::Label::new(txt)
-                                                            .sense(egui::Sense::click()),
-                                                    )
-                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                    .on_hover_text("查看合同详情");
-                                                if r.clicked() {
-                                                    detail = Some(s.contract_id.clone());
-                                                }
+                                                ui.label(txt);
                                             });
                                             table_cell(ui, name_w, false, |ui| {
-                                                ui.label(
-                                                    RichText::new(if expanded {
-                                                        "－"
-                                                    } else {
-                                                        "＋"
-                                                    })
-                                                    .size(11.0)
-                                                    .color(p.text_muted),
-                                                );
                                                 let cname = text_of("contract_name");
                                                 // R-56：草稿视为「未生效」，名称用警示色；
                                                 // 选中态仍用主色（交互反馈优先），其余状态不变。
@@ -320,61 +302,75 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 } else {
                                                     p.text
                                                 };
+                                                // R-60：名称改为「查看详情」入口，展开标记已移到累计已付
                                                 let r = widgets::marquee_sense(
                                                     ui,
                                                     &cname,
-                                                    (name_w - 22.0).max(20.0),
+                                                    (name_w - 8.0).max(20.0),
                                                     12.5,
                                                     name_color,
                                                     egui::Sense::click(),
                                                 )
                                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                                                 .on_hover_text(
-                                                    "点击展开 / 收起该合同的拨款明细；名称过长时悬停自动滚动",
+                                                    "点击查看合同详情；名称过长时悬停自动滚动",
                                                 );
                                                 if r.clicked() {
-                                                    expand = Some(s.contract_id.clone());
-                                                }
-                                                if expanded {
-                                                    name_rect = Some(r.rect);
+                                                    detail = Some(s.contract_id.clone());
                                                 }
                                             });
                                             if !compact {
                                                 table_cell(ui, c_contractor, false, |ui| {
-                                                    // R-59：承包单位是「该单位其他合同」的入口，
+                                                    // R-59：承包单位是「该单位其他合同」的入口；
                                                     // 展开时用主色，便于一眼看出当前展开的是哪一行
                                                     let contractor = s.contractor_name.clone();
                                                     let is_open = matches!(
-                                                        app.expanded_contractor.as_ref(),
-                                                        Some((c, a))
-                                                            if c == &contractor
-                                                                && a == &s.contract_id
+                                                        app.expanded_contractor.as_deref(),
+                                                        Some(id) if id == s.contract_id
                                                     );
                                                     let color = if is_open {
                                                         p.primary
                                                     } else {
                                                         p.text_muted
                                                     };
+                                                    // R-60：与「展开拨款明细」同款标记，手感统一；
+                                                    // 行内 item_spacing 被清零过，这里留 4px 免得「＋」贴住单位名
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    let mark = ui
+                                                        .add(
+                                                            egui::Label::new(
+                                                                RichText::new(if is_open {
+                                                                    "－"
+                                                                } else {
+                                                                    "＋"
+                                                                })
+                                                                .size(11.0)
+                                                                .color(p.text_muted),
+                                                            )
+                                                            .sense(egui::Sense::click()),
+                                                        )
+                                                        .on_hover_cursor(
+                                                            egui::CursorIcon::PointingHand,
+                                                        );
                                                     let r = widgets::marquee_sense(
                                                         ui,
                                                         &contractor,
-                                                        (c_contractor - 8.0).max(20.0),
+                                                        (c_contractor - 23.0).max(20.0),
                                                         12.0,
                                                         color,
                                                         egui::Sense::click(),
                                                     )
                                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                                                     .on_hover_text(
-                                                        "点击查看该单位的其他合同；名称过长时悬停自动滚动",
+                                                        "点击展开 / 收起该单位的其他合同；名称过长时悬停自动滚动",
                                                     );
-                                                    if r.clicked() {
-                                                        expand_contractor = Some((
-                                                            contractor.clone(),
-                                                            s.contract_id.clone(),
-                                                        ));
+                                                    if r.clicked() || mark.clicked() {
+                                                        expand_contractor =
+                                                            Some(s.contract_id.clone());
                                                     }
                                                     if is_open {
-                                                        contractor_rect = Some(r.rect);
+                                                        contractor_rect =
+                                                            Some(r.rect.union(mark.rect));
                                                     }
                                                 });
                                                 table_cell(ui, c_amount, true, |ui| {
@@ -410,11 +406,46 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                                 });
                                             }
                                             table_cell(ui, c_paid, true, |ui| {
-                                                ui.label(
-                                                    RichText::new(text_of("paid_amount"))
-                                                        .size(12.5)
-                                                        .color(p.text),
-                                                );
+                                                // R-60：累计已付成为「展开拨款明细」的入口。
+                                                // 右对齐布局里先放金额（最右），后放标记（落在金额左侧）。
+                                                // 行内 item_spacing 被清零过，这里单独留 4px，免得「－」贴住数字。
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                let amount = ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            RichText::new(text_of("paid_amount"))
+                                                                .size(12.5)
+                                                                .color(p.text),
+                                                        )
+                                                        .sense(egui::Sense::click()),
+                                                    )
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                    .on_hover_text(
+                                                        "点击展开 / 收起该合同的拨款明细",
+                                                    );
+                                                let mark = ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            RichText::new(if expanded {
+                                                                "－"
+                                                            } else {
+                                                                "＋"
+                                                            })
+                                                            .size(11.0)
+                                                            .color(p.text_muted),
+                                                        )
+                                                        .sense(egui::Sense::click()),
+                                                    )
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                    .on_hover_text(
+                                                        "点击展开 / 收起该合同的拨款明细",
+                                                    );
+                                                if amount.clicked() || mark.clicked() {
+                                                    expand = Some(s.contract_id.clone());
+                                                }
+                                                if expanded {
+                                                    paid_rect = Some(amount.rect.union(mark.rect));
+                                                }
                                             });
                                             table_cell(ui, c_rate, false, |ui| {
                                                 let frac = s.pay_rate.bp() as f32 / 10_000.0;
@@ -449,7 +480,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                         &mut print_pay,
                                         &mut print_material,
                                     );
-                                    keep_rect = Some(name_rect.map_or(panel, |n| n.union(panel)));
+                                    keep_rect = Some(paid_rect.map_or(panel, |n| n.union(panel)));
                                 }
                                 if contractor_open {
                                     // R-59：取全量台账（不受搜索 / 状态筛选影响），排除当前行
@@ -498,8 +529,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     if let Some(id) = expand {
                         action = Some(Act::Expand(id));
-                    } else if let Some((name, anchor)) = expand_contractor {
-                        action = Some(Act::ExpandContractor(name, anchor));
+                    } else if let Some(id) = expand_contractor {
+                        action = Some(Act::ExpandContractor(id));
                     } else if let Some(id) = detail {
                         action = Some(Act::DetailModal(id));
                     }
@@ -583,12 +614,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     match action {
-        Some(Act::DetailModal(id)) => app.open_contract_detail(&id),
+        Some(Act::DetailModal(id)) => {
+            // R-60：点合同名称看详情时同时选中该行，右侧详情卡与弹窗保持同一份合同
+            app.select(&id);
+            app.open_contract_detail(&id);
+        }
         Some(Act::Expand(id)) => {
             app.select(&id);
             app.toggle_expand(&id);
         }
-        Some(Act::ExpandContractor(name, anchor)) => app.toggle_contractor(&name, &anchor),
+        Some(Act::ExpandContractor(id)) => app.toggle_contractor(&id),
         Some(Act::OpenPayment(id)) => app.open_payment(&id),
         Some(Act::New) => {
             app.new_contract = crate::dialogs::ContractForm::default();
@@ -884,7 +919,8 @@ fn other_contracts_of<'a>(
 /// R-59：点承包单位后在该行下方展开的面板，沿用「拨款明细」展开卡的同款样式。
 /// `anchor` 是当前行合同 id，只用来给面板内的表格划出独立 id 作用域——
 /// 同一帧里若有多张表，自动生成的 id 会撞车（egui 会报 “First/Second use of Table ID”）。
-/// 列：合同编号 / 合同名称 / 合同金额 / 审计价 / 支付率 / 项目状态；点编号或名称打开合同详情。
+/// 列：合同编号 / 合同名称 / 合同金额 / 审计价 / 支付率 / 项目状态；点名称打开合同详情
+/// （R-60：编号与台账一致，不再可点）。
 fn contractor_panel(
     ui: &mut egui::Ui,
     p: &crate::theme::Palette,
@@ -986,12 +1022,8 @@ fn contractor_panel_body(
                 for o in others {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
-                            if widgets::link(ui, p, &o.contract_no, 11.5)
-                                .on_hover_text("查看合同详情")
-                                .clicked()
-                            {
-                                *open = Some(o.contract_id.clone());
-                            }
+                            // R-60：与台账一致，编号不做任何点击交互，也不再用主色
+                            ui.label(RichText::new(&o.contract_no).size(11.5).color(p.text_muted));
                         });
                         row.col(|ui| {
                             let w = ui.available_width().max(20.0);
