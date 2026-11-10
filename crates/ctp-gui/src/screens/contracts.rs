@@ -1046,14 +1046,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             }
         }
         Some(Act::Audit) => {
-            if let Some(s) = app.selected_summary() {
-                app.audit_form.amount = if s.is_audited {
-                    s.audit_price.map(|m| m.format_yuan()).unwrap_or_default()
-                } else {
-                    String::new()
-                };
+            // R-67：整表回填交给 App 统一读库（摘要没有审定日期 / 单位 / 报告号，不能用来预填）
+            if let Some(id) = app.selected.clone() {
+                app.open_audit_price(&id);
             }
-            app.dialog = crate::dialogs::Dialog::AuditPrice;
         }
         Some(Act::Delivery) => {
             app.delivery_form = app

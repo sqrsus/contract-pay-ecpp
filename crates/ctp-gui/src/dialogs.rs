@@ -801,6 +801,25 @@ impl Default for AuditForm {
     }
 }
 
+impl AuditForm {
+    /// R-67：按库里的合同档案整表回填。**五个字段一个都不能漏** ——
+    /// 之前只回填金额，再次打开时日期退回今天、单位与报告号为空，
+    /// 而提交是无条件覆盖写，点一次「确认登记」就把原有的审定单位 / 报告号清空了。
+    ///
+    /// * 未审定：金额留空，日期取今天（首次登记的正常默认值）；
+    /// * 已审定：金额、审定日期、审定单位、审定报告号都取库里现值；
+    /// * 变更原因：取该合同上一次登记时填的原因（读不到就退回「结算审定」）。
+    pub fn from_contract(c: &Contract, last_reason: Option<String>) -> Self {
+        Self {
+            amount: c.audit_price().map(|m| m.format_yuan()).unwrap_or_default(),
+            date: c.audit_date.clone().unwrap_or_else(today_iso),
+            org: c.audit_org.clone().unwrap_or_default(),
+            report_no: c.audit_report_no.clone().unwrap_or_default(),
+            reason: last_reason.unwrap_or_else(|| "结算审定".into()),
+        }
+    }
+}
+
 /// 合同金额编辑表单。
 #[derive(Default)]
 pub struct AmountForm {
@@ -2824,9 +2843,19 @@ fn audit_form_unchanged(app: &App) -> bool {
 
 fn audit_price(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
+    // R-67：弹窗不阻塞背景，用户仍能点下面的行切换焦点。焦点一变就按新合同整表重填，
+    // 否则会出现「表单还是 A、标题与提交却已经指向 B」——审定信息会写到错的人身上。
+    if app.audit_target != app.selected {
+        match app.selected.clone() {
+            Some(id) => app.open_audit_price(&id),
+            None => app.audit_target = None,
+        }
+    }
     let mut cancel = false;
     let mut submit = false;
-    let id = app.selected.clone();
+    // R-67：一律写给表单所属的那份合同。帧首已保证它与当前选中一致，
+    // 用 target 而不是 selected，是为了让「回填的谁 = 提交给谁」只有一个来源。
+    let id = app.audit_target.clone();
     let no = app
         .selected_summary()
         .map(|s| s.contract_no.clone())
@@ -2898,6 +2927,7 @@ fn audit_price(app: &mut App, ctx: &egui::Context) {
 
     if cancel {
         app.dialog = Dialog::None;
+        app.audit_target = None;
     }
     if submit {
         if let Some(id) = id {
@@ -2921,6 +2951,7 @@ fn audit_price(app: &mut App, ctx: &egui::Context) {
                 Ok(c) => {
                     app.refresh();
                     app.audit_form = AuditForm::default();
+                    app.audit_target = None;
                     app.dialog = Dialog::None;
                     app.success(format!(
                         "审计价已登记，有效计价基准 {} 元",
@@ -4519,5 +4550,82 @@ mod tests {
         );
         // 候选取不到时保留用户原文（允许直接录一个新项目）
         assert_eq!(pick_project_name(&src, "全新项目"), "全新项目");
+    }
+
+    /// R-67：构造一条已审定的合同，用于校验审计价弹窗的回填。
+    fn audited_contract() -> Contract {
+        Contract {
+            id: "CT-1".into(),
+            project_id: "PJ-1".into(),
+            contract_no: "HT-2026-001".into(),
+            contract_name: "测试合同".into(),
+            contract_type: ContractType::Engineering,
+            contract_category_code: "CONSTRUCT".into(),
+            category_id: None,
+            party_a: "某业主单位".into(),
+            contractor_id: "ORG-1".into(),
+            building_id: None,
+            sort_no: 0,
+            sign_date: "2026-01-01".into(),
+            original_amount_cent: Money::from_cent(10_000_000),
+            audit_price_cent: Some(Money::from_cent(9_500_050)),
+            audit_date: Some("2026-02-03".into()),
+            audit_org: Some("某造价咨询公司".into()),
+            audit_report_no: Some("审字[2026]第 8 号".into()),
+            duration_days: 90,
+            planned_start: None,
+            planned_end: None,
+            actual_start: None,
+            actual_end: None,
+            delivery_date: None,
+            pricing_method: None,
+            retention_rate_bp: 0,
+            advance_rate_bp: 0,
+            status: ctp_core::contract::ContractStatus::Draft,
+            payment_terms: "按进度付款".into(),
+            remark: None,
+            is_deleted: false,
+            version: 1,
+            created_at: "2026-01-01T00:00:00".into(),
+            created_by: Some("t".into()),
+            updated_at: "2026-01-01T00:00:00".into(),
+            updated_by: Some("t".into()),
+            bid_method: None,
+            open_bid_date: None,
+            project_leader: None,
+            contact_info: None,
+            bid_agent_id: None,
+        }
+    }
+
+    /// R-67：再次登记审计价时，五个字段都必须来自库里的现值。
+    ///
+    /// 这是缺陷的核心断言：此前只回填金额，日期退回今天、单位与报告号为空，
+    /// 而提交是无条件覆盖写 —— 点一次「确认登记」就把原有的审定信息清掉了。
+    #[test]
+    fn 审计价弹窗整表回填五项() {
+        let c = audited_contract();
+        let f = AuditForm::from_contract(&c, Some("结算审定·复核".into()));
+        assert_eq!(f.amount, "95,000.50", "金额要按库里的审定价格式化");
+        assert_eq!(f.date, "2026-02-03");
+        assert_eq!(f.org, "某造价咨询公司");
+        assert_eq!(f.report_no, "审字[2026]第 8 号");
+        assert_eq!(f.reason, "结算审定·复核");
+    }
+
+    /// 未审定的合同首次登记：金额留空、日期取今天、原因给默认值。
+    #[test]
+    fn 未审定合同回填为空金额与今日日期() {
+        let mut c = audited_contract();
+        c.audit_price_cent = None;
+        c.audit_date = None;
+        c.audit_org = None;
+        c.audit_report_no = None;
+        let f = AuditForm::from_contract(&c, None);
+        assert!(f.amount.is_empty());
+        assert_eq!(f.date, today_iso());
+        assert!(f.org.is_empty());
+        assert!(f.report_no.is_empty());
+        assert_eq!(f.reason, "结算审定");
     }
 }

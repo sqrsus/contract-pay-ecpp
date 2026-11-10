@@ -77,11 +77,25 @@ fn fixture_with(
     delivery: Option<&str>,
 ) -> (Connection, String) {
     let mut conn = db::open_in_memory().unwrap();
-    db::migrate(&mut conn).unwrap();
-    ctp_store::seed::seed_reference(&conn, "t").unwrap();
-    project_and_org(&conn);
+    let cid = seed_fixture(&mut conn, amount_yuan, ctype, delivery);
+    (conn, cid)
+}
+
+/// 在调用方给的连接里建好「参考数据 → 项目 / 承包单位 → 一条已生效合同」，返回合同 id。
+///
+/// 单独抽出来是为了让文件库测试（附件体积回收必须看真实文件大小）复用同一套数据，
+/// 内存库测不出「库文件有没有缩」。
+fn seed_fixture(
+    conn: &mut Connection,
+    amount_yuan: i64,
+    ctype: ctp_core::contract::ContractType,
+    delivery: Option<&str>,
+) -> String {
+    db::migrate(conn).unwrap();
+    ctp_store::seed::seed_reference(conn, "t").unwrap();
+    project_and_org(conn);
     let c = service::create_contract(
-        &mut conn,
+        conn,
         NewContract {
             project_id: "PJ-1".into(),
             contract_name: "测试合同".into(),
@@ -99,9 +113,9 @@ fn fixture_with(
         "t",
     )
     .unwrap();
-    attach_contract(&mut conn, &c.id);
-    service::activate_contract(&mut conn, &c.id, "t").unwrap();
-    (conn, c.id)
+    attach_contract(conn, &c.id);
+    service::activate_contract(conn, &c.id, "t").unwrap();
+    c.id
 }
 
 /// 补一份「合同正本」附件：生效校验要求它必须在位。
@@ -1545,4 +1559,136 @@ fn 修改合同类别_变更明细显示中文名() {
         .expect("类别变了必须进变更清单");
     assert_eq!(row.old, "工程款", "修改前用中文名");
     assert_eq!(row.new, "设备款", "修改后用中文名");
+}
+
+/// R-67：审计价弹窗要回填「上次填的变更原因」，数据来源只能是该合同最近一条
+/// `SET_AUDIT_PRICE` 日志 —— `audit_price_history` 是全局单键、不带合同 id，无法按合同取。
+#[test]
+fn 最近一次审计价原因按合同取且只取原因段() {
+    let (mut conn, cid) = fixture(1000);
+    assert_eq!(
+        service::last_audit_reason(&conn, &cid),
+        None,
+        "从未登记过审计价时应退回默认原因"
+    );
+
+    service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(90_000)),
+        Some("2026-10-20".into()),
+        Some("某造价咨询".into()),
+        Some("SJ-001".into()),
+        "竣工结算审定",
+        "t",
+    )
+    .unwrap();
+    assert_eq!(
+        service::last_audit_reason(&conn, &cid).as_deref(),
+        Some("竣工结算审定"),
+        "detail 形如「审计价 X（原 Y）：原因」，只能取冒号后的原因"
+    );
+
+    // 再登记一次：应取最新那条，而不是第一次的
+    service::register_audit_price(
+        &mut conn,
+        &cid,
+        Some(Money::from_cent(88_000)),
+        None,
+        None,
+        None,
+        "复审核减",
+        "t",
+    )
+    .unwrap();
+    assert_eq!(
+        service::last_audit_reason(&conn, &cid).as_deref(),
+        Some("复审核减")
+    );
+
+    // 不存在的合同不能串到别人的原因上
+    assert_eq!(service::last_audit_reason(&conn, "CT-NOT-EXIST"), None);
+}
+
+/// R-67：附件替换后库文件必须真的回落，且同一类只留一条记录。
+///
+/// 缺陷现象是「替换后数据库占用只增不减」：SQLite 的 `ON CONFLICT DO UPDATE`
+/// 只把旧 BLOB 占的页挂回 freelist，文件高水位不回落。这里用**文件库**验证
+/// `save_attachment` 之后确实做了物理压缩，同时确认没有留下第二行旧记录。
+#[test]
+fn 替换附件后库文件回落且只留一条() {
+    let dir = std::env::temp_dir().join(format!("ctp-att-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("t.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let mut conn = db::open(path.to_str().unwrap()).unwrap();
+    // WAL 模式下新写入先落在 -wal 里，主库文件暂时不变 —— 量「占用」要把两边加起来
+    let size_of = |p: &std::path::Path| -> u64 {
+        ["", "-wal"]
+            .iter()
+            .filter_map(|s| std::fs::metadata(format!("{}{s}", p.display())).ok())
+            .map(|m| m.len())
+            .sum()
+    };
+    let cid = seed_fixture(
+        &mut conn,
+        1000,
+        ctp_core::contract::ContractType::Service,
+        Some("2020-01-01"),
+    );
+
+    let big = vec![b'A'; 3 * 1024 * 1024];
+    service::save_attachment(
+        &mut conn,
+        &cid,
+        AttachmentKind::AuditReport,
+        "审计报告-大.pdf",
+        Some("application/pdf"),
+        &big,
+        "t",
+    )
+    .unwrap();
+    let before = size_of(&path);
+    assert!(
+        before > 2 * 1024 * 1024,
+        "前置：写入 3 MB 附件后占用应该够大，实际 {before}"
+    );
+
+    let small = b"%PDF-1.4 small".to_vec();
+    service::save_attachment(
+        &mut conn,
+        &cid,
+        AttachmentKind::AuditReport,
+        "审计报告-小.pdf",
+        Some("application/pdf"),
+        &small,
+        "t",
+    )
+    .unwrap();
+    let after = size_of(&path);
+    assert!(
+        after * 2 < before,
+        "替换成小文件后库文件应回落，实际 {before} → {after}"
+    );
+
+    let list = service::list_attachments(&conn, &cid).unwrap();
+    let same: Vec<_> = list
+        .iter()
+        .filter(|a| a.kind_code == AttachmentKind::AuditReport.code())
+        .collect();
+    assert_eq!(same.len(), 1, "同一类附件只能留一条记录，不能插新行");
+    assert_eq!(same[0].file_name, "审计报告-小.pdf");
+    assert_eq!(same[0].size_bytes, small.len() as i64);
+    assert_eq!(
+        service::attachment_bytes(&conn, &same[0].id).unwrap(),
+        small,
+        "读回来的必须是新内容，旧内容不能残留"
+    );
+
+    drop(conn);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

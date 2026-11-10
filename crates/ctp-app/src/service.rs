@@ -12,7 +12,7 @@ use ctp_core::project::{Contractor, ContractorRole, Project};
 use ctp_core::quota::PaymentQuota;
 use ctp_core::rate::Rate;
 use ctp_store::{db, repo, Result, StoreError};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 fn year_of(date: &str) -> String {
     date.get(0..4).unwrap_or("0000").to_string()
@@ -886,6 +886,12 @@ pub fn save_attachment(
     // 同类是「覆盖」，先扣掉旧行的体积再算总量，否则反复替换同一类附件会被误判为超限
     let kind_code = kind.code();
     let existing = repo::list_attachments(&tx, contract_id)?;
+    // R-67：记下被覆盖那一份的大小，提交后据此判断值不值得压缩
+    let old_size = existing
+        .iter()
+        .find(|x| x.kind_code == kind_code)
+        .map(|x| x.size_bytes)
+        .unwrap_or(0);
     let other_total = existing
         .iter()
         .filter(|x| x.kind_code != kind_code)
@@ -930,6 +936,12 @@ pub fn save_attachment(
         .into_iter()
         .find(|x| x.kind_code == kind_code);
     tx.commit()?;
+    // R-67：只有「换成更小的文件」才压缩。SQLite 只把旧 BLOB 占的页挂回 freelist，
+    // 文件高水位不回落（10 MB 换成 1 MB，库仍是 10 MB）；变大时压缩纯属白等一次全库重写。
+    // 压缩失败不影响「附件已保存」这个结果，下次替换 / 删除会再试。
+    if old_size > content.len() as i64 {
+        let _ = db::compact(conn);
+    }
     Ok(saved.unwrap_or(a))
 }
 
@@ -942,6 +954,9 @@ pub fn attachment_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
 }
 
 /// 删除附件与删除留痕同事务（R-39）。
+///
+/// R-67：删完再压缩。附件是库里最大的对象，删掉 7 MB 扫描件后若不 VACUUM，
+/// 文件大小一点都不会变，用户看到的就是「删了也不省空间」。
 pub fn delete_attachment(conn: &mut Connection, id: &str, operator: &str) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if let Some((kind, name)) = repo::delete_attachment(&tx, id)? {
@@ -956,6 +971,8 @@ pub fn delete_attachment(conn: &mut Connection, id: &str, operator: &str) -> Res
         )?;
     }
     tx.commit()?;
+    // 压缩失败不影响删除结果（记录已经没了），只是空间暂时还挂在 freelist 上
+    let _ = db::compact(conn);
     Ok(())
 }
 
@@ -1131,6 +1148,31 @@ pub fn register_audit_price(
     )?;
     tx.commit()?;
     Ok(c)
+}
+
+/// R-67：该合同最近一次登记审计价时填的「变更原因」，仅用于弹窗回填。
+///
+/// 历史数组 `audit_price_history` 是全局单键、不带合同 id，没法按合同取；
+/// 这里读操作日志里该合同最近一条 `SET_AUDIT_PRICE` 的 detail
+/// （格式「审计价 X（原 Y）：原因」），取最后一个中文冒号之后的部分。
+pub fn last_audit_reason(conn: &Connection, contract_id: &str) -> Option<String> {
+    let detail: Option<String> = conn
+        .query_row(
+            "SELECT detail FROM sys_audit_log \
+             WHERE target_type = 'ct_contract' AND target_id = ?1 AND action = 'SET_AUDIT_PRICE' \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [contract_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    detail
+        .and_then(|d| {
+            d.rsplit_once('：')
+                .map(|(_, reason)| reason.trim().to_string())
+        })
+        .filter(|r| !r.is_empty())
 }
 
 /// 项目交工：登记 / 修改交工日期（覆盖写，写审计日志）。

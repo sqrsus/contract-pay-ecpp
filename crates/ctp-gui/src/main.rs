@@ -253,6 +253,9 @@ pub struct App {
     /// 合同详情只读弹窗（点击合同编号）
     pub modal_contract: Option<Contract>,
     pub audit_form: AuditForm,
+    /// 审计价表单当前对应的合同 id（R-67）。弹窗打开期间用户仍可点下面的行切换焦点，
+    /// 记住它才能保证「回填的是谁、提交就写给谁」，不会把 A 的审定信息写到 B 上。
+    pub audit_target: Option<String>,
     /// 项目交工弹窗的日期输入
     pub delivery_form: String,
     pub amount_form: AmountForm,
@@ -430,6 +433,7 @@ impl App {
             new_contract_flash: None,
             modal_contract: None,
             audit_form: AuditForm::default(),
+            audit_target: None,
             delivery_form: String::new(),
             amount_form: AmountForm::default(),
             role: None,
@@ -613,7 +617,7 @@ impl App {
                 if let Some(id) = self.summaries.first().map(|s| s.contract_id.clone()) {
                     self.select(&id);
                     self.screen = Screen::Contracts;
-                    self.dialog = Dialog::AuditPrice;
+                    self.open_audit_price(&id);
                 }
             }
             "edit_amount" => {
@@ -822,6 +826,30 @@ impl App {
             crate::dialogs::EditContractForm::from_contract(&c, &self.projects, &self.contractors);
         self.edit_contract = Some(form);
         self.dialog = Dialog::EditContract;
+    }
+
+    /// 打开「登记审计价」弹窗（R-67）：整表回填库里现值。
+    ///
+    /// 读的是**整条**合同而不是列表摘要 —— 摘要里没有 `audit_date / audit_org /
+    /// audit_report_no`，拿摘要回填必然把这几项弄空，而提交是无条件覆盖写，
+    /// 于是「只看一眼就确认」会真的清掉库里的审定单位与报告号。
+    /// 读不到合同就不打开空表单，避免用户白填一遍再被覆盖。
+    pub fn open_audit_price(&mut self, id: &str) {
+        let Some(c) = self
+            .db
+            .as_ref()
+            .and_then(|conn| repo::get_contract(conn, id).ok())
+        else {
+            self.error("读取合同失败，请刷新后重试");
+            return;
+        };
+        let last_reason = self
+            .db
+            .as_ref()
+            .and_then(|conn| ctp_app::service::last_audit_reason(conn, id));
+        self.audit_form = crate::dialogs::AuditForm::from_contract(&c, last_reason);
+        self.audit_target = Some(c.id);
+        self.dialog = Dialog::AuditPrice;
     }
 
     /// 合同台账点击「累计已付」：展开 / 收起该合同的拨款明细。

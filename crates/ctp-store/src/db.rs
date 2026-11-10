@@ -30,6 +30,32 @@ fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // R-67：附件以 BLOB 入库，替换 / 删除时 SQLite 只把旧页标记为空闲，
+    // 旧文件内容仍以明文留在文件里（默认 secure_delete = OFF），用十六进制工具就能捞出来。
+    // 打开即清零，配合 `compact` 一起用：前者管「内容不残留」，后者管「文件缩回去」。
+    conn.pragma_update(None, "secure_delete", "ON")?;
+    Ok(())
+}
+
+/// 物理回收：把空闲页还给文件系统，并把 WAL 里的结果合并回主库。
+///
+/// 只写大 BLOB 的表做 `UPDATE` / `DELETE` 时，SQLite 把旧页挂到 freelist 上复用，
+/// **文件高水位不会回落** —— 10 MB 附件换成 1 MB 后，库文件仍是 10 MB。
+/// 只有 `VACUUM` 会重建整个库；而 WAL 模式下 `VACUUM` 的结果先是落在 WAL 里，
+/// 必须再 `wal_checkpoint(TRUNCATE)`，主库文件的大小才会真的变小（漏了这步会以为没生效）。
+///
+/// 调用方负责把频率压住：只在附件体积确实变小时调用，别每次写都跑一遍。
+pub fn compact(conn: &Connection) -> Result<()> {
+    // VACUUM 不能在事务里执行，必须在业务事务提交之后调用
+    conn.execute_batch("VACUUM")?;
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        // 返回 (busy, log, checkpointed)，这里只关心它跑完；内存库不会是 WAL
+        let (_busy, _log, _done): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+    }
     Ok(())
 }
 
@@ -465,5 +491,99 @@ mod tests {
         // 迁移函数对全新库是幂等的空操作，连续跑两次不应报错
         migrate_retired_enums(&mut conn).unwrap();
         migrate_retired_enums(&mut conn).unwrap();
+    }
+
+    /// 建一个独立的文件库，返回 (连接, 库路径, 临时目录)。
+    /// 用进程 id 隔离，避免并行测试互相删文件。
+    fn temp_db(tag: &str) -> (Connection, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ctp-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.db");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let conn = open(path.to_str().unwrap()).unwrap();
+        (conn, path)
+    }
+
+    fn drop_db(conn: Connection, path: &std::path::Path) {
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// R-67：附件换成小文件后，库文件必须真的缩小。
+    ///
+    /// SQLite 的 UPDATE 只把旧 BLOB 占的页挂到 freelist 上复用，文件高水位不回落
+    /// （10 MB 换成 1 MB，库仍是 10 MB）；`compact` 的 VACUUM + WAL checkpoint 才会缩。
+    #[test]
+    fn 压缩把空闲页还给文件系统() {
+        let (conn, path) = temp_db("compact");
+        conn.execute_batch("CREATE TABLE t(id TEXT PRIMARY KEY, b BLOB)")
+            .unwrap();
+        let big = vec![b'X'; 3 * 1024 * 1024];
+        conn.execute("INSERT INTO t VALUES('a', ?1)", rusqlite::params![&big])
+            .unwrap();
+        compact(&conn).unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let small = vec![b'Y'; 64 * 1024];
+        conn.execute(
+            "UPDATE t SET b = ?1 WHERE id = 'a'",
+            rusqlite::params![&small],
+        )
+        .unwrap();
+        compact(&conn).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+
+        assert!(
+            before > 2 * 1024 * 1024,
+            "前置：写入 3 MB 后文件应该够大，实际 {before}"
+        );
+        assert!(
+            after * 4 < before,
+            "压缩后应显著变小，实际 {before} → {after}"
+        );
+        // 压缩不能改变数据本身
+        let len: i64 = conn
+            .query_row("SELECT length(b) FROM t WHERE id = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(len, small.len() as i64);
+        drop_db(conn, &path);
+    }
+
+    /// R-67：secure_delete 开启后，覆盖写不会把旧内容以明文留在库文件里。
+    #[test]
+    fn 覆盖写不把旧字节留在文件里() {
+        let (conn, path) = temp_db("secure");
+        conn.execute_batch("CREATE TABLE t(id TEXT PRIMARY KEY, b BLOB)")
+            .unwrap();
+        let mut old = b"OLDMARK-UNIQUE-PAYLOAD".to_vec();
+        old.extend(std::iter::repeat_n(b'Q', 200_000));
+        conn.execute("INSERT INTO t VALUES('a', ?1)", rusqlite::params![&old])
+            .unwrap();
+        let new = vec![b'N'; 1_000];
+        conn.execute(
+            "UPDATE t SET b = ?1 WHERE id = 'a'",
+            rusqlite::params![&new],
+        )
+        .unwrap();
+        // 把 WAL 合并回主库，否则读到的还是旧主库
+        let _: (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !contains(&raw, b"OLDMARK-UNIQUE-PAYLOAD"),
+            "被覆盖的旧内容仍能从库文件里搜到，说明 secure_delete 没生效"
+        );
+        drop_db(conn, &path);
     }
 }
