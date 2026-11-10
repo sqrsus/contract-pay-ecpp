@@ -38,6 +38,76 @@ impl LedgerSortKey {
     }
 }
 
+/// R-65：表头的三种身份。除四个可排序列外，「合同编号」是**恢复初始排序**的入口
+/// （初始排序 = 库返回的原始行序，即不排序），其余列是纯文本。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadKind {
+    Sort(LedgerSortKey),
+    ResetSort,
+    Plain,
+}
+
+fn head_kind(key: &str) -> HeadKind {
+    if key == "contract_no" {
+        return HeadKind::ResetSort;
+    }
+    match LedgerSortKey::of_column(key) {
+        Some(k) => HeadKind::Sort(k),
+        None => HeadKind::Plain,
+    }
+}
+
+/// 表头一格的呈现：标题文字、是否高亮、悬停提示。三处表头共用它，
+/// 箭头（可排序列）与 ↺（编号列）就不会各写一套而互相不一致（R-64 / R-65）。
+struct HeadView {
+    label: String,
+    active: bool,
+    tip: String,
+}
+
+fn head_view(title: &str, kind: HeadKind, cur: Option<(LedgerSortKey, bool)>) -> HeadView {
+    match kind {
+        HeadKind::Sort(k) => match cur {
+            Some((ck, desc)) if ck == k => HeadView {
+                label: if desc {
+                    format!("{title} ↓")
+                } else {
+                    format!("{title} ↑")
+                },
+                active: true,
+                tip: if desc {
+                    format!("{title}：当前倒序（↓），点击切换为正序")
+                } else {
+                    format!("{title}：当前正序（↑），点击切换为倒序")
+                },
+            },
+            _ => HeadView {
+                label: title.to_string(),
+                active: false,
+                tip: format!("点击按「{title}」排序（首次为倒序）"),
+            },
+        },
+        HeadKind::ResetSort => HeadView {
+            label: if cur.is_some() {
+                format!("{title} ↺")
+            } else {
+                title.to_string()
+            },
+            active: cur.is_some(),
+            tip: if cur.is_some() {
+                "恢复初始排序（库返回的原始行序）".to_string()
+            } else {
+                "当前已是初始排序".to_string()
+            },
+        },
+        HeadKind::Plain => HeadView {
+            label: title.to_string(),
+            active: false,
+            tip: String::new(),
+        },
+    }
+}
+
 /// R-64：表头点击后的新排序状态。同列翻转方向；换列则从**倒序**重新开始（金额大的先看）。
 pub fn next_sort_state(
     cur: Option<(LedgerSortKey, bool)>,
@@ -367,19 +437,23 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             } else {
                                 c.screen_width
                             };
-                            // R-64：四列可点排序，其余列保持纯文本表头
-                            match LedgerSortKey::of_column(c.key) {
-                                Some(key) => {
-                                    let desc = app
-                                        .ledger_sort
-                                        .and_then(|(k, d)| (k == key).then_some(d));
-                                    if table_head_sortable(ui, &p, w, c.title, c.right, desc)
-                                        .clicked()
-                                    {
-                                        app.toggle_ledger_sort(key);
+                            // R-64 / R-65：四个可排序列 +「合同编号」可点，其余列纯文本
+                            let kind = head_kind(c.key);
+                            let view = head_view(c.title, kind, app.ledger_sort);
+                            if kind == HeadKind::Plain {
+                                table_head(ui, &p, w, &view.label, c.right);
+                            } else {
+                                let color = if view.active { p.text } else { p.text_muted };
+                                let clicked = table_head_clickable(
+                                    ui, w, &view.label, color, c.right, c.key, view.tip,
+                                )
+                                .clicked();
+                                if clicked {
+                                    match kind {
+                                        HeadKind::Sort(key) => app.toggle_ledger_sort(key),
+                                        _ => app.reset_ledger_sort(),
                                     }
                                 }
-                                None => table_head(ui, &p, w, c.title, c.right),
                             }
                         }
                     });
@@ -978,16 +1052,22 @@ fn table_head(ui: &mut egui::Ui, p: &crate::theme::Palette, width: f32, text: &s
     });
 }
 
-/// R-64：可排序表头。整格可点（不只是文字），激活列在标题后显示 ↑ / ↓ 并用正文色突出，
-/// 未激活列保持灰色但也接受点击 —— 否则用户看不出这四列能排。
+/// R-64 / R-65：可点表头。点按**只落在文字上**（用户确认的口径）——
+/// 表格本身不拦点击，文字左边的留白与上下边距都不响应。
+///
+/// 这里刻意不做「整格一个 response」：`Label` 默认是可选中的文本，可选中的 label 点按语义是
+/// `click_and_drag`，会与外层格子的点击互相争抢，文字上按下去反而拿不到 `clicked()`
+/// （表现为「只有文字旁边的空白能排序」，且右对齐列在左、左对齐列在右）。
+/// 所以 label 一律 `selectable(false)` 退回纯展示，再按它自己的矩形单独注册一次点击。
 /// 箭头与文字拼在同一个字符串里：右对齐列是 `right_to_left` 布局，分开放会把箭头排到文字左边。
-fn table_head_sortable(
+fn table_head_clickable(
     ui: &mut egui::Ui,
-    p: &crate::theme::Palette,
     width: f32,
     text: &str,
+    color: egui::Color32,
     right: bool,
-    desc: Option<bool>,
+    key: &str,
+    tip: String,
 ) -> egui::Response {
     let layout = if right {
         egui::Layout::right_to_left(egui::Align::Center)
@@ -997,23 +1077,16 @@ fn table_head_sortable(
     let inner = ui.allocate_ui_with_layout(egui::vec2(width, 26.0), layout, |ui| {
         ui.set_width(width);
         ui.add_space(4.0);
-        let (label, color) = match desc {
-            Some(true) => (format!("{text} ↓"), p.text),
-            Some(false) => (format!("{text} ↑"), p.text),
-            None => (text.to_string(), p.text_muted),
-        };
-        ui.label(RichText::new(label).size(12.0).color(color));
+        ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).selectable(false))
     });
-    let resp = inner
-        .response
-        .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let tip = match desc {
-        Some(true) => format!("{text}：当前倒序（↓），点击切换为正序"),
-        Some(false) => format!("{text}：当前正序（↑），点击切换为倒序"),
-        None => format!("点击按「{text}」排序（首次为倒序）"),
-    };
-    resp.on_hover_text(tip)
+    // 只认文字矩形：留白不响应，鼠标移上去才变手型
+    ui.interact(
+        inner.inner.rect,
+        egui::Id::new(("ledger_head", key)),
+        egui::Sense::click(),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text(tip)
 }
 
 /// 合同行下方展开的拨款明细面板：表头与「拨款管理 · 拨款明细」一致，已作废条目不再列出。
@@ -1841,5 +1914,86 @@ mod tests {
             next_sort_state(Some((LedgerSortKey::Rate, true)), LedgerSortKey::Audit),
             (LedgerSortKey::Audit, true)
         );
+    }
+
+    /// R-65：表头身份只给四个数值列和「合同编号」开口，其余列保持纯文本、不能点。
+    #[test]
+    fn 表头分类只为四列与编号开口() {
+        assert_eq!(head_kind("contract_no"), HeadKind::ResetSort);
+        assert_eq!(
+            head_kind("total_amount"),
+            HeadKind::Sort(LedgerSortKey::Amount)
+        );
+        assert_eq!(
+            head_kind("audit_price"),
+            HeadKind::Sort(LedgerSortKey::Audit)
+        );
+        assert_eq!(
+            head_kind("paid_amount"),
+            HeadKind::Sort(LedgerSortKey::Paid)
+        );
+        assert_eq!(head_kind("pay_rate"), HeadKind::Sort(LedgerSortKey::Rate));
+        // 名称 / 承包单位 / 交工日期 / 项目状态不是排序入口，也不是重置入口
+        for key in [
+            "contract_name",
+            "contractor_name",
+            "delivery_date",
+            "project_status",
+        ] {
+            assert_eq!(head_kind(key), HeadKind::Plain, "{key} 应为纯文本表头");
+        }
+    }
+
+    /// R-65：标题里的箭头 / ↺ 与高亮都只跟随**当前**排序状态：
+    /// 任一时刻最多一列带标记，切换后旧列立即回到无标记的灰字。
+    #[test]
+    fn 表头标题跟随当前排序状态() {
+        // 本列在排：箭头按方向走，且高亮
+        let v = head_view(
+            "合同金额",
+            HeadKind::Sort(LedgerSortKey::Amount),
+            Some((LedgerSortKey::Amount, true)),
+        );
+        assert_eq!(v.label, "合同金额 ↓");
+        assert!(v.active);
+        let v = head_view(
+            "合同金额",
+            HeadKind::Sort(LedgerSortKey::Amount),
+            Some((LedgerSortKey::Amount, false)),
+        );
+        assert_eq!(v.label, "合同金额 ↑");
+        assert!(v.active);
+
+        // 别的列在排：本列无标记、不高亮
+        let v = head_view(
+            "审计价",
+            HeadKind::Sort(LedgerSortKey::Audit),
+            Some((LedgerSortKey::Amount, true)),
+        );
+        assert_eq!(v.label, "审计价");
+        assert!(!v.active);
+
+        // 编号列：排序生效时加 ↺ 并高亮（它是恢复入口），未排序时与普通灰字一致
+        let v = head_view(
+            "合同编号",
+            HeadKind::ResetSort,
+            Some((LedgerSortKey::Rate, false)),
+        );
+        assert_eq!(v.label, "合同编号 ↺");
+        assert!(v.active);
+        let v = head_view("合同编号", HeadKind::ResetSort, None);
+        assert_eq!(v.label, "合同编号");
+        assert!(!v.active);
+        assert!(!v.tip.is_empty(), "未排序时也应说明当前就是初始排序");
+
+        // 纯文本列永远不突出，也不给点击提示
+        let v = head_view(
+            "项目状态",
+            HeadKind::Plain,
+            Some((LedgerSortKey::Amount, true)),
+        );
+        assert_eq!(v.label, "项目状态");
+        assert!(!v.active);
+        assert!(v.tip.is_empty());
     }
 }

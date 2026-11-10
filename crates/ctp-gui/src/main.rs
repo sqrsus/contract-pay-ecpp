@@ -855,6 +855,19 @@ impl App {
         self.pending_offset_fix = None;
     }
 
+    /// R-65：点台账表头「合同编号」→ 恢复初始排序（库返回的原始行序）。
+    /// 已经处于初始排序时整段短路：不改状态也不回顶部 ——
+    /// 否则一次没有变化的点击会把列表甩回第一行，用户会以为误触了什么。
+    pub fn reset_ledger_sort(&mut self) {
+        if self.ledger_sort.is_none() {
+            return;
+        }
+        self.ledger_sort = None;
+        self.ledger_scroll_top = true;
+        self.pending_expand_settle = None;
+        self.pending_offset_fix = None;
+    }
+
     /// 总览「新建拨款」：跳到拨款管理，并尽量定位到已选合同。
     pub fn start_payment(&mut self) {
         if let Some(id) = self.selected.clone() {
