@@ -142,12 +142,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     };
     // R-46：明细表与 Excel 导出共用同一份「当前合同的拨款单」与合同标签，
     // 不再在表格里和导出分支里各过滤一次 app.payments、各拼一次合同名。
-    let payment_rows: Vec<ctp_core::payment::Payment> = app
+    //
+    // R-77：明细改倒序显示，新单在最上面。`list_payments` 给的是
+    // `ORDER BY pay_date, payment_no` 正序，整段反转即完全镜像
+    // （开单日期晚的在上，同一天按拨款单号倒序）。
+    // 屏幕明细、Excel「拨款一览」导出、批量打印页序三处共用这一份顺序，故一并倒序；
+    // 表格行与 `ReportResult::payment_ledger(&payment_rows, …)` 同源，行不会错位。
+    let mut payment_rows: Vec<ctp_core::payment::Payment> = app
         .payments
         .iter()
         .filter(|pm| pm.contract_id == cid)
         .cloned()
         .collect();
+    payment_rows.reverse();
     let contract_label = format!("{} {}", s.contract_no, s.contract_name);
     // 额度按表单里的开单日期计算，与登记时的校验口径一致。
     // R-39：查询失败不再静默退回缓存值，而是给出可见警告 + 重试入口。
@@ -779,13 +786,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         app.print_sel.extend(ids);
     }
     if batch_print {
-        // 按列表顺序取当前合同下已勾选的单据；总览页走同一入口，只是传它自己的 6 条
-        let ids: Vec<String> = app
+        // 按列表顺序取当前合同下已勾选的单据；总览页走同一入口，只是传它自己的 8 条
+        // R-77：页序与明细表一致（新单在前），故与 `payment_rows` 同步反转。
+        let mut ids: Vec<String> = app
             .payments
             .iter()
             .filter(|pm| pm.contract_id == cid && app.print_sel.contains(&pm.id))
             .map(|pm| pm.id.clone())
             .collect();
+        ids.reverse();
         app.open_batch_print(ids);
     }
 
