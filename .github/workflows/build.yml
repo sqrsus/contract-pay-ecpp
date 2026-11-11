@@ -122,6 +122,13 @@ jobs:
   # 发布说明：--generate-notes 自动汇总「上一个 v* 标签 → 本次」之间的提交与 PR，
   #           --notes-start-tag 显式指定起点，避免把更早的历史也带进来。
   #           如需按 PR 标签分组，可另加 .github/release.yml 定制分类。
+  #
+  # 发布资产（三件）：
+  #   ctp-gui-<版本>-windows-x64.exe    可直接运行，便于老用户沿用习惯
+  #   ctp-gui-<版本>-windows-x64.zip    同一 exe 的体积压缩版，供下载慢的场景
+  #   SHA256SUMS.txt                    前两者的校验和
+  # GitHub 不对 Release 资产做二次压缩，exe 直传时用户下载的就是 10 MB 全量；
+  # 打成 zip 后实际下载量约减半，且不改动程序本身（无需重新编译、不改变校验逻辑）。
   # ---------------------------------------------------------------------------
   release:
     name: 发布 Release
@@ -196,15 +203,23 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: 重命名产物并生成校验和
+      - name: 重命名产物、打包 zip 并生成校验和
         if: ${{ steps.guard.outputs.exists == 'false' }}
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ steps.ver.outputs.version }}"
           cd artifacts
-          mv ctp-gui.exe "ctp-gui-${VERSION}-windows-x64.exe"
-          sha256sum ./*.exe > SHA256SUMS.txt
+          EXE="ctp-gui-${VERSION}-windows-x64.exe"
+          ZIP="ctp-gui-${VERSION}-windows-x64.zip"
+          mv ctp-gui.exe "${EXE}"
+          # runner 镜像自带 zip；万一某天缺失就补装，避免发版卡在缺工具上
+          command -v zip >/dev/null 2>&1 || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq zip
+          }
+          # -9 最高压缩率；-X 去掉 uid/时间等多余字段，同样的 exe 每次压出同样的包
+          zip -9 -X "${ZIP}" "${EXE}"
+          sha256sum ./*.exe ./*.zip > SHA256SUMS.txt
           ls -lh
           cat SHA256SUMS.txt
 
