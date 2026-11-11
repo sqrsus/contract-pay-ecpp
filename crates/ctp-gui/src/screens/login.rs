@@ -156,6 +156,17 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                     );
                 });
             }
+
+            // 底部一行版本标识：未登录也能看到，反馈问题时不必先登录再报版本。
+            // 与登录后状态栏同一套文本（软件版本来自包信息，结构版本来自数据库）。
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(app.version_line())
+                        .size(11.0)
+                        .color(p.text_muted),
+                );
+            });
         });
 
     // ---------------- 动作落地

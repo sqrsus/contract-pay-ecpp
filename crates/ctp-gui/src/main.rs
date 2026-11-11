@@ -36,6 +36,13 @@ use screens::contracts::{next_sort_state, LedgerSortKey};
 use theme::{Palette, ThemeMode};
 use widgets::Tone;
 
+/// 软件版本号。
+///
+/// 编译期从包信息系统读取，唯一真源是根 `Cargo.toml` 的 `workspace.package.version`
+/// （四个 crate 经 `version.workspace = true` 继承），**禁止在此硬编码**。
+/// 与 Excel 导出页脚 `xlsx.rs` 的 `env!("CARGO_PKG_VERSION")` 同源，bump 版本只改 Cargo.toml。
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// 导航页。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -1488,11 +1495,8 @@ impl App {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     if !self.narrow {
-                        ui.label(
-                            RichText::new(format!("结构版本 {}", self.schema_version))
-                                .size(10.5)
-                                .color(p.text_muted),
-                        );
+                        // 结构版本已移到底部状态栏，与软件版本并排常驻显示；
+                        // 此处只留计数，避免同一信息在界面里出现两遍。
                         ui.label(
                             RichText::new(format!(
                                 "合同 {} · 拨款单 {}",
@@ -1511,8 +1515,18 @@ impl App {
 
     // ---------------------------------------------------------------- 状态栏
 
+    /// 版本标识文本：「版本 0.5.2 · 结构 1.6.0-rv28」。
+    ///
+    /// 软件版本取自包信息（编译期常量 `APP_VERSION`），结构版本取自数据库；
+    /// 库未打开时结构版本为空，只显示软件版本，不出现尾部悬空的「结构」。
+    pub fn version_line(&self) -> String {
+        format_version(&self.schema_version)
+    }
+
     fn status_bar(&mut self, ctx: &egui::Context) {
         let p = self.pal;
+        let ver_text = self.version_line();
+        let role_text = self.role.map(|r| r.label()).unwrap_or("未登录").to_string();
         egui::TopBottomPanel::bottom("status")
             .exact_height(34.0)
             .frame(
@@ -1522,19 +1536,110 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let (text, tone) = match &self.toast {
-                        Some(t) => (t.text.clone(), t.tone),
-                        None => ("就绪".to_string(), Tone::Neutral),
-                    };
-                    let (fg, _) = tone.colors(&p);
-                    ui.label(RichText::new("●").size(12.0).color(fg));
-                    ui.label(RichText::new(text).size(12.5).color(p.text));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let role = self.role.map(|r| r.label()).unwrap_or("未登录");
-                        ui.label(RichText::new(role).size(11.5).color(p.text_muted));
-                    });
+                    // 两栏宽度先算好再画：右栏按内容固定，左栏吃掉剩余宽度。
+                    // 不依赖「谁先画谁让位」，因此任何窗口宽度下都不会互相挤压。
+                    let ver_w = text_width(ui, &ver_text, 11.5);
+                    let role_w = text_width(ui, &role_text, 11.5);
+                    let (show_role, right_w) =
+                        status_right_plan(ui.available_width(), ver_w, role_w, STATUS_MIN_LEFT);
+                    let total_w = ui.available_width();
+                    let left_w = (total_w - right_w).max(0.0);
+                    let row_h = ui.available_height();
+                    // 两栏之间的间距已逐像素算进宽度，不再叠加默认 item_spacing
+                    ui.spacing_mut().item_spacing.x = 0.0;
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_w, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            // 必须钉死宽度：`allocate_ui_with_layout` 只按内容实际宽度
+                            // 推进光标，不 set_width 的话右栏会被左侧文字直接带过来。
+                            ui.set_width(left_w);
+                            let (text, tone) = match &self.toast {
+                                Some(t) => (t.text.clone(), t.tone),
+                                None => ("就绪".to_string(), Tone::Neutral),
+                            };
+                            let (fg, _) = tone.colors(&p);
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(RichText::new("●").size(12.0).color(fg));
+                            // 截断而非换行：状态栏高度固定，换行会被裁掉且顶到上沿
+                            let resp = ui.add(
+                                egui::Label::new(RichText::new(&text).size(12.5).color(p.text))
+                                    .truncate(),
+                            );
+                            // 被截断时悬停给全文，长提示不至于读不全
+                            if text_width(ui, &text, 12.5) > left_w - 24.0 {
+                                let _ = resp.on_hover_text(text);
+                            }
+                        },
+                    );
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right_w, row_h),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            // 同上：右栏宽度固定，版本号才能稳定贴住最右侧
+                            ui.set_width(right_w);
+                            ui.spacing_mut().item_spacing.x = STATUS_GAP;
+                            ui.label(RichText::new(&ver_text).size(11.5).color(p.text_muted));
+                            // 空间不够时身份先让位，版本号始终保留
+                            if show_role {
+                                ui.label(RichText::new("│").size(11.5).color(p.border));
+                                ui.label(RichText::new(&role_text).size(11.5).color(p.text_muted));
+                            }
+                        },
+                    );
                 });
             });
+    }
+}
+
+/// 版本标识文本：软件版本恒有，结构版本可能尚未就绪（库未打开时为空）。
+pub fn format_version(schema: &str) -> String {
+    if schema.is_empty() {
+        format!("版本 {APP_VERSION}")
+    } else {
+        format!("版本 {} · 结构 {}", APP_VERSION, schema)
+    }
+}
+
+/// 状态栏右侧块内元素间距（版本号与身份之间隔一条竖线）。
+const STATUS_GAP: f32 = 10.0;
+/// 竖线「│」的渲染宽度，作为固定值参与宽度预算。
+const STATUS_SEP_W: f32 = 5.0;
+/// 左侧提示文字必须保住的最小宽度：低于它就把责任推到身份标签上。
+const STATUS_MIN_LEFT: f32 = 160.0;
+
+/// 量一段文字在指定字号下的自然宽度（不换行）。
+///
+/// 用于状态栏分栏前做像素级预算 —— 先量后画，宽度分配与绘制结果必然一致。
+fn text_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(size),
+            Color32::WHITE,
+        )
+        .size()
+        .x
+    })
+}
+
+/// 状态栏右侧块的宽度预算：返回 `(是否显示身份标签, 右栏总宽)`。
+///
+/// 规则是「版本号常显，其余先收缩」：
+/// 1. 总宽足够（右栏 + 左侧最小宽度）→ 身份与版本号都显示；
+/// 2. 不够 → 身份标签退出，只留版本号。
+///
+/// 版本号自身宽度不受窗口影响，所以右栏最窄也是 `ver_w`，
+/// 左侧提示文字则按剩余宽度截断，两者不会重叠。
+fn status_right_plan(avail: f32, ver_w: f32, role_w: f32, min_left: f32) -> (bool, f32) {
+    let with_role = ver_w + STATUS_GAP * 2.0 + STATUS_SEP_W + role_w + 1.0;
+    if avail >= with_role + min_left {
+        (true, with_role)
+    } else {
+        // +1.0 吸收字体度量与布局取整的浮点误差，避免差一像素就换行
+        (false, ver_w + 1.0)
     }
 }
 
@@ -1794,4 +1899,73 @@ fn main() -> eframe::Result<()> {
         );
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 版本号必须来自包信息且是三段式：Cargo 拒绝两段式（`0.5` 无法解析），
+    /// 界面串一旦被手改成别的形状，这里会先炸。
+    #[test]
+    fn app_version_comes_from_package_metadata() {
+        assert_eq!(
+            APP_VERSION.split('.').count(),
+            3,
+            "版本号应为 MAJOR.MINOR.PATCH：{APP_VERSION}"
+        );
+        assert!(
+            APP_VERSION
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c.is_ascii_alphabetic()),
+            "版本号含非法字符：{APP_VERSION}"
+        );
+        assert!(!APP_VERSION.is_empty(), "版本号不得为空");
+    }
+
+    /// 结构版本未就绪时不能出现「版本 0.5.2 · 结构」这种尾巴悬空的串。
+    #[test]
+    fn version_line_without_schema_shows_version_only() {
+        let s = format_version("");
+        assert_eq!(s, format!("版本 {APP_VERSION}"));
+        assert!(!s.contains("结构"), "无结构版本时不应出现「结构」：{s}");
+    }
+
+    #[test]
+    fn version_line_with_schema_shows_both() {
+        let s = format_version("1.6.0-rv28");
+        assert_eq!(s, format!("版本 {APP_VERSION} · 结构 1.6.0-rv28"));
+    }
+
+    /// 宽窗口：身份与版本号都排出。
+    #[test]
+    fn status_right_plan_keeps_role_when_roomy() {
+        let (show_role, w) = status_right_plan(1344.0, 210.0, 42.0, STATUS_MIN_LEFT);
+        assert!(show_role);
+        // 210 + 10*2 + 5 + 42 + 1
+        assert!((w - 278.0).abs() < 0.01, "右栏宽度应为 278，实际 {w}");
+        assert!(w + STATUS_MIN_LEFT <= 1344.0);
+    }
+
+    /// 窄窗口：身份让位，版本号宽度一点不减（「常显」的含义）。
+    #[test]
+    fn status_right_plan_drops_role_when_narrow() {
+        let (show_role, w) = status_right_plan(300.0, 210.0, 42.0, STATUS_MIN_LEFT);
+        assert!(!show_role, "空间不足时应隐藏身份标签");
+        assert!((w - 211.0).abs() < 0.01, "右栏宽度应回落到版本号本身");
+        // 任何情况下右栏都至少容得下版本号，不会把版本号挤掉
+        assert!(w >= 210.0);
+    }
+
+    /// 阈值两侧：刚好够放身份 vs 差 1px 就不放。
+    #[test]
+    fn status_right_plan_boundary_is_exact() {
+        let need = 210.0 + STATUS_GAP * 2.0 + STATUS_SEP_W + 42.0 + 1.0;
+        let (show_role, _) =
+            status_right_plan(need + STATUS_MIN_LEFT, 210.0, 42.0, STATUS_MIN_LEFT);
+        assert!(show_role, "刚好够时应保留身份");
+        let (show_role, _) =
+            status_right_plan(need + STATUS_MIN_LEFT - 1.0, 210.0, 42.0, STATUS_MIN_LEFT);
+        assert!(!show_role, "差 1px 就应让位");
+    }
 }
