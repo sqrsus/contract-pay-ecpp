@@ -9,12 +9,25 @@ use eframe::egui::{self, RichText};
 /// 最近拨款一行：(单 ID, 开单日期, 单号, 合同 ID, 合同名称, 承包单位, 金额分, 是否作废)
 type RecentRow = (String, String, String, String, String, String, i64, bool);
 
-/// 「最近拨款」合同名称列宽：R-56 加宽到 1.3 倍（236 → 306.8），R-58 ×1.2 → 368.16，
-/// R-59 再 ×1.1 → 404.98。表头、单元格与滚动宽度三处必须同值，否则文字与列边界会错位。
-const NAME_W: f32 = 404.98;
-
-/// 「最近拨款」承包单位列宽：R-58 130 × 1.2 = 156，R-59 再 ×1.2 = 187.2。同样三处同值。
+/// 「最近拨款」各列宽。R-56 起合同名称列被反复加宽：236 → 306.8 → 368.16 → 404.98，
+/// 本轮（R-76）再 ×1.3 → 526.47。表头、单元格与分隔线三处必须同值，否则文字与列边界会错位。
+const CHECK_W: f32 = 24.0;
+const DATE_W: f32 = 86.0;
+const NO_W: f32 = 104.0;
+const NAME_W: f32 = 526.47;
+/// 承包单位列宽：R-58 130 × 1.2 = 156，R-59 再 ×1.2 = 187.2，本轮不动。
 const CONTRACTOR_W: f32 = 187.2;
+const AMOUNT_W: f32 = 110.0;
+const STATUS_W: f32 = 52.0;
+const OP_W: f32 = 116.0;
+
+/// 整行宽度：合同名称加宽后（1205.67）已超过默认窗口（1380）下的表格可用宽度（约 1114），
+/// 因此整张表放进横向滚动区，按此宽度撑开内容；分隔线也用它定宽
+/// （滚动区内部的 `ui.available_width()` 是无穷大，不能拿来做线宽）。
+const ROW_W: f32 = CHECK_W + DATE_W + NO_W + NAME_W + CONTRACTOR_W + AMOUNT_W + STATUS_W + OP_W;
+
+/// 「最近拨款」显示条数：R-76 由 6 条增加到 8 条（勾选 / 全选范围同步扩大）。
+const RECENT_ROWS: usize = 8;
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let p = app.pal;
@@ -197,10 +210,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         })
         .collect();
     recent.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
-    // 只勾最近 6 条里未作废的单据；顺序与列表一致，批量打印按此顺序成页
+    // 只勾最近 8 条里未作废的单据；顺序与列表一致，批量打印按此顺序成页
     let payable_ids: Vec<String> = recent
         .iter()
-        .take(6)
+        .take(RECENT_ROWS)
         .filter(|r| !r.7)
         .map(|r| r.0.clone())
         .collect();
@@ -242,113 +255,138 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         });
         ui.add_space(2.0);
 
-        // 表头
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            head_cell(ui, &p, 24.0, "", false);
-            head_cell(ui, &p, 86.0, "开单日期", false);
-            head_cell(ui, &p, 104.0, "拨款单号", false);
-            // R-59：合同名称 ×1.1（→ 404.98）、承包单位 ×1.2（→ 187.2），其余列宽不变
-            head_cell(ui, &p, NAME_W, "合同名称", false);
-            head_cell(ui, &p, CONTRACTOR_W, "承包单位", false);
-            head_cell(ui, &p, 110.0, "金额", true);
-            head_cell(ui, &p, 52.0, "状态", false);
-            head_cell(ui, &p, 116.0, "操作", false);
-        });
-        ui.add_space(3.0);
-        widgets::divider(ui, &p);
+        // R-76：合同名称列 ×1.3（404.98 → 526.47）后整行宽 1205.67 px，超过默认窗口
+        // （1380）下卡片内的可用宽度（约 1114 px）。除合同名称外的列宽一律不动、
+        // 整体右移，表头与数据行一起放进横向滚动区，超出时横向拖动查看「操作」列。
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_width(ROW_W);
 
-        for (i, (pay_id, date, no, contract_id, cname, contractor, amount, voided)) in
-            recent.into_iter().take(6).enumerate()
-        {
-            let fill = if i % 2 == 1 {
-                p.surface_alt
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            egui::Frame::none()
-                .fill(fill)
-                .inner_margin(egui::Margin::symmetric(0.0, 2.0))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        cell(ui, 24.0, false, |ui| {
-                            let paid = !voided;
-                            let mut on = app.print_sel.contains(&pay_id);
-                            let cb = ui.add_enabled(paid, egui::Checkbox::new(&mut on, ""));
-                            if !paid {
-                                cb.on_hover_text("作废单不可打印");
-                            } else if cb.changed() {
-                                sel_toggle.push((pay_id.clone(), on));
-                            }
-                        });
-                        cell(ui, 86.0, false, |ui| {
-                            ui.label(RichText::new(date).size(12.0).color(p.text_muted));
-                        });
-                        cell(ui, 104.0, false, |ui| {
-                            if widgets::link(ui, &p, &no, 12.5).clicked() {
-                                open_pay = Some(pay_id.clone());
-                            }
-                        });
-                        cell(ui, NAME_W, false, |ui| {
-                            // 合同名称即详情入口：悬停滚动查看全名，点击弹出该合同的详情弹窗
-                            let r = widgets::marquee_sense(
-                                ui,
-                                &cname,
-                                NAME_W,
-                                12.5,
-                                p.primary,
-                                egui::Sense::click(),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text("点击查看合同详情");
-                            if r.clicked() {
-                                open_contract = Some(contract_id.clone());
-                            }
-                        });
-                        cell(ui, CONTRACTOR_W, false, |ui| {
-                            widgets::marquee(ui, &contractor, CONTRACTOR_W, 12.0, p.text_muted);
-                        });
-                        cell(ui, 110.0, true, |ui| {
-                            ui.label(
-                                RichText::new(Money::from_cent(amount).format_yuan())
-                                    .size(13.0)
-                                    .strong()
-                                    .color(p.text),
-                            );
-                        });
-                        cell(ui, 52.0, false, |ui| {
-                            let tone = if voided { Tone::Neutral } else { Tone::Success };
-                            widgets::badge(ui, &p, if voided { "作废" } else { "已付" }, tone);
-                        });
-                        cell(ui, 116.0, false, |ui| {
-                            // 与「拨款管理 · 拨款明细」操作列一致：文字链，作废单置灰不可点
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            if voided {
-                                ui.label(
-                                    RichText::new("打印拨款单").size(11.0).color(p.text_muted),
-                                )
-                                .on_hover_text("已作废的拨款单不可打印");
-                                ui.label(RichText::new("打印附件").size(11.0).color(p.text_muted))
-                                    .on_hover_text("已作废的拨款单不可打印");
-                            } else {
-                                if widgets::link(ui, &p, "打印拨款单", 11.0)
-                                    .on_hover_text("预览付款打印模板的 9 个合并域取值")
-                                    .clicked()
-                                {
-                                    print_pay = Some(pay_id.clone());
-                                }
-                                if widgets::link(ui, &p, "打印附件", 11.0)
-                                    .on_hover_text("中标通知书、审计报告等材料打印")
-                                    .clicked()
-                                {
-                                    print_material = Some(contract_id.clone());
-                                }
-                            }
-                        });
-                    });
+                // 表头
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    head_cell(ui, &p, CHECK_W, "", false);
+                    head_cell(ui, &p, DATE_W, "开单日期", false);
+                    head_cell(ui, &p, NO_W, "拨款单号", false);
+                    head_cell(ui, &p, NAME_W, "合同名称", false);
+                    head_cell(ui, &p, CONTRACTOR_W, "承包单位", false);
+                    head_cell(ui, &p, AMOUNT_W, "金额", true);
+                    head_cell(ui, &p, STATUS_W, "状态", false);
+                    head_cell(ui, &p, OP_W, "操作", false);
                 });
-        }
+                ui.add_space(3.0);
+                divider_fixed(ui, &p, ROW_W);
+
+                for (i, (pay_id, date, no, contract_id, cname, contractor, amount, voided)) in
+                    recent.into_iter().take(RECENT_ROWS).enumerate()
+                {
+                    let fill = if i % 2 == 1 {
+                        p.surface_alt
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    egui::Frame::none()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(0.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                cell(ui, CHECK_W, false, |ui| {
+                                    let paid = !voided;
+                                    let mut on = app.print_sel.contains(&pay_id);
+                                    let cb = ui.add_enabled(paid, egui::Checkbox::new(&mut on, ""));
+                                    if !paid {
+                                        cb.on_hover_text("作废单不可打印");
+                                    } else if cb.changed() {
+                                        sel_toggle.push((pay_id.clone(), on));
+                                    }
+                                });
+                                cell(ui, DATE_W, false, |ui| {
+                                    ui.label(RichText::new(date).size(12.0).color(p.text_muted));
+                                });
+                                cell(ui, NO_W, false, |ui| {
+                                    if widgets::link(ui, &p, &no, 12.5).clicked() {
+                                        open_pay = Some(pay_id.clone());
+                                    }
+                                });
+                                cell(ui, NAME_W, false, |ui| {
+                                    // 合同名称即详情入口：悬停滚动查看全名，点击弹出该合同的详情弹窗
+                                    let r = widgets::marquee_sense(
+                                        ui,
+                                        &cname,
+                                        NAME_W,
+                                        12.5,
+                                        p.primary,
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("点击查看合同详情");
+                                    if r.clicked() {
+                                        open_contract = Some(contract_id.clone());
+                                    }
+                                });
+                                cell(ui, CONTRACTOR_W, false, |ui| {
+                                    widgets::marquee(
+                                        ui,
+                                        &contractor,
+                                        CONTRACTOR_W,
+                                        12.0,
+                                        p.text_muted,
+                                    );
+                                });
+                                cell(ui, AMOUNT_W, true, |ui| {
+                                    ui.label(
+                                        RichText::new(Money::from_cent(amount).format_yuan())
+                                            .size(13.0)
+                                            .strong()
+                                            .color(p.text),
+                                    );
+                                });
+                                cell(ui, STATUS_W, false, |ui| {
+                                    let tone = if voided { Tone::Neutral } else { Tone::Success };
+                                    widgets::badge(
+                                        ui,
+                                        &p,
+                                        if voided { "作废" } else { "已付" },
+                                        tone,
+                                    );
+                                });
+                                cell(ui, OP_W, false, |ui| {
+                                    // 与「拨款管理 · 拨款明细」操作列一致：文字链，作废单置灰不可点
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    if voided {
+                                        ui.label(
+                                            RichText::new("打印拨款单")
+                                                .size(11.0)
+                                                .color(p.text_muted),
+                                        )
+                                        .on_hover_text("已作废的拨款单不可打印");
+                                        ui.label(
+                                            RichText::new("打印附件")
+                                                .size(11.0)
+                                                .color(p.text_muted),
+                                        )
+                                        .on_hover_text("已作废的拨款单不可打印");
+                                    } else {
+                                        if widgets::link(ui, &p, "打印拨款单", 11.0)
+                                            .on_hover_text("预览付款打印模板的 9 个合并域取值")
+                                            .clicked()
+                                        {
+                                            print_pay = Some(pay_id.clone());
+                                        }
+                                        if widgets::link(ui, &p, "打印附件", 11.0)
+                                            .on_hover_text("中标通知书、审计报告等材料打印")
+                                            .clicked()
+                                        {
+                                            print_material = Some(contract_id.clone());
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                }
+            });
     });
 
     // ---------------- 交互落地
@@ -413,4 +451,16 @@ fn head_cell(ui: &mut egui::Ui, p: &crate::theme::Palette, width: f32, text: &st
     cell(ui, width, right, |ui| {
         ui.label(RichText::new(text).size(11.5).color(p.text_muted));
     });
+}
+
+/// 定宽分隔线。
+///
+/// 横向滚动区内部的 `ui.available_width()` 是无穷大，`widgets::divider` 直接拿它当线宽
+/// 会画不出东西（甚至算出非有限矩形），所以这里显式传入整行宽度。
+fn divider_fixed(ui: &mut egui::Ui, p: &crate::theme::Palette, width: f32) {
+    ui.add_space(2.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(0.5), p.border);
+    ui.add_space(2.0);
 }

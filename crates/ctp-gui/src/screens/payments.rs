@@ -204,25 +204,48 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(10.0);
 
     // ---------------- 当前合同（下拉正下方一行）
-    // 三项状态元素已移回下拉右侧，本行只剩合同名称。
-    // 字号与表单输入框一致（Body 14）；过长时单行截断并悬停看全名，
-    // 整行不会被名称撑破，也不会挤压右侧。
+    // 三项状态元素已移回下拉右侧；本行显示「合同名称 + 四个半角空格 + 承包单位」（R-76）。
+    // 名称与承包单位分两段着色（名称 p.text、承包单位 p.text_muted），
+    // 用 LayoutJob 拼成一行：既能保留两段颜色，又能整行单行截断、悬停看全文。
+    // 字号与表单输入框一致（Body 14），名称再长也不会把行撑破。
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.label(RichText::new("当前合同为：").size(14.0).color(p.text_muted));
-        let name_w = ui.available_width();
-        let resp = ui.add(
-            egui::Label::new(
-                RichText::new(s.contract_name.clone())
-                    .size(14.0)
-                    .strong()
-                    .color(p.text),
-            )
-            .truncate(),
+        let full = format!("{}    {}", s.contract_name, s.contractor_name);
+        let font = egui::FontId::proportional(14.0);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &s.contract_name,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: p.text,
+                ..Default::default()
+            },
         );
-        // 被截断时悬停看全名
-        if crate::text_width(ui, &s.contract_name, 14.0) > name_w {
-            let _ = resp.on_hover_text(s.contract_name.clone());
+        job.append(
+            "    ",
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: p.text_muted,
+                ..Default::default()
+            },
+        );
+        job.append(
+            &s.contractor_name,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color: p.text_muted,
+                ..Default::default()
+            },
+        );
+        let name_w = ui.available_width();
+        let resp = ui.add(egui::Label::new(job).truncate());
+        // 被截断时悬停看全名与承包单位
+        if crate::text_width(ui, &full, 14.0) > name_w {
+            let _ = resp.on_hover_text(full);
         }
     });
 
@@ -352,13 +375,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut select_all = false;
     let mut clear_sel = false;
 
+    // R-76：「拨款明细」的高度上限跟随左栏「登记拨款单」卡片。
+    // 明细在右栏绘制，需要先拿到表单卡片的实际外框高度，所以先落一个可写变量，
+    // 左栏画完就赋值，右栏直接读（同帧、顺序执行，不是上一帧的旧值）。
+    let mut form_card_h: f32 = 0.0;
+
     ui.horizontal_top(|ui| {
         let form_w = if avail_w > 900.0 { 300.0 } else { avail_w };
         ui.allocate_ui_with_layout(
             egui::vec2(form_w, 0.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                widgets::card(&p).show(ui, |ui| {
+                let form_card = widgets::card(&p).show(ui, |ui| {
                     ui.set_width(form_w - 34.0);
                     widgets::section_title(ui, &p, "登记拨款单", "单级登记，无需审批");
                     ui.add_space(6.0);
@@ -491,14 +519,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         );
                     }
                 });
+                // 表单卡片外框高度：右栏明细卡片以此为高度上限
+                form_card_h = form_card.response.rect.height();
             },
         );
 
         if avail_w > 900.0 {
             ui.add_space(12.0);
             let list_w = avail_w - form_w - 12.0;
+            // R-76：「拨款明细」栏的高度上限 = 左栏「登记拨款单」卡片的外框高度。
+            // 做法是把右栏的高度直接钉成表单卡片高度：明细表内部是滚动区，
+            // 可用高度就是这根上限，行数多时到顶即滚动、行数少时仍按内容收缩
+            // （初始默认高度不变），两张卡片的底边因此自然齐平。
+            let list_h = form_card_h.max(200.0);
             ui.allocate_ui_with_layout(
-                egui::vec2(list_w, 0.0),
+                egui::vec2(list_w, list_h),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     widgets::card(&p).show(ui, |ui| {
@@ -543,6 +578,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         });
                         ui.add_space(4.0);
                         ui.spacing_mut().item_spacing.x = 20.0;
+                        // R-76：表格高度不单独设上限——右栏本身已按表单卡片高度收紧，
+                        // 滚动区按可用高度自然封顶，行数少时仍按内容收缩。
                         // R-33：列配置、单元格取值、合计行全部来自 ReportResult；
                         // 勾选 / 打印 / 作废等交互列仍由页面按列语义附加绘制。
                         let mut tb = TableBuilder::new(ui)
