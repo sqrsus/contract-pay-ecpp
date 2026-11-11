@@ -77,8 +77,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     let mut picked_id: Option<String> = None;
-    // 合同下拉：宽度为原 372 px 的 1.5 倍（558）。加宽后本行只留标签与下拉，
-    // 状态徽标与支付率移到下一行右侧，避免窄窗口下被挤压或换行错位。
+    // 合同下拉：宽度为原 372 px 的 1.5 倍（558）。
+    // 状态徽标与支付率紧跟在下拉右侧（R-74 从下一行移回），保持原有内容与样式：
+    // 558 + 三项在最小窗口（1100）下仍能放进一行，故不加收缩或换行兜底。
     ui.horizontal(|ui| {
         ui.label(RichText::new("合同").size(12.5).color(p.text_muted));
         picked_id = widgets::contract_select(
@@ -91,6 +92,40 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             &mut app.pay_open,
             558.0,
         );
+
+        // 当前合同的项目状态与支付率：下拉之后紧跟，样式与合同台账一致
+        if let Some(s) = app
+            .pay_contract
+            .as_ref()
+            .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
+        {
+            ui.add_space(8.0);
+            let frac = s.pay_rate.bp() as f32 / 10_000.0;
+            let color = if s.is_inverted {
+                p.danger
+            } else if frac > 0.99 {
+                p.warn
+            } else {
+                p.primary
+            };
+            // 按真实状态取标签：原来只看「是否归档」，草稿 / 待生效合同会被
+            // 错标成「履行中」，与下方「不可登记拨款」的提示自相矛盾。
+            let st = ContractStatus::from_code(&s.status);
+            let (st_text, st_tone) = match st {
+                Some(x) if x.is_payable() => (x.label(), Tone::Success),
+                Some(x) if s.is_archived() => (x.label(), Tone::Danger),
+                Some(x) => (x.label(), Tone::Neutral),
+                None => (s.status.as_str(), Tone::Neutral),
+            };
+            widgets::badge(ui, &p, st_text, st_tone);
+            ui.add_space(8.0);
+            widgets::bar(ui, &p, frac, color, 82.0, 7.0);
+            ui.label(
+                RichText::new(s.pay_rate.percent_string())
+                    .size(11.5)
+                    .color(p.text_muted),
+            );
+        }
     });
     if let Some(id) = picked_id {
         app.pay_contract = Some(id);
@@ -169,61 +204,26 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(10.0);
 
     // ---------------- 当前合同（下拉正下方一行）
-    // 左侧显示下游选中的合同名称，右侧固定放状态徽标与支付率：
-    // 名称过长时截断而不是挤压右侧，右侧块宽度固定所以任何窗口宽度都不重叠。
-    let right_w = 214.0;
+    // 三项状态元素已移回下拉右侧，本行只剩合同名称。
+    // 字号与表单输入框一致（Body 14）；过长时单行截断并悬停看全名，
+    // 整行不会被名称撑破，也不会挤压右侧。
     ui.horizontal(|ui| {
-        let left_w = (ui.available_width() - right_w).max(120.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(left_w, 22.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                // 钉死宽度，否则右侧块会被左侧名称直接带过来
-                ui.set_width(left_w);
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(RichText::new("当前合同为：").size(12.0).color(p.text_muted));
-                let resp = ui.add(
-                    egui::Label::new(
-                        RichText::new(s.contract_name.clone())
-                            .size(12.0)
-                            .strong()
-                            .color(p.text),
-                    )
-                    .truncate(),
-                );
-                // 被截断时悬停看全名
-                if crate::text_width(ui, &s.contract_name, 12.0) > left_w - 80.0 {
-                    let _ = resp.on_hover_text(s.contract_name.clone());
-                }
-            },
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new("当前合同为：").size(14.0).color(p.text_muted));
+        let name_w = ui.available_width();
+        let resp = ui.add(
+            egui::Label::new(
+                RichText::new(s.contract_name.clone())
+                    .size(14.0)
+                    .strong()
+                    .color(p.text),
+            )
+            .truncate(),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let frac = s.pay_rate.bp() as f32 / 10_000.0;
-            let color = if s.is_inverted {
-                p.danger
-            } else if frac > 0.99 {
-                p.warn
-            } else {
-                p.primary
-            };
-            ui.label(
-                RichText::new(s.pay_rate.percent_string())
-                    .size(11.5)
-                    .color(p.text_muted),
-            );
-            widgets::bar(ui, &p, frac, color, 82.0, 7.0);
-            ui.add_space(2.0);
-            // 按真实状态取标签：原来只看「是否归档」，草稿 / 待生效合同会被
-            // 错标成「履行中」，与下方「不可登记拨款」的提示自相矛盾。
-            let st = ContractStatus::from_code(&s.status);
-            let (st_text, st_tone) = match st {
-                Some(x) if x.is_payable() => (x.label(), Tone::Success),
-                Some(x) if s.is_archived() => (x.label(), Tone::Danger),
-                Some(x) => (x.label(), Tone::Neutral),
-                None => (s.status.as_str(), Tone::Neutral),
-            };
-            widgets::badge(ui, &p, st_text, st_tone);
-        });
+        // 被截断时悬停看全名
+        if crate::text_width(ui, &s.contract_name, 14.0) > name_w {
+            let _ = resp.on_hover_text(s.contract_name.clone());
+        }
     });
 
     ui.add_space(10.0);
@@ -383,25 +383,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         }
                     });
 
-                    // 大写金额：随输入实时换算（零壹贰…圆角分整），
-                    // 未填或格式非法时显示「—」，该行始终占位，输入时按钮不跳动。
+                    // 大写金额：随输入实时换算（零壹贰…圆角分整）。
+                    // 字号与输入框显示字体一致（Body 14），未填或格式非法时显示「—」；
+                    // 该行始终占位，长金额单行截断并悬停看全，输入时下方按钮不跳动。
                     let cn = amount_cn_text(&app.pay_form.amount);
                     ui.add_space(3.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
-                        ui.label(RichText::new("大写：").size(11.0).color(p.text_muted));
+                        ui.label(RichText::new("大写：").size(14.0).color(p.text_muted));
                         let avail = ui.available_width();
-                        // 表单只有约 300 px 宽，长金额先降字号保单行（最低 9.0），
-                        // 再放不下才截断并挂 tooltip —— 换行会让下方按钮上下跳。
-                        let mut size = 11.0_f32;
-                        while size > 9.0 && crate::text_width(ui, &cn, size) > avail {
-                            size -= 0.5;
-                        }
                         let resp = ui.add(
-                            egui::Label::new(RichText::new(&cn).size(size).color(p.text))
+                            egui::Label::new(RichText::new(&cn).size(14.0).color(p.text))
                                 .truncate(),
                         );
-                        if crate::text_width(ui, &cn, size) > avail {
+                        if crate::text_width(ui, &cn, 14.0) > avail {
                             let _ = resp.on_hover_text(&cn);
                         }
                     });
