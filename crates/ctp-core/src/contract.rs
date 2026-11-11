@@ -435,7 +435,7 @@ impl Contract {
         }
         if !dict::is_valid_contract_category(&self.contract_category_code) {
             return Err(DomainError::InvalidDict(format!(
-                "合同类别 {}（应为 GC/SB/CL/FW/JC）",
+                "合同类别 {}（应为 GC/SB/CL/FW/JC/SJ）",
                 self.contract_category_code
             )));
         }
@@ -491,13 +491,9 @@ impl Contract {
                 self.status.code().to_string(),
             ));
         }
-        // Unknown 只用于「读到一个不认识的旧码」，不能原样写回：
-        // DDL 的 CHECK 只收 OPEN / GOV_PROC / DIRECT，硬写会拿到一条 SQLite 约束错误。
-        if let Some(BidMethod::Unknown(raw)) = &self.bid_method {
-            return Err(DomainError::Invariant(format!(
-                "招标方式编码「{raw}」无法识别，不能写回数据库"
-            )));
-        }
+        // R-70：Unknown 不再在实体层拒绝写回。读路径保留原码供界面显示，
+        // 写库时由 `repo::legal_bid_code` 归一为 NULL，服务层把原码记进审计留痕；
+        // 这样含未知码的合同仍可编辑，也不会把非法码写进 CHECK 约束列。
         Ok(())
     }
 }
@@ -571,7 +567,7 @@ mod tests {
         }
     }
 
-    /// 保存前校验要覆盖开标日期，且 Unknown 招标方式不能原样写回（会被 CHECK 拒）。
+    /// 保存前校验要覆盖开标日期；未知招标码由写库层归一，实体层不阻断编辑（R-70）。
     #[test]
     fn 校验覆盖开标日期与未知招标方式() {
         let mut c = sample();
@@ -581,8 +577,8 @@ mod tests {
         c.open_bid_date = Some("2026-02-28".into());
         assert!(c.validate().is_ok());
         c.bid_method = Some(BidMethod::Unknown("LEGACY_X".into()));
-        let err = c.validate().unwrap_err();
-        assert!(err.to_string().contains("无法识别"), "{err}");
+        assert!(c.validate().is_ok(), "未知码由写库层归一，实体层不阻断编辑");
+        assert_eq!(c.bid_method.as_ref().unwrap().label(), "未知(LEGACY_X)");
     }
 
     #[test]

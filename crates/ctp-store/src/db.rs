@@ -71,7 +71,7 @@ pub fn compact(conn: &Connection) -> Result<()> {
 /// 与旧版 `migrate` 的区别：无版本守卫、无补列 / 删列、无枚举改写、无同名单位去重、
 /// 无序号校准、无旧日志搬迁；`sys_meta` 里也不再写 `schema_version` / `tol_bp`。
 pub fn init_schema(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (_, sql) in schema::table_statements() {
         tx.execute_batch(sql)?;
     }

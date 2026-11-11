@@ -2063,6 +2063,16 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         }
     }
 
+    // R-70：非法数字显式报错并停在表单，不再静默变成 0 落库。
+    if submit {
+        if let Some(msg) =
+            number_input_error(&app.new_contract.duration, &app.new_contract.retention)
+        {
+            app.new_contract_flash = Some(msg);
+            return;
+        }
+    }
+
     if submit {
         let f = &app.new_contract;
         let project_text = f.project_text.trim().to_string();
@@ -2098,15 +2108,22 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         let contact_info = opt(&f.contact_info);
         let bid_agent_text = opt(&f.bid_agent_text);
         let activate = f.activate;
-        let atts: Vec<(AttachmentKind, String, Option<String>, Vec<u8>)> = f
+        let atts: Vec<service::AttachmentInput> = f
             .attachments
             .iter()
-            .map(|a| (a.kind, a.file_name.clone(), a.mime.clone(), a.bytes.clone()))
+            .map(|a| service::AttachmentInput {
+                kind: a.kind,
+                file_name: a.file_name.clone(),
+                mime_type: a.mime.clone(),
+                content: a.bytes.clone(),
+            })
             .collect();
 
         let op = app.operator();
+        // R-70：建档 + 附件 + 生效收进同一个 IMMEDIATE 事务，任一步失败整体回滚，
+        // 不再出现「界面报保存失败、库里却留着合同和部分附件」的半截数据。
         let created = app.exec(move |conn| {
-            let c = service::create_contract(
+            service::create_contract_bundle(
                 conn,
                 NewContract {
                     project_id: String::new(),
@@ -2138,41 +2155,30 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                     contact_info,
                     bid_agent_text,
                 },
+                &atts,
+                activate,
                 op,
-            )?;
-            for (kind, fname, mime, bytes) in &atts {
-                service::save_attachment(conn, &c.id, *kind, fname, mime.as_deref(), bytes, op)?;
-            }
-            Ok(c)
+            )
         });
 
         match created {
             Ok(c) => {
                 let cid = c.id.clone();
                 let cno = c.contract_no.clone();
-                let act_err = if activate {
-                    app.exec(|conn| service::activate_contract(conn, &cid, op))
-                        .err()
-                } else {
-                    None
-                };
                 app.refresh();
                 app.select(&cid);
                 app.new_contract = ContractForm::default();
                 app.new_contract_flash = None;
                 app.dialog = Dialog::None;
-                match act_err {
-                    None if activate => {
-                        app.success(format!("合同 {cno} 已建立并生效，可直接登记拨款"))
-                    }
-                    None => app.success(format!(
+                if activate {
+                    app.success(format!("合同 {cno} 已建立并生效，可直接登记拨款"))
+                } else {
+                    app.success(format!(
                         "合同 {cno} 已保存为草稿，补齐合同附件后可在详情卡设为生效"
-                    )),
-                    Some(e) => app.error(format!(
-                        "合同 {cno} 已建立，但生效失败：{e}（当前为草稿，可在详情卡重试）"
-                    )),
+                    ))
                 }
             }
+            // 事务整体回滚后，不会再出现「合同已建立但生效失败」的半截状态
             Err(e) => app.error(format!("新建合同失败：{e}")),
         }
     }
@@ -2527,6 +2533,10 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                             form.orig_type.label(),
                             ctype.label()
                         ));
+                    } else if let Some(msg) =
+                        number_input_error(&form.duration, &form.retention)
+                    {
+                        form.error = Some(msg);
                     } else {
                         let cat_code = dict::CONTRACT_CATEGORIES
                             .get(form.category_idx)
@@ -4169,6 +4179,57 @@ fn pct_to_bp(s: &str) -> i32 {
     match t.parse::<f64>() {
         Ok(v) if v.is_finite() => Rate::from_bp((v * 100.0).round() as i32).bp(),
         _ => 0,
+    }
+}
+
+/// R-70：表单数字的前置校验，返回可读错误。
+///
+/// 原先「abc」/ 越界比例被 `unwrap_or(0)` / `pct_to_bp` 静默变成 0 落库，
+/// 用户看不到任何输入错误；现在在提交前拦下并显示提示，后面的兜底分支不可达。
+fn number_input_error(duration: &str, retention: &str) -> Option<String> {
+    let d = duration.trim();
+    if !d.is_empty() {
+        match d.parse::<i64>() {
+            Ok(v) if v >= 0 => {}
+            Ok(v) => return Some(format!("合同工期不能为负：{v}")),
+            Err(_) => return Some(format!("合同工期「{d}」不是整数，请修正后再保存")),
+        }
+    }
+    let r = retention.trim();
+    if !r.is_empty() {
+        match r.parse::<f64>() {
+            Ok(v) if v.is_finite() && (0.0..=100.0).contains(&v) => {}
+            Ok(v) if v.is_finite() => {
+                return Some(format!("质保金比例应在 0～100 之间，当前为 {r}"))
+            }
+            _ => return Some(format!("质保金比例「{r}」不是有效数字，请修正后再保存")),
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod r70_number_input_tests {
+    use super::number_input_error;
+
+    #[test]
+    fn 合法与留空都放行() {
+        assert!(number_input_error("", "").is_none());
+        assert!(number_input_error("365", "3.5").is_none());
+        assert!(number_input_error("0", "0").is_none());
+    }
+
+    #[test]
+    fn 非法数字被显式拦下() {
+        assert!(number_input_error("abc", "3").unwrap().contains("合同工期"));
+        assert!(number_input_error("-1", "3").unwrap().contains("不能为负"));
+        assert!(number_input_error("10", "x")
+            .unwrap()
+            .contains("质保金比例"));
+        assert!(number_input_error("10", "101").unwrap().contains("0～100"));
+        assert!(number_input_error("10", "NaN")
+            .unwrap()
+            .contains("质保金比例"));
     }
 }
 

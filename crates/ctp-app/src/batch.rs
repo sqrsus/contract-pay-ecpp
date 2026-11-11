@@ -469,13 +469,12 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
 
         // 同一行内容已入账则跳过，不重复拨款；改过任一格才算新数据。
         let import_key = row_fingerprint(row, line);
-        let taken: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pay_payment WHERE import_key = ?1",
-                [&import_key],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // R-70：查重失败必须显式报错，不能吞成「未入账」继续导入。
+        let taken: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pay_payment WHERE import_key = ?1",
+            [&import_key],
+            |r| r.get(0),
+        )?;
         if taken > 0 {
             report.duplicates += 1;
             continue;

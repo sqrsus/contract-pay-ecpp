@@ -147,6 +147,30 @@ impl Payment {
         if self.period_no < 0 {
             return Err(DomainError::Invariant("期数不能为负".into()));
         }
+        // R-70：可选文本按「NULL 或非空」口径兜底，避免空串 / 控制字符 / 超长文本落库。
+        // 写入入口已用 norm_text 归一，这里是所有写路径（含 update_payment）的最后一道闸。
+        for (label, v) in [
+            ("标题", self.title.as_deref()),
+            ("事由", self.reason.as_deref()),
+            ("银行流水号", self.bank_serial_no.as_deref()),
+            ("付款账户", self.pay_account.as_deref()),
+            ("收款账户", self.receive_account.as_deref()),
+            ("备注", self.remark.as_deref()),
+        ] {
+            if let Some(s) = v {
+                if s.trim().is_empty() {
+                    return Err(DomainError::Invariant(format!(
+                        "{label}为空字符串，应写 NULL"
+                    )));
+                }
+                if s.chars().count() > 200 {
+                    return Err(DomainError::Invariant(format!("{label}超过 200 字")));
+                }
+                if s.chars().any(char::is_control) {
+                    return Err(DomainError::Invariant(format!("{label}含控制字符")));
+                }
+            }
+        }
         Ok(())
     }
 

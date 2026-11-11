@@ -2204,3 +2204,347 @@ fn r69_附件名净化掉路径与保留字符() {
         "纯路径名应被拒绝"
     );
 }
+
+// ---------------------------------------------------------------- R-70 写入路径回归
+
+/// 组合写入的基线数据：空库 + 字典 + 一份项目 / 单位。
+fn r70_base() -> Connection {
+    let mut conn = db::open_in_memory().unwrap();
+    db::init_schema(&mut conn).unwrap();
+    ctp_store::seed::seed_reference(&conn, "t").unwrap();
+    project_and_org(&conn);
+    conn
+}
+
+fn r70_input(name: &str) -> NewContract {
+    NewContract {
+        project_id: "PJ-1".into(),
+        contract_name: name.into(),
+        contract_type: ctp_core::contract::ContractType::Service,
+        contract_category_code: "FW".into(),
+        category_id: Some("C04".into()),
+        party_a: "某建设单位".into(),
+        contractor_id: "ORG-1".into(),
+        sign_date: "2026-01-10".into(),
+        original_amount: Money::from_cent(10_000_000),
+        payment_terms: "按月计量".into(),
+        ..Default::default()
+    }
+}
+
+fn r70_rows(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// 「新建合同 + 附件 + 生效」任一步失败必须整体回滚：
+/// 合同、附件、自动建档、CREATE 日志都不留半截数据。
+#[test]
+fn r70_组合写入失败整体回滚() {
+    let mut conn = r70_base();
+    let atts = vec![
+        service::AttachmentInput {
+            kind: AttachmentKind::AuditReport,
+            file_name: "审计报告.pdf".into(),
+            mime_type: None,
+            content: b"ok".to_vec(),
+        },
+        // 第二个附件内容为空，必须在同一个事务里被挡下
+        service::AttachmentInput {
+            kind: AttachmentKind::AuditReport,
+            file_name: "空文件.pdf".into(),
+            mime_type: None,
+            content: Vec::new(),
+        },
+    ];
+    let err =
+        service::create_contract_bundle(&mut conn, r70_input("半截数据测试"), &atts, false, "t");
+    assert!(err.is_err(), "空附件必须让整次写入失败");
+    assert_eq!(
+        r70_rows(&conn, "SELECT COUNT(*) FROM ct_contract"),
+        0,
+        "合同必须回滚"
+    );
+    assert_eq!(
+        r70_rows(&conn, "SELECT COUNT(*) FROM ct_contract_attachment"),
+        0,
+        "第一个附件也必须回滚"
+    );
+    assert_eq!(
+        r70_rows(&conn, "SELECT COUNT(*) FROM sys_audit_log"),
+        0,
+        "CREATE 日志必须回滚"
+    );
+    assert_eq!(
+        r70_rows(&conn, "SELECT COUNT(*) FROM prj_project"),
+        1,
+        "不应多建项目档案"
+    );
+
+    // 勾选立即生效但缺合同正本：同样整体回滚，不再留下「已建但生效失败」的合同
+    let only_audit = vec![service::AttachmentInput {
+        kind: AttachmentKind::AuditReport,
+        file_name: "审计报告.pdf".into(),
+        mime_type: None,
+        content: b"ok".to_vec(),
+    }];
+    assert!(service::create_contract_bundle(
+        &mut conn,
+        r70_input("缺正本测试"),
+        &only_audit,
+        true,
+        "t",
+    )
+    .is_err());
+    assert_eq!(r70_rows(&conn, "SELECT COUNT(*) FROM ct_contract"), 0);
+    assert_eq!(
+        r70_rows(&conn, "SELECT COUNT(*) FROM ct_contract_attachment"),
+        0
+    );
+}
+
+/// 成功路径与原先逐条提交等价：合同生效、两份附件在位、留痕齐全；
+/// 组合路径同样执行附件名净化（R-69 口径不能在这里漏掉）。
+#[test]
+fn r70_组合写入成功与逐条提交等价() {
+    let mut conn = r70_base();
+    let atts = vec![
+        service::AttachmentInput {
+            kind: AttachmentKind::Contract,
+            file_name: r"..\..\Windows\合同正本.pdf".into(),
+            mime_type: Some("application/pdf".into()),
+            content: b"%PDF-1.4 test".to_vec(),
+        },
+        service::AttachmentInput {
+            kind: AttachmentKind::AuditReport,
+            file_name: "审计报告.pdf".into(),
+            mime_type: None,
+            content: b"audit".to_vec(),
+        },
+    ];
+    let c = service::create_contract_bundle(&mut conn, r70_input("组合写入"), &atts, true, "t")
+        .unwrap();
+    assert_eq!(
+        repo::get_contract(&conn, &c.id).unwrap().status,
+        ContractStatus::Active
+    );
+    let list = repo::list_attachments(&conn, &c.id).unwrap();
+    assert_eq!(list.len(), 2);
+    assert!(
+        list.iter()
+            .all(|a| !a.file_name.contains('/') && !a.file_name.contains('\\')),
+        "组合写入也必须净化附件名"
+    );
+    // 甲方名称首次出现会自动建档，也写一条 CREATE；按对象类型区分才精确
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='CREATE' AND target_type='ct_contract'"
+        ),
+        1
+    );
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='UPSERT'"
+        ),
+        2
+    );
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='ACTIVATE'"
+        ),
+        1
+    );
+}
+
+/// 导出是「只读查看 + 系统留痕」：只允许写 sys_audit_log，业务表一行都不能改。
+#[test]
+fn r70_导出只写审计日志不改业务表() {
+    let (mut conn, cid) = fixture(1_000_000);
+    pay(&mut conn, &cid, 100_000).unwrap();
+    let before = {
+        let n = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        (
+            n("ct_contract"),
+            n("pay_payment"),
+            n("ct_contract_attachment"),
+        )
+    };
+    let path = tmp_xlsx("r70_export_only_log");
+    service::export_report(
+        &conn,
+        ctp_app::report::ReportKind::PeriodSummary,
+        &path,
+        "t",
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let after = {
+        let n = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        (
+            n("ct_contract"),
+            n("pay_payment"),
+            n("ct_contract_attachment"),
+        )
+    };
+    assert_eq!(before, after, "导出不得改动任何业务表");
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='EXPORT'"
+        ),
+        1,
+        "导出仍须留痕"
+    );
+}
+
+/// 首笔拨款的状态迁移与作废回退各有独立动作码，不再把「回退」显示成「生效」。
+#[test]
+fn r70_首笔拨款与作废回退各有独立动作码() {
+    let (mut conn, cid) = fixture(1_000_000);
+    let p = pay(&mut conn, &cid, 100_000).unwrap();
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='PERFORMING'"
+        ),
+        1,
+        "首笔拨款应留一条状态迁移日志"
+    );
+    service::void_payment(&mut conn, &p.id, "填错", "t").unwrap();
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='REVERT_ACTIVE'"
+        ),
+        1,
+        "回退应留一条独立日志"
+    );
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='ACTIVATE'"
+        ),
+        1,
+        "回退不应复用 ACTIVATE（fixture 里只有初次生效那一条）"
+    );
+}
+
+/// 库里出现无法识别的招标方式码时：仍可编辑、非法码不写回 CHECK 列、原码留在留痕里。
+#[test]
+fn r70_未知招标方式码可编辑且归一为null() {
+    let (mut conn, cid) = fixture(1_000_000);
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
+    conn.execute(
+        "UPDATE ct_contract SET bid_method = 'LEGACY_X' WHERE id = ?1",
+        [&cid],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+        .unwrap();
+
+    let c = repo::get_contract(&conn, &cid).unwrap();
+    assert!(matches!(
+        c.bid_method,
+        Some(ctp_core::contract::BidMethod::Unknown(_))
+    ));
+    assert!(c.validate().is_ok(), "实体层不再阻断编辑");
+
+    let mut input = edit_like(&c, "测试项目");
+    input.remark = Some("R-70 回归".into());
+    let out = service::update_contract_master(&mut conn, &cid, input, "回归", "t");
+    assert!(out.is_ok(), "含未知码的合同应能保存：{:?}", out.err());
+
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT bid_method FROM ct_contract WHERE id = ?1",
+            [&cid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(raw.is_none(), "未知码不得写回 CHECK 约束列");
+    let detail: String = conn
+        .query_row(
+            "SELECT COALESCE(detail,'') FROM sys_audit_log WHERE action='EDIT_CONTRACT' \
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        detail.contains("LEGACY_X"),
+        "原码应留在审计留痕里：{detail}"
+    );
+}
+
+/// 空串归一为 NULL；关联档案 id 不存在时给可读业务错误而不是外键约束异常。
+#[test]
+fn r70_空串归一为null且不存在关联档案被拒() {
+    let mut conn = r70_base();
+    let bad = NewContract {
+        project_id: "PJ-NOT-EXIST".into(),
+        ..r70_input("不存在的项目")
+    };
+    let err = service::create_contract(&mut conn, bad, "t").unwrap_err();
+    assert!(
+        err.to_string().contains("所属项目"),
+        "应给出业务错误：{err}"
+    );
+
+    let c = service::create_contract(
+        &mut conn,
+        NewContract {
+            remark: Some("   ".into()),
+            planned_start: Some("".into()),
+            project_leader: Some("  ".into()),
+            ..r70_input("空串归一")
+        },
+        "t",
+    )
+    .unwrap();
+    let got = repo::get_contract(&conn, &c.id).unwrap();
+    assert!(got.remark.is_none(), "空白备注应写 NULL");
+    assert!(got.planned_start.is_none(), "空串日期应写 NULL");
+    assert!(got.project_leader.is_none(), "空白负责人应写 NULL");
+}
+
+/// 操作日志只保留一次性清空入口：保底 200 条 + 一条 CLEAR 留痕。
+#[test]
+fn r70_清空日志保底留痕() {
+    let mut conn = db::open_in_memory().unwrap();
+    db::init_schema(&mut conn).unwrap();
+    for _ in 0..205 {
+        db::insert_audit_log(
+            &conn,
+            "ct_contract",
+            "CT-1",
+            Some("合同"),
+            "CREATE",
+            Some("明细"),
+            "t",
+        )
+        .unwrap();
+    }
+    let n = ctp_app::logs::clear(&mut conn, "t").unwrap();
+    assert_eq!(n, 5, "205 条只删最旧 5 条");
+    assert_eq!(
+        ctp_app::logs::total(&conn).unwrap(),
+        201,
+        "200 条 + 1 条留痕"
+    );
+    assert_eq!(
+        r70_rows(
+            &conn,
+            "SELECT COUNT(*) FROM sys_audit_log WHERE action='CLEAR'"
+        ),
+        1
+    );
+}

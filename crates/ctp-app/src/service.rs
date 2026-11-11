@@ -396,6 +396,77 @@ fn resolve_owner(conn: &Connection, name: &str, operator: &str) -> Result<String
 
 // ---------------------------------------------------------------- 合同
 
+/// 「新建合同 + 若干附件 + 可选立即生效」组合写入的附件入参（R-70）。
+#[derive(Debug, Clone)]
+pub struct AttachmentInput {
+    pub kind: AttachmentKind,
+    pub file_name: String,
+    pub mime_type: Option<String>,
+    pub content: Vec<u8>,
+}
+
+/// 关联档案存在性校验：只用内部白名单表名拼 SQL，避免动态表名注入。
+///
+/// 原先 `project_id` 直传、`building_id` / `bid_agent_id` 都不校验，
+/// 要等 SQLite 抛外键约束；这里提前给出可读的业务错误。
+fn require_ref(conn: &Connection, table: &str, id: &str, label: &str) -> Result<()> {
+    let sql = match table {
+        "prj_project" => "SELECT COUNT(*) FROM prj_project WHERE id = ?1",
+        "org_contractor" => "SELECT COUNT(*) FROM org_contractor WHERE id = ?1",
+        "prj_building" => "SELECT COUNT(*) FROM prj_building WHERE id = ?1",
+        _ => return Ok(()),
+    };
+    let n: i64 = conn.query_row(sql, [id], |r| r.get(0))?;
+    if n == 0 {
+        return Err(StoreError::Inconsistent(format!(
+            "{label}「{id}」在档案里不存在，请重新选择"
+        )));
+    }
+    Ok(())
+}
+
+/// 「新建合同 + 若干附件 + 可选立即生效」在**同一个 IMMEDIATE 事务**里完成。
+///
+/// R-70（P1）：此前 GUI 在一个写门面闭包里依次调用三个各自开事务并提交的服务，
+/// 第 2 个附件失败时合同、自动建档的项目/单位、第 1 个附件与 CREATE 日志都已落库，
+/// 界面却报「新建合同失败」，留下无法回滚的半截数据。合并后任何一步失败整体回滚；
+/// 成功路径产生的数据与原先逐条提交完全一致。
+pub fn create_contract_bundle(
+    conn: &mut Connection,
+    input: NewContract,
+    attachments: &[AttachmentInput],
+    activate: bool,
+    operator: &str,
+) -> Result<Contract> {
+    validate_iso_date(&input.sign_date)?;
+    if input.payment_terms.trim().is_empty() {
+        return Err(DomainError::MissingField("付款条款").into());
+    }
+    if input.contract_category_code.trim().is_empty() {
+        return Err(DomainError::MissingField("合同类别").into());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let c = create_contract_in_tx(&tx, input, operator)?;
+    for a in attachments {
+        // 与单条上传同一套文件名净化口径（R-69），避免路径 / 保留字符落库
+        let safe_name = sanitize_file_name(&a.file_name);
+        let _ = save_attachment_in_tx(
+            &tx,
+            &c.id,
+            a.kind,
+            &safe_name,
+            a.mime_type.as_deref(),
+            &a.content,
+            operator,
+        )?;
+    }
+    if activate {
+        activate_in_tx(&tx, &c.id, operator)?;
+    }
+    tx.commit()?;
+    Ok(c)
+}
+
 pub fn create_contract(
     conn: &mut Connection,
     input: NewContract,
@@ -410,28 +481,35 @@ pub fn create_contract(
     }
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let c = create_contract_in_tx(&tx, input, operator)?;
+    tx.commit()?;
+    Ok(c)
+}
+
+/// 事务内的合同建档主体；单建与「合同 + 附件 + 生效」组合共用同一段实现。
+fn create_contract_in_tx(tx: &Connection, input: NewContract, operator: &str) -> Result<Contract> {
     let now = now_iso();
 
     // 三个输入框的文本 → 具体档案；找不到就自动建档（甲方记为业主角色）
     let project_id = resolve_project(
-        &tx,
+        tx,
         &input.project_id,
         input.project_text.as_deref(),
         operator,
     )?;
     let contractor_id = resolve_contractor(
-        &tx,
+        tx,
         &input.contractor_id,
         input.contractor_text.as_deref(),
         input.contract_type,
         operator,
     )?;
-    let party_a = resolve_owner(&tx, &input.party_a, operator)?;
+    let party_a = resolve_owner(tx, &input.party_a, operator)?;
 
     // 招标代理：与承包单位同路径，但以 AGENT 角色建档，避免混入承包单位联想列表
     let bid_agent_id = match input.bid_agent_text.as_deref().map(|s| s.trim()) {
         Some(name) if !name.is_empty() => Some(ensure_contractor(
-            &tx,
+            tx,
             name,
             ContractorRole::Agent,
             operator,
@@ -460,9 +538,9 @@ pub fn create_contract(
     let (seq, contract_no) = {
         let mut got = None;
         for _ in 0..5 {
-            let s = db::next_sequence(&tx, &format!("contract_no:{year}"))?;
+            let s = db::next_sequence(tx, &format!("contract_no:{year}"))?;
             let no = ids::contract_no(&year, s);
-            if repo::find_contract_by_no(&tx, &no)?.is_none() {
+            if repo::find_contract_by_no(tx, &no)?.is_none() {
                 got = Some((s, no));
                 break;
             }
@@ -474,12 +552,24 @@ pub fn create_contract(
         })?
     };
     if let Some(cat) = &input.category_id {
-        if !repo::category_exists(&tx, cat)? {
+        if !repo::category_exists(tx, cat)? {
             return Err(StoreError::DictMissing(format!("会计分类 {cat}")));
         }
     }
 
-    let delivery_date = input.delivery_date.filter(|d| !d.trim().is_empty());
+    // R-70：关联档案显式校验，避免「id 直传一个不存在的档案」落到外键约束报错
+    require_ref(tx, "prj_project", &project_id, "所属项目")?;
+    require_ref(tx, "org_contractor", &contractor_id, "承包单位")?;
+    if let Some(id) = bid_agent_id.as_deref() {
+        require_ref(tx, "org_contractor", id, "招标代理")?;
+    }
+    if let Some(id) = input.building_id.as_deref() {
+        require_ref(tx, "prj_building", id, "建筑物")?;
+    }
+
+    // R-70：可选文本统一按「去空白，全空写 NULL」归一，
+    // 不再把 Some("") 这类空串落进 Option<String> 列。
+    let delivery_date = norm_text(input.delivery_date);
     let c = Contract {
         id: ids::new_id("CT"),
         project_id,
@@ -499,8 +589,8 @@ pub fn create_contract(
         audit_org: None,
         audit_report_no: None,
         duration_days: input.duration_days,
-        planned_start: input.planned_start,
-        planned_end: input.planned_end,
+        planned_start: norm_text(input.planned_start),
+        planned_end: norm_text(input.planned_end),
         actual_start: None,
         actual_end: None,
         delivery_date,
@@ -509,7 +599,7 @@ pub fn create_contract(
         advance_rate_bp: input.advance_rate_bp,
         status: ContractStatus::Draft,
         payment_terms: input.payment_terms,
-        remark: input.remark,
+        remark: norm_text(input.remark),
         is_deleted: false,
         version: 1,
         created_at: now.clone(),
@@ -518,14 +608,14 @@ pub fn create_contract(
         updated_by: Some(operator.to_string()),
         bid_method: input.bid_method,
         open_bid_date,
-        project_leader: input.project_leader,
-        contact_info: input.contact_info,
+        project_leader: norm_text(input.project_leader),
+        contact_info: norm_text(input.contact_info),
         bid_agent_id,
     };
     c.validate()?;
-    repo::insert_contract(&tx, &c)?;
+    repo::insert_contract(tx, &c)?;
     db::insert_audit_log(
-        &tx,
+        tx,
         "ct_contract",
         &c.id,
         Some(&format!("{} {}", c.contract_no, c.contract_name)),
@@ -533,7 +623,6 @@ pub fn create_contract(
         Some(&format!("{} {}", c.contract_no, c.contract_name)),
         operator,
     )?;
-    tx.commit()?;
     Ok(c)
 }
 
@@ -791,6 +880,13 @@ pub fn update_contract_master(
     c.retention_rate_bp = input.retention_rate_bp;
     c.payment_terms = input.payment_terms;
     c.remark = input.remark;
+    // R-70：库里若含无法识别的招标方式原码，读路径会原样带回 Unknown；
+    // 写库时由 `repo::legal_bid_code` 归一为 NULL，把原码记进留痕以便追溯，
+    // 合同因此仍可编辑，且不会把非法码写进 CHECK 约束列。
+    let unknown_bid: Option<String> = match &input.bid_method {
+        Some(BidMethod::Unknown(raw)) => Some(raw.clone()),
+        _ => None,
+    };
     c.bid_method = input.bid_method;
     c.open_bid_date = input.open_bid_date;
     c.project_leader = input.project_leader;
@@ -806,13 +902,16 @@ pub fn update_contract_master(
     c.version += 1;
 
     let detail = format!(
-        "{}｜{}",
+        "{}｜{}{}",
         reason,
         changes
             .iter()
             .map(FieldChange::audit_text)
             .collect::<Vec<_>>()
-            .join("；")
+            .join("；"),
+        unknown_bid
+            .map(|raw| format!("；招标方式原码「{raw}」无法识别，已置空，请重新选择"))
+            .unwrap_or_default()
     );
     db::insert_audit_log(
         &tx,
@@ -867,16 +966,23 @@ pub fn activate_contract(
     operator: &str,
 ) -> Result<Contract> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut c = repo::get_contract(&tx, contract_id)?;
-    if !repo::has_attachment(&tx, &c.id, AttachmentKind::Contract.code())? {
+    let c = activate_in_tx(&tx, contract_id, operator)?;
+    tx.commit()?;
+    Ok(c)
+}
+
+/// 事务内的合同生效主体（R-70：组合写入复用）。
+fn activate_in_tx(tx: &Connection, contract_id: &str, operator: &str) -> Result<Contract> {
+    let mut c = repo::get_contract(tx, contract_id)?;
+    if !repo::has_attachment(tx, &c.id, AttachmentKind::Contract.code())? {
         return Err(DomainError::AttachmentRequired(AttachmentKind::Contract.label()).into());
     }
     c.transit(ContractStatus::Active)?;
     c.updated_at = now_iso();
     c.updated_by = Some(operator.to_string());
-    repo::update_contract(&tx, &c)?;
+    repo::update_contract(tx, &c)?;
     db::insert_audit_log(
-        &tx,
+        tx,
         "ct_contract",
         &c.id,
         Some(&format!("{} {}", c.contract_no, c.contract_name)),
@@ -884,7 +990,6 @@ pub fn activate_contract(
         None,
         operator,
     )?;
-    tx.commit()?;
     Ok(c)
 }
 
@@ -948,10 +1053,54 @@ pub fn save_attachment(
         return Err(DomainError::MissingField("附件文件名").into());
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (saved, old_size) =
+        save_attachment_in_tx(&tx, contract_id, kind, &name, mime_type, content, operator)?;
+    tx.commit()?;
+    // R-67：只有「换成更小的文件」才压缩。SQLite 只把旧 BLOB 占的页挂回 freelist，
+    // 文件高水位不回落（10 MB 换成 1 MB，库仍是 10 MB）；变大时压缩纯属白等一次全库重写。
+    // 压缩失败不影响「附件已保存」这个结果，下次替换 / 删除会再试。
+    if old_size > content.len() as i64 {
+        let _ = db::compact(conn);
+    }
+    Ok(saved)
+}
+
+/// 事务内的附件 upsert 主体（R-70：组合写入复用）。
+///
+/// 返回（落库记录，被覆盖旧文件的大小）；VACUUM 只能在事务外做，故由调用方决定。
+fn save_attachment_in_tx(
+    tx: &Connection,
+    contract_id: &str,
+    kind: AttachmentKind,
+    name: &str,
+    mime_type: Option<&str>,
+    content: &[u8],
+    operator: &str,
+) -> Result<(Attachment, i64)> {
+    // R-70：组合写入也走这条路径，空文件 / 超限 / 空文件名必须在这里挡住，
+    // 不能只依赖单条上传入口的校验，否则会写进脏数据。
+    if content.is_empty() {
+        return Err(StoreError::Inconsistent(format!(
+            "「{}」文件内容为空",
+            kind.label()
+        )));
+    }
+    let max = ctp_core::attachment::MAX_ATTACHMENT_BYTES;
+    if content.len() as i64 > max {
+        return Err(StoreError::Inconsistent(format!(
+            "「{}」{:.1} MB，超过 {} MB 上限",
+            kind.label(),
+            content.len() as f64 / (1024.0 * 1024.0),
+            max / 1024 / 1024
+        )));
+    }
+    if name.trim().is_empty() {
+        return Err(DomainError::MissingField("附件文件名").into());
+    }
 
     // 同类是「覆盖」，先扣掉旧行的体积再算总量，否则反复替换同一类附件会被误判为超限
     let kind_code = kind.code();
-    let existing = repo::list_attachments(&tx, contract_id)?;
+    let existing = repo::list_attachments(tx, contract_id)?;
     // R-67：记下被覆盖那一份的大小，提交后据此判断值不值得压缩
     let old_size = existing
         .iter()
@@ -987,30 +1136,23 @@ pub fn save_attachment(
         updated_by: Some(operator.to_string()),
         version: 1,
     };
-    repo::upsert_attachment(&tx, &a, content)?;
+    repo::upsert_attachment(tx, &a, content)?;
     // 覆盖已有行时主键仍是旧 id（ON CONFLICT DO UPDATE 不换主键），
     // 先回读拿真实记录再写日志，否则日志会指向一条不存在的新 id（R-68 幽灵日志）。
-    let saved = repo::list_attachments(&tx, contract_id)?
+    let saved = repo::list_attachments(tx, contract_id)?
         .into_iter()
         .find(|x| x.kind_code == kind_code);
     let logged = saved.as_ref().unwrap_or(&a);
     db::insert_audit_log(
-        &tx,
+        tx,
         "ct_contract_attachment",
         &logged.id,
-        Some(name.as_str()),
+        Some(name),
         "UPSERT",
         Some(&format!("{} · {}", kind.label(), name)),
         operator,
     )?;
-    tx.commit()?;
-    // R-67：只有「换成更小的文件」才压缩。SQLite 只把旧 BLOB 占的页挂回 freelist，
-    // 文件高水位不回落（10 MB 换成 1 MB，库仍是 10 MB）；变大时压缩纯属白等一次全库重写。
-    // 压缩失败不影响「附件已保存」这个结果，下次替换 / 删除会再试。
-    if old_size > content.len() as i64 {
-        let _ = db::compact(conn);
-    }
-    Ok(saved.unwrap_or(a))
+    Ok((saved.unwrap_or(a), old_size))
 }
 
 pub fn list_attachments(conn: &Connection, contract_id: &str) -> Result<Vec<Attachment>> {
@@ -1400,21 +1542,21 @@ pub fn register_payment(
     let p = Payment {
         id: ids::new_id("PM"),
         payment_no,
-        title: input.title,
+        title: norm_text(input.title),
         sort_no: seq,
         period_no: seq,
         contract_id: c.id.clone(),
         project_id: c.project_id.clone(),
         pay_date: input.pay_date,
         amount_cent: input.amount,
-        reason: input.reason,
+        reason: norm_text(input.reason),
         pay_method: input.pay_method,
-        bank_serial_no: input.bank_serial_no,
-        pay_account: input.pay_account,
-        receive_account: input.receive_account,
+        bank_serial_no: norm_text(input.bank_serial_no),
+        pay_account: norm_text(input.pay_account),
+        receive_account: norm_text(input.receive_account),
         status: PaymentStatus::Paid,
         operator_id: operator.to_string(),
-        remark: input.remark,
+        remark: norm_text(input.remark),
         is_deleted: false,
         version: 1,
         created_at: now.clone(),
@@ -1439,6 +1581,19 @@ pub fn register_payment(
         c.updated_at = p.created_at.clone();
         c.updated_by = Some(operator.to_string());
         repo::update_contract(&tx, &c)?;
+        // R-70：首笔拨款触发的状态迁移也单独留痕，与作废回退对称。
+        db::insert_audit_log(
+            &tx,
+            "ct_contract",
+            &c.id,
+            Some(&format!("{} {}", c.contract_no, c.contract_name)),
+            "PERFORMING",
+            Some(&format!(
+                "登记首笔拨款 {}，合同状态由「生效」转为「履行中」",
+                p.payment_no
+            )),
+            operator,
+        )?;
     }
 
     db::insert_audit_log(
@@ -1501,7 +1656,7 @@ pub fn void_payment(
             "ct_contract",
             &c.id,
             Some(&format!("{} {}", c.contract_no, c.contract_name)),
-            "ACTIVATE",
+            "REVERT_ACTIVE",
             Some(&format!(
                 "作废最后一笔已付 {}，合同回退「生效」：{reason}",
                 p.payment_no
@@ -1667,6 +1822,8 @@ pub fn default_summary_range() -> (String, String) {
 /// 导出一张报表到 .xlsx，并写一条 `EXPORT` 审计日志（FR-SYS-07）。
 ///
 /// 只用 `&Connection`：导出不改业务数据，审计日志是普通 INSERT，不需要 `BEGIN IMMEDIATE`。
+/// R-70：本模块是 GUI「只读查看 + 系统留痕」门面唯一允许调用的服务，
+/// 只允许写 `sys_audit_log`，不得在此写入任何业务表。
 pub fn export_report(
     conn: &Connection,
     kind: crate::report::ReportKind,

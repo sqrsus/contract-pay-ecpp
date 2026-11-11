@@ -3,7 +3,8 @@
 //! 数据口径（R-31）：
 //! * 列表 / 计数走 `ctp_app::logs`，与库里的 `sys_audit_log` 同源；
 //! * 时间显示的是**本地时间**（存储为 UTC，查询层换算）；
-//! * 清理必须二次确认，清完留一条 `CLEAR` 记录写明范围与条数。
+//! * R-70：只保留一次性清空，二次确认 + 确认词 + 保底 200 条 + 清完留痕；
+//!   日期区间只用于列表筛选，不再作为清理范围。
 
 use crate::screens::page_header;
 use crate::widgets;
@@ -59,7 +60,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // ---------------- 筛选行
-    let mut clear_range = false;
     let mut clear_all = false;
     ui.horizontal(|ui| {
         widgets::field_label(ui, &p, "日期");
@@ -97,16 +97,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let range_ok = !app.log_from.trim().is_empty() || !app.log_to.trim().is_empty();
-            if widgets::danger_solid_button(ui, &p, "全部清理", true).clicked() {
+            // R-70：只保留一次性清空入口；按时间段清理按钮已移除。
+            if widgets::danger_solid_button(ui, &p, "清理日志", true).clicked() {
                 clear_all = true;
-            }
-            if widgets::ghost_button(ui, &p, "按时间段清理")
-                .on_hover_text("删除起止日期闭区间内的全部日志（不看类型与关键词）")
-                .clicked()
-                && range_ok
-            {
-                clear_range = true;
             }
         });
     });
@@ -226,14 +219,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // ---------------- 清理确认弹窗（二次确认；清完由服务层留 CLEAR 记录）
-    if let Some((filter, desc)) = app.log_clear.clone() {
+    if let Some(desc) = app.log_clear.clone() {
         let mut cancel = false;
         let mut submit = false;
-        let n = app.read(|c| logs::count(c, &filter)).unwrap_or(0);
-        // R-68（C14）：「全部清理」双保险——须输入确认词「清空」；且服务层
+        let n = app.read(logs::total).unwrap_or(0);
+        // R-68（C14）：一次性清空双保险——须输入确认词「清空」；且服务层
         // 会保底保留最近 200 条，这里提前告知用户。
-        let is_clear_all = filter.is_empty();
-        let word_ok = !is_clear_all || app.log_clear_word.trim() == "清空";
+        let word_ok = app.log_clear_word.trim() == "清空";
         egui::Window::new("确认清理日志")
             .collapsible(false)
             .resizable(false)
@@ -256,37 +248,30 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!(
-                        "将删除 {n} 条日志，删除后不可恢复。{}",
-                        if is_clear_all {
-                            "系统会保底保留最近 200 条及本条清理留痕。"
-                        } else {
-                            ""
-                        }
+                        "将删除 {n} 条日志，删除后不可恢复。系统会保底保留最近 200 条及本条清理留痕。"
                     ))
                     .size(12.5)
                     .color(if n > 0 { p.danger } else { p.text_muted }),
                 );
-                if is_clear_all {
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "「全部清理」影响面大，请输入「清空」二字确认（已输入：{}）",
-                            if app.log_clear_word.trim().is_empty() {
-                                "—"
-                            } else {
-                                app.log_clear_word.trim()
-                            }
-                        ))
-                        .size(11.5)
-                        .color(p.text_muted),
-                    );
-                    ui.add_sized(
-                        [ui.available_width(), 26.0],
-                        egui::TextEdit::singleline(&mut app.log_clear_word)
-                            .hint_text("输入：清空")
-                            .margin(egui::Margin::symmetric(8.0, 4.0)),
-                    );
-                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "「清理日志」影响面大，请输入「清空」二字确认（已输入：{}）",
+                        if app.log_clear_word.trim().is_empty() {
+                            "—"
+                        } else {
+                            app.log_clear_word.trim()
+                        }
+                    ))
+                    .size(11.5)
+                    .color(p.text_muted),
+                );
+                ui.add_sized(
+                    [ui.available_width(), 26.0],
+                    egui::TextEdit::singleline(&mut app.log_clear_word)
+                        .hint_text("输入：清空")
+                        .margin(egui::Margin::symmetric(8.0, 4.0)),
+                );
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("清理完成后会自动留一条「清理日志」记录，写明范围与条数。")
@@ -314,7 +299,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             app.log_clear = None;
             app.log_clear_word.clear();
             let op = app.operator();
-            match app.exec(move |c| logs::clear(c, &filter, op)) {
+            match app.exec(move |c| logs::clear(c, op)) {
                 Ok(n) => {
                     app.log_key = None;
                     app.success(format!("已清理 {n} 条日志（已留痕）"));
@@ -324,23 +309,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
-    // ---------------- 清理入口动作
-    if clear_range {
-        let f = LogFilter {
-            from: app.log_from.trim().to_string(),
-            to: app.log_to.trim().to_string(),
-            action: None,
-            keyword: String::new(),
-        };
-        let desc = logs::describe(&f);
-        app.log_clear = Some((f, desc));
-    }
+    // ---------------- 清理入口动作（R-70：只有一次性清空）
     if clear_all {
-        app.log_clear = Some((LogFilter::default(), "全部清理".to_string()));
+        app.log_clear = Some("确认清理日志".to_string());
     }
 }
 
-/// 看列表用的筛选（类型 + 关键词 + 日期）；清理用的时间段筛选单独构造。
+/// 列表筛选（类型 + 关键词 + 日期区间）；R-70 起与清理完全解耦。
 fn view_filter(app: &App) -> LogFilter {
     LogFilter {
         from: app.log_from.trim().to_string(),

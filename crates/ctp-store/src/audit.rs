@@ -30,7 +30,9 @@ pub struct AuditLogRow {
     pub created_local: String,
 }
 
-/// 日志筛选条件。`from` / `to` 是**本地日期**闭区间，空串表示不限。
+/// 日志**列表筛选**条件。`from` / `to` 是本地日期闭区间，空串表示不限。
+///
+/// R-70 起仅用于查询与显示，不再作为清理范围参数。
 #[derive(Debug, Clone, Default)]
 pub struct LogFilter {
     pub from: String,
@@ -45,7 +47,7 @@ impl LogFilter {
     /// 四个条件写成「参数为空即放行」，避免动态拼 SQL 带来的参数错位。
     ///
     /// 关键词按**字面子串**匹配：`ESCAPE '\'` + `db::like_escape` 把 `%` / `_` /
-    /// `\` 转义掉。否则输入一个 `%` 就命中全表，「按条件清理」会退化成「全部清理」。
+    /// `\` 转义掉。否则输入一个 `%` 就命中全表，筛选结果会失真。
     fn where_clause() -> &'static str {
         "WHERE (?1 = '' OR date(created_at, '+8 hours') >= ?1) \
            AND (?2 = '' OR date(created_at, '+8 hours') <= ?2) \
@@ -62,19 +64,6 @@ impl LogFilter {
             self.action.clone().unwrap_or_default(),
             crate::db::like_escape(self.keyword.trim()),
         ]
-    }
-
-    /// 四个条件全空 = 「全部清理」（R-68 / C14：只有这种情况受保底条数约束）。
-    pub fn is_empty(&self) -> bool {
-        self.from.trim().is_empty()
-            && self.to.trim().is_empty()
-            && self
-                .action
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-            && self.keyword.trim().is_empty()
     }
 }
 
@@ -141,54 +130,24 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
     Ok(rows)
 }
 
-/// 「全部清理」至少保留的最近条数（R-68 / C14-A）。
+/// 一次性清空日志时至少保留的最近条数（R-68 / C14-A）。
 ///
-/// 全删不可恢复，误触一次就把审计链清零；按条件清理不受此限
-/// （用户明确指定了范围），只有「全部清理」兜住最近这么多条。
+/// 全删不可恢复，误触一次就把审计链清零；清空后留下最新的 N 条，
+/// 并额外写一条 `CLEAR` 留痕（见 `ctp_app::logs::clear`）。
 pub const AUDIT_KEEP_MIN: usize = 200;
 
-/// 是否触发「最近 N 条」保底。
+/// 一次性清空日志：删除除最近 [`AUDIT_KEEP_MIN`] 条以外的全部记录，返回删除条数。
 ///
-/// 早期只按「四个条件全空」判定，于是填一个能匹配全表的关键词（字面 `%` 已转义，
-/// 但仍可填表内共有的文字）、或把时间区间拉满，就能绕过保底把日志清空。
-/// 改为按**删完后还剩多少**判定：任何形式的「实质全清」都要兜住；
-/// 小范围按条件清理（删完仍 ≥ 200 条）不受影响。
-pub fn needs_floor(conn: &Connection, f: &LogFilter, explicit_all: bool) -> Result<bool> {
-    // 「全部清理」无条件保底，哪怕库里刚好只剩 200 条（此时删除数应为 0）。
-    if explicit_all {
-        return Ok(true);
-    }
-    let all = total(conn)?;
-    // 全表还不到 200 条时，「保留最近 200 条」等同于一条都不许删，
-    // 会让小库上的按条件清理彻底失效；此时按用户给定的范围如实删除。
-    if all <= AUDIT_KEEP_MIN as i64 {
-        return Ok(false);
-    }
-    let matched = count(conn, f)?;
-    Ok(all.saturating_sub(matched) < AUDIT_KEEP_MIN as i64)
-}
-
-/// 删除符合条件的日志，返回删除条数。
-///
-/// 按日志 id 序保留最近 [`AUDIT_KEEP_MIN`] 条不删——id 形如 LOG-{毫秒}-{序号}，
-/// 固定宽度使字典序即时间序，与 `db::insert_audit_log` 的裁剪口径一致。
-pub fn clear(conn: &Connection, f: &LogFilter, keep_recent_min: bool) -> Result<usize> {
-    let p = f.params();
-    let protect = needs_floor(conn, f, keep_recent_min)?;
-    let n = if protect {
-        let sql = format!(
-            "DELETE FROM sys_audit_log {} \
-             AND id NOT IN (SELECT id FROM sys_audit_log ORDER BY id DESC LIMIT ?5)",
-            LogFilter::where_clause()
-        );
-        conn.execute(
-            &sql,
-            rusqlite::params![p[0], p[1], p[2], p[3], AUDIT_KEEP_MIN as i64],
-        )?
-    } else {
-        let sql = format!("DELETE FROM sys_audit_log {}", LogFilter::where_clause());
-        conn.execute(&sql, rusqlite::params![p[0], p[1], p[2], p[3]])?
-    };
+/// 按日志 id 序保留最近 N 条——id 形如 LOG-{毫秒}-{序号}，固定宽度使字典序即时间序，
+/// 与 `db::insert_audit_log` 的裁剪口径一致。
+/// R-70 起不再提供「按时间段 / 按条件」清理入口，删除只走这一条路径；
+/// 因为只有全清一种操作，保底无条件生效，不再需要按「删完还剩多少」判定。
+pub fn clear_all(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM sys_audit_log \
+         WHERE id NOT IN (SELECT id FROM sys_audit_log ORDER BY id DESC LIMIT ?1)",
+        rusqlite::params![AUDIT_KEEP_MIN as i64],
+    )?;
     Ok(n)
 }
 
@@ -240,7 +199,8 @@ mod tests {
     fn 日期筛选按本地日期换算() {
         let conn = fixture();
         add(&conn, "HT-001", "CREATE", "新建合同");
-        // now_iso 是 UTC；本地日期取它的 +8 版本，用同一天筛必然命中
+        // 列表筛选的日期区间（R-70 保留功能）：now_iso 是 UTC，
+        // 本地日期取它的 +8 版本，用同一天筛必然命中
         let utc = now_iso();
         let local_date: String = conn
             .query_row("SELECT date(?1, '+8 hours')", rusqlite::params![utc], |r| {
@@ -261,36 +221,17 @@ mod tests {
         assert_eq!(count(&conn, &f).unwrap(), 0);
     }
 
+    /// 一次性清空必须保底保留最近 200 条，且重复清空不会继续删。
     #[test]
-    fn 清理只删命中条件的那部分() {
-        let conn = fixture();
-        add(&conn, "HT-001", "CREATE", "新建合同");
-        add(&conn, "HT-001", "VOID", "作废合同");
-        let f = LogFilter {
-            action: Some("VOID".into()),
-            ..Default::default()
-        };
-        assert_eq!(clear(&conn, &f, false).unwrap(), 1);
-        assert_eq!(total(&conn).unwrap(), 1);
-        assert_eq!(actions(&conn).unwrap(), vec!["CREATE".to_string()]);
-    }
-
-    /// 保底按「删完还剩多少」判定：即使填了筛选条件，只要实质是清空也要兜住。
-    #[test]
-    fn 实质全清一律保留最近两百条() {
+    fn 清空日志保底保留最近两百条() {
         let conn = fixture();
         for i in 0..205 {
             add(&conn, "HT-001", "CREATE", &format!("第 {i} 条"));
         }
-        // 所有行都是 CREATE，按类型清理会命中全表；不能靠「填了个条件」绕过保底
-        let f = LogFilter {
-            action: Some("CREATE".into()),
-            ..Default::default()
-        };
-        assert_eq!(clear(&conn, &f, false).unwrap(), 5);
+        assert_eq!(clear_all(&conn).unwrap(), 5);
         assert_eq!(total(&conn).unwrap(), 200);
-        // 全部清理同样保底，且再来一次不会继续删
-        assert_eq!(clear(&conn, &LogFilter::default(), true).unwrap(), 0);
+        // 再来一次不会继续删
+        assert_eq!(clear_all(&conn).unwrap(), 0);
         assert_eq!(total(&conn).unwrap(), 200);
         // 留下的是最新的那些（detail 带行号，按 id 序倒排取第一条）
         let rows = list(&conn, &LogFilter::default(), 1).unwrap();

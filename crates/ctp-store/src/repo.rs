@@ -103,7 +103,7 @@ pub fn insert_category(
         "INSERT INTO ct_category(id, category_code, category_name, sort_no, is_enabled, \
             created_at, created_by, updated_at, updated_by, version) \
          VALUES (?1,?2,?3,?4,1,?5,?6,?5,?6,1) \
-         ON CONFLICT(category_code) DO UPDATE SET category_name = excluded.category_name",
+         ON CONFLICT(category_code) DO NOTHING",
         rusqlite::params![id, code, name, sort_no, now, operator],
     )?;
     Ok(())
@@ -122,7 +122,7 @@ pub fn insert_dict_item(
         "INSERT INTO sys_dict_item(dict_type, item_code, item_name, sort_no, is_enabled, \
             created_at, created_by, updated_at, updated_by, version) \
          VALUES (?1,?2,?3,?4,1,?5,?6,?5,?6,1) \
-         ON CONFLICT(dict_type, item_code) DO UPDATE SET item_name = excluded.item_name",
+         ON CONFLICT(dict_type, item_code) DO NOTHING",
         rusqlite::params![dict_type, code, name, sort_no, now, operator],
     )?;
     Ok(())
@@ -204,6 +204,17 @@ fn map_contract(row: &Row) -> rusqlite::Result<Contract> {
     })
 }
 
+/// 写库口径（R-70）：无法识别的招标方式原码不写回业务列。
+///
+/// DDL 的 CHECK 只收 OPEN / GOV_PROC / DIRECT；Unknown 归一为 NULL，
+/// 由服务层把原码记进审计日志。避免「读到未知码 → 整表保存必失败」的读写不对称。
+fn legal_bid_code(b: &ctp_core::contract::BidMethod) -> Option<&str> {
+    match b {
+        ctp_core::contract::BidMethod::Unknown(_) => None,
+        _ => Some(b.code()),
+    }
+}
+
 pub fn insert_contract(conn: &Connection, c: &Contract) -> Result<()> {
     c.validate()?;
     conn.execute(
@@ -250,7 +261,7 @@ pub fn insert_contract(conn: &Connection, c: &Contract) -> Result<()> {
             c.updated_at,
             c.updated_by,
             c.version,
-            c.bid_method.as_ref().map(|b| b.code()),
+            c.bid_method.as_ref().and_then(legal_bid_code),
             c.open_bid_date,
             c.project_leader,
             c.contact_info,
@@ -310,7 +321,7 @@ pub fn update_contract(conn: &Connection, c: &Contract) -> Result<()> {
             c.is_deleted as i32,
             c.updated_at,
             c.updated_by,
-            c.bid_method.as_ref().map(|b| b.code()),
+            c.bid_method.as_ref().and_then(legal_bid_code),
             c.open_bid_date,
             c.project_leader,
             c.contact_info,

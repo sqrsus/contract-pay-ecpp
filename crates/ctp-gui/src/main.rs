@@ -88,7 +88,7 @@ impl Screen {
             Screen::Contracts => "合同清单、审计价与金额维护",
             Screen::Payments => "登记拨款单并实时校验可付额度",
             Screen::Summary => "按日 / 项目 / 承包单位统计已付拨款",
-            Screen::Logs => "写库操作留痕、按时间段或全部清理",
+            Screen::Logs => "写库操作留痕、筛选与日志清理",
             Screen::Checks => "口径自检、管理密码",
         }
     }
@@ -312,9 +312,9 @@ pub struct App {
     pub log_actions: Vec<String>,
     /// 上次查询用的筛选快照；与当前值不同就重查
     pub log_key: Option<(String, String, Option<String>, String)>,
-    /// 待确认的清理动作（筛选条件 + 一句人话描述）
-    pub log_clear: Option<(ctp_store::audit::LogFilter, String)>,
-    /// 「全部清理」的确认词输入（R-68 / C14-B）：须输入「清空」二字才能提交。
+    /// 待确认的一次性清空动作（弹窗标题文案）
+    pub log_clear: Option<String>,
+    /// 「清理日志」的确认词输入（R-68 / C14-B）：须输入「清空」二字才能提交。
     pub log_clear_word: String,
 
     pub dialog: Dialog,
@@ -524,11 +524,15 @@ impl App {
         if std::env::var("CTP_LOGIN").as_deref() == Ok("admin") {
             self.login_admin = true;
         }
-        // `CTP_ROLE=browse|admin` 跳过登录直达主界面（截图与回归核对用，正常启动不设置）
-        match std::env::var("CTP_ROLE").unwrap_or_default().as_str() {
-            "browse" => self.role = Some(ctp_app::auth::Role::Browse),
-            "admin" => self.role = Some(ctp_app::auth::Role::Admin),
-            _ => {}
+        // R-70：`CTP_ROLE=browse|admin` 跳过登录仅限自检模式。
+        // 否则任何能控制进程环境的人设一个变量就能拿到管理员写权限（越权写入）。
+        // 空库冒烟 / 截图自动化会同时设置 CTP_SELFTEST=1，行为不变。
+        if std::env::var("CTP_SELFTEST").as_deref() == Ok("1") {
+            match std::env::var("CTP_ROLE").unwrap_or_default().as_str() {
+                "browse" => self.role = Some(ctp_app::auth::Role::Browse),
+                "admin" => self.role = Some(ctp_app::auth::Role::Admin),
+                _ => {}
+            }
         }
         // `CTP_SELECT=1` 仅选中第一份合同，用于核对选中态布局
         if std::env::var("CTP_SELECT").unwrap_or_default() == "1" {
@@ -1114,14 +1118,17 @@ impl App {
         write: impl FnOnce(&Connection, &std::path::Path) -> ctp_store::Result<(usize, usize)>,
     ) {
         let outcome: Result<(usize, PathBuf), String> = (|| {
-            let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
             let path = rfd::FileDialog::new()
                 .set_file_name(file_name)
                 .add_filter("Excel 工作簿", &["xlsx"])
                 .save_file()
                 // 用户取消保存框：用空串标记，不弹错误提示
                 .ok_or_else(String::new)?;
-            let (rows, _) = write(conn, &path).map_err(|e| e.to_string())?;
+            // R-70：导出是「只读查看 + 系统留痕」，走专用门面而非裸 db 连接；
+            // 该门面只允许服务层写 sys_audit_log，改业务数据一律走 exec。
+            let (rows, _) = self
+                .export_audit(|conn| write(conn, &path))
+                .map_err(|e| e.to_string())?;
             Ok((rows, path))
         })();
         match outcome {
@@ -1248,6 +1255,23 @@ impl App {
         let conn = self.db.as_mut().ok_or_else(|| "数据库未打开".to_string())?;
         let out = f(conn).map_err(|e| e.to_string())?;
         Ok(out)
+    }
+
+    /// 「只读查看 + 系统留痕」专用门面（R-70）。
+    ///
+    /// 导出 Excel 属于查看行为，浏览角色同样可用；服务层只会写一条
+    /// `sys_audit_log` 的 EXPORT 记录，不碰任何业务表（见 `service::write_and_log`）。
+    /// 单列这个具名入口，把「不检查 can_write 的路径」钉死在导出上：
+    /// 任何改业务数据的操作一律走 `exec`。未登录不给导出，避免无主留痕。
+    pub fn export_audit<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, ctp_store::StoreError>,
+    ) -> Result<T, String> {
+        if self.role.is_none() {
+            return Err(Self::NO_PERMISSION.to_string());
+        }
+        let conn = self.db.as_ref().ok_or_else(|| "数据库未打开".to_string())?;
+        f(conn).map_err(|e| e.to_string())
     }
 
     /// 只读访问数据库：浏览用户同样可用，不经过写权限检查。

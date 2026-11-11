@@ -1,7 +1,7 @@
 //! 操作日志的应用层：查询、类型/对象的中文映射、清理留痕。
 //!
 //! 日志本身由各业务入口在**同一事务内**写入（`db::insert_audit_log`），这里只负责
-//! 读出来给人看、以及按条件清理。清理动作自身也留一条 `CLEAR`，否则日志被谁清空无从追溯。
+//! 读出来给人看、以及一次性清空。清空动作自身也留一条 `CLEAR`，否则日志被谁清空无从追溯。
 
 use ctp_store::audit::{self, AuditLogRow, LogFilter};
 use ctp_store::{db, Result};
@@ -14,6 +14,8 @@ pub fn action_label(action: &str) -> String {
     let name = match action {
         "CREATE" => "新建",
         "ACTIVATE" => "生效",
+        "REVERT_ACTIVE" => "回退生效",
+        "PERFORMING" => "转为履行中",
         "VOID" => "作废",
         "EDIT_AMOUNT" => "修改金额",
         "SET_AUDIT_PRICE" => "登记审计价",
@@ -69,66 +71,32 @@ pub fn actions(conn: &Connection) -> Result<Vec<String>> {
     audit::actions(conn)
 }
 
-/// 「实质全清」至少保留的最近条数（R-68 / C14-A）。
-///
-/// 全删不可恢复，误触一次就把审计链清零；保底不再只看「条件是否全空」，
-/// 而是看删完后还剩多少——条件拉满或关键词覆盖全表同样要兜住。
+/// 一次性清空时至少保留的最近条数（R-68 / C14-A）。
 pub use ctp_store::audit::AUDIT_KEEP_MIN;
 
-/// 清理日志并留痕，返回删除条数。
+/// 一次性清空日志并留痕，返回删除条数。
 ///
-/// `filter` 四个条件全空即「全部清理」；否则按条件清理（例如只清某个时间范围）。
 /// R-39：删除与 `CLEAR` 留痕放在同一个 IMMEDIATE 事务里，
 /// 否则「删光了但留痕写入失败」会得到一个没有来源说明的空日志表。
-/// 保底按「删完后还剩多少」判定（见 `audit::needs_floor`），任何形式的
-/// 实质全清都至少留下最近 [`AUDIT_KEEP_MIN`] 条，留痕文案与实际行为一致。
-pub fn clear(conn: &mut Connection, filter: &LogFilter, operator: &str) -> Result<usize> {
+/// R-70：不再接收筛选条件，也不再提供「按时间段 / 按条件」清理；
+/// 删除固定走 `audit::clear_all`，保底保留最近 [`AUDIT_KEEP_MIN`] 条，
+/// 留痕文案与实际行为一致。
+pub fn clear(conn: &mut Connection, operator: &str) -> Result<usize> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let keep_min = audit::needs_floor(&tx, filter, filter.is_empty())?;
-    let n = audit::clear(&tx, filter, keep_min)?;
-    let scope = describe(filter);
-    let kept_note = if keep_min {
-        format!("，保留最近 {AUDIT_KEEP_MIN} 条")
-    } else {
-        String::new()
-    };
+    let n = audit::clear_all(&tx)?;
     db::insert_audit_log(
         &tx,
         "sys_audit_log",
         "sys_audit_log",
         Some("操作日志"),
         "CLEAR",
-        Some(&format!("{scope}，共 {n} 条{kept_note}")),
+        Some(&format!(
+            "全部清理，共 {n} 条，保留最近 {AUDIT_KEEP_MIN} 条"
+        )),
         operator,
     )?;
     tx.commit()?;
     Ok(n)
-}
-
-/// 把筛选条件写成一句人话，供清理留痕与界面提示共用。
-pub fn describe(filter: &LogFilter) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let from = filter.from.trim();
-    let to = filter.to.trim();
-    if !from.is_empty() || !to.is_empty() {
-        parts.push(format!(
-            "时间 {} ~ {}",
-            if from.is_empty() { "不限" } else { from },
-            if to.is_empty() { "不限" } else { to }
-        ));
-    }
-    if let Some(a) = filter.action.as_ref().filter(|s| !s.trim().is_empty()) {
-        parts.push(format!("类型 {}", action_label(a)));
-    }
-    let kw = filter.keyword.trim();
-    if !kw.is_empty() {
-        parts.push(format!("关键词「{kw}」"));
-    }
-    if parts.is_empty() {
-        "全部清理".to_string()
-    } else {
-        format!("按条件清理（{}）", parts.join("、"))
-    }
 }
 
 #[cfg(test)]
@@ -168,7 +136,7 @@ mod tests {
         for i in 0..205 {
             add(&conn, "CREATE", &format!("HT-00{i} 合同"));
         }
-        let n = clear(&mut conn, &LogFilter::default(), "管理员").unwrap();
+        let n = clear(&mut conn, "管理员").unwrap();
         // 205 条只删掉最旧的 5 条，最近 200 条保底保留
         assert_eq!(n, 5);
         assert_eq!(total(&conn).unwrap(), 201); // 200 条 + 1 条留痕
@@ -181,23 +149,9 @@ mod tests {
     }
 
     #[test]
-    fn 按条件清理的留痕写明范围() {
-        let mut conn = fixture();
-        add(&conn, "CREATE", "HT-001 道路改造");
-        add(&conn, "VOID", "HT-002 桥梁维修");
-        let f = LogFilter {
-            action: Some("VOID".into()),
-            ..Default::default()
-        };
-        assert_eq!(clear(&mut conn, &f, "管理员").unwrap(), 1);
-        let rows = list(&conn, &LogFilter::default(), 10).unwrap();
-        let clear_row = rows.iter().find(|r| r.action == "CLEAR").unwrap();
-        let detail = clear_row.detail.as_deref().unwrap();
-        assert!(detail.contains("作废"), "留痕应写明类型：{detail}");
-    }
-
-    #[test]
-    fn 条件描述对空条件说全部清理() {
-        assert_eq!(describe(&LogFilter::default()), "全部清理");
+    fn 状态迁移动作有独立中文映射() {
+        assert_eq!(action_label("REVERT_ACTIVE"), "回退生效");
+        assert_eq!(action_label("PERFORMING"), "转为履行中");
+        assert_ne!(action_label("REVERT_ACTIVE"), action_label("ACTIVATE"));
     }
 }
