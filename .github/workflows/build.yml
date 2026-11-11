@@ -123,12 +123,15 @@ jobs:
   #           --notes-start-tag 显式指定起点，避免把更早的历史也带进来。
   #           如需按 PR 标签分组，可另加 .github/release.yml 定制分类。
   #
-  # 发布资产（三件）：
-  #   ctp-gui-<版本>-windows-x64.exe    可直接运行，便于老用户沿用习惯
-  #   ctp-gui-<版本>-windows-x64.zip    同一 exe 的体积压缩版，供下载慢的场景
-  #   SHA256SUMS.txt                    前两者的校验和
-  # GitHub 不对 Release 资产做二次压缩，exe 直传时用户下载的就是 10 MB 全量；
-  # 打成 zip 后实际下载量约减半，且不改动程序本身（无需重新编译、不改变校验逻辑）。
+  # 发布资产（两件）：
+  #   ctp-gui-<版本>-windows-x64.zip    唯一可下载产物，解压后即 ctp-gui-<版本>-windows-x64.exe
+  #   SHA256SUMS.txt                    只记录上面 zip 的校验和
+  # 不再直传未压缩的 exe（R-78）：同一份程序多挂一份 10 MB 全量，只增加下载面与选择成本；
+  # zip 解压后的文件名已带版本号，与直传 exe 的观感一致，程序本身也未改动。
+  # 注意上传必须显式列出文件、不能用 artifacts/*：zip 是由 artifact 里的 exe 现场压出来的，
+  # 通配符会把中间产物 exe 一并带上发布页，等于又回到了三件。
+  # 中间环节（build job 的 upload-artifact）仍传 exe：那是 CI 内部传递用的临时产物，
+  # 30 天过期，不对外暴露。
   # ---------------------------------------------------------------------------
   release:
     name: 发布 Release
@@ -219,7 +222,8 @@ jobs:
           }
           # -9 最高压缩率；-X 去掉 uid/时间等多余字段，同样的 exe 每次压出同样的包
           zip -9 -X "${ZIP}" "${EXE}"
-          sha256sum ./*.exe ./*.zip > SHA256SUMS.txt
+          # R-78：只发 zip，校验和也只算 zip（exe 留在本地目录不再上传）
+          sha256sum ./*.zip > SHA256SUMS.txt
           ls -lh
           cat SHA256SUMS.txt
 
@@ -241,4 +245,5 @@ jobs:
           else
             echo "未找到更早的 v* 标签，发布说明将覆盖全部历史"
           fi
-          gh release create "${TAG}" artifacts/* "${ARGS[@]}"
+          # R-78：显式列出要上传的两个文件。用 artifacts/* 会把中间产物 exe 一并带上发布页。
+          gh release create "${TAG}" artifacts/*.zip artifacts/SHA256SUMS.txt "${ARGS[@]}"
