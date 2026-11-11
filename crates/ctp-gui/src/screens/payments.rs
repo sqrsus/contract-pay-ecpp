@@ -77,6 +77,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     let mut picked_id: Option<String> = None;
+    // 合同下拉：宽度为原 372 px 的 1.5 倍（558）。加宽后本行只留标签与下拉，
+    // 状态徽标与支付率移到下一行右侧，避免窄窗口下被挤压或换行错位。
     ui.horizontal(|ui| {
         ui.label(RichText::new("合同").size(12.5).color(p.text_muted));
         picked_id = widgets::contract_select(
@@ -87,37 +89,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             app.pay_contract.as_deref(),
             &mut app.pay_filter,
             &mut app.pay_open,
-            372.0,
+            558.0,
         );
-
-        // 当前合同的项目状态与支付率：下拉之后紧跟，样式与合同台账一致
-        if let Some(s) = app
-            .pay_contract
-            .as_ref()
-            .and_then(|id| app.summaries.iter().find(|s| &s.contract_id == id))
-        {
-            ui.add_space(8.0);
-            if s.is_archived() {
-                widgets::badge(ui, &p, "归档关闭", Tone::Danger);
-            } else {
-                widgets::badge(ui, &p, "履行中", Tone::Success);
-            }
-            ui.add_space(8.0);
-            let frac = s.pay_rate.bp() as f32 / 10_000.0;
-            let color = if s.is_inverted {
-                p.danger
-            } else if frac > 0.99 {
-                p.warn
-            } else {
-                p.primary
-            };
-            widgets::bar(ui, &p, frac, color, 82.0, 7.0);
-            ui.label(
-                RichText::new(s.pay_rate.percent_string())
-                    .size(11.5)
-                    .color(p.text_muted),
-            );
-        }
     });
     if let Some(id) = picked_id {
         app.pay_contract = Some(id);
@@ -194,6 +167,64 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let mut open_pay: Option<String> = None;
 
     ui.add_space(10.0);
+
+    // ---------------- 当前合同（下拉正下方一行）
+    // 左侧显示下游选中的合同名称，右侧固定放状态徽标与支付率：
+    // 名称过长时截断而不是挤压右侧，右侧块宽度固定所以任何窗口宽度都不重叠。
+    let right_w = 214.0;
+    ui.horizontal(|ui| {
+        let left_w = (ui.available_width() - right_w).max(120.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_w, 22.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                // 钉死宽度，否则右侧块会被左侧名称直接带过来
+                ui.set_width(left_w);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(RichText::new("当前合同为：").size(12.0).color(p.text_muted));
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(s.contract_name.clone())
+                            .size(12.0)
+                            .strong()
+                            .color(p.text),
+                    )
+                    .truncate(),
+                );
+                // 被截断时悬停看全名
+                if crate::text_width(ui, &s.contract_name, 12.0) > left_w - 80.0 {
+                    let _ = resp.on_hover_text(s.contract_name.clone());
+                }
+            },
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let frac = s.pay_rate.bp() as f32 / 10_000.0;
+            let color = if s.is_inverted {
+                p.danger
+            } else if frac > 0.99 {
+                p.warn
+            } else {
+                p.primary
+            };
+            ui.label(
+                RichText::new(s.pay_rate.percent_string())
+                    .size(11.5)
+                    .color(p.text_muted),
+            );
+            widgets::bar(ui, &p, frac, color, 82.0, 7.0);
+            ui.add_space(2.0);
+            // 按真实状态取标签：原来只看「是否归档」，草稿 / 待生效合同会被
+            // 错标成「履行中」，与下方「不可登记拨款」的提示自相矛盾。
+            let st = ContractStatus::from_code(&s.status);
+            let (st_text, st_tone) = match st {
+                Some(x) if x.is_payable() => (x.label(), Tone::Success),
+                Some(x) if s.is_archived() => (x.label(), Tone::Danger),
+                Some(x) => (x.label(), Tone::Neutral),
+                None => (s.status.as_str(), Tone::Neutral),
+            };
+            widgets::badge(ui, &p, st_text, st_tone);
+        });
+    });
 
     ui.add_space(10.0);
 
@@ -349,6 +380,29 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         };
                         if fill.clicked() && payable_cent > 0 {
                             app.pay_form.amount = Money::from_cent(payable_cent).format_yuan();
+                        }
+                    });
+
+                    // 大写金额：随输入实时换算（零壹贰…圆角分整），
+                    // 未填或格式非法时显示「—」，该行始终占位，输入时按钮不跳动。
+                    let cn = amount_cn_text(&app.pay_form.amount);
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        ui.label(RichText::new("大写：").size(11.0).color(p.text_muted));
+                        let avail = ui.available_width();
+                        // 表单只有约 300 px 宽，长金额先降字号保单行（最低 9.0），
+                        // 再放不下才截断并挂 tooltip —— 换行会让下方按钮上下跳。
+                        let mut size = 11.0_f32;
+                        while size > 9.0 && crate::text_width(ui, &cn, size) > avail {
+                            size -= 0.5;
+                        }
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(&cn).size(size).color(p.text))
+                                .truncate(),
+                        );
+                        if crate::text_width(ui, &cn, size) > avail {
+                            let _ = resp.on_hover_text(&cn);
                         }
                     });
 
@@ -809,6 +863,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// 本次金额输入框的文本 → 中文大写。
+///
+/// 空白与格式非法（如 `1.2.3`、`abc`）一律返回「—」：占位行始终存在，
+/// 输入过程中表单高度不变，下方按钮不会上下跳。
+/// 注意 `Money::parse_yuan("")` 按业务口径返回 0（空视作零），此处必须先判空，
+/// 否则空输入会显示成「零圆整」，看起来像已经填了金额。
+fn amount_cn_text(input: &str) -> String {
+    if input.trim().is_empty() {
+        return "—".to_string();
+    }
+    Money::parse_yuan(input)
+        .map(|m| m.rmb_uppercase())
+        .unwrap_or_else(|_| "—".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,5 +924,23 @@ mod tests {
         ];
         assert!(list.iter().any(|s| s.contract_id == "C1"));
         assert!(!list.iter().any(|s| s.contract_id == "C9"));
+    }
+
+    /// R-72：金额框空白或格式非法时大写行显示「—」，不显示误导性的零。
+    #[test]
+    fn 金额大写_空与非法显示破折号() {
+        assert_eq!(amount_cn_text(""), "—");
+        assert_eq!(amount_cn_text("   "), "—");
+        assert_eq!(amount_cn_text("abc"), "—");
+        assert_eq!(amount_cn_text("1.2.3"), "—");
+    }
+
+    /// R-72：合法金额按财务票据口径实时换算（与打印件同一套规则）。
+    #[test]
+    fn 金额大写_跟随输入() {
+        assert_eq!(amount_cn_text("600"), "陆佰圆整");
+        assert_eq!(amount_cn_text("1250000.00"), "壹佰贰拾伍万圆整");
+        assert_eq!(amount_cn_text("0.01"), "零圆零壹分");
+        assert_eq!(amount_cn_text("1000.05"), "壹仟圆零伍分");
     }
 }
