@@ -1638,7 +1638,7 @@ fn detail_card(app: &App, ui: &mut egui::Ui, action: &mut Option<Act>, max_h: f3
             "可付额度",
             &format!("{} 元", payable_now.format_yuan()),
         );
-        // 支付率后带上封顶比例：80% 说明付清条件尚未满足（不额外占一行）
+        // 支付率后带上封顶比例（97%）：说明付清条件尚未满足（不额外占一行）
         let rate_text = if quota_view.limit_note.is_some() {
             format!(
                 "{}（上限 {}%）",

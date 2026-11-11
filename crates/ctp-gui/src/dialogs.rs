@@ -2524,7 +2524,7 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                     if need_confirm {
                         form.confirmed_type = Some(ctype);
                         let note = if ctype == ContractType::Engineering {
-                            "改为工程类后，该合同将受「已审定 + 交工满 2 年」与 80% 封顶约束，已有付款可能变成超付"
+                            "改为工程类后，该合同将受「已审定 + 交工满 2 年」与 97% 封顶约束，已有付款可能变成超付"
                         } else {
                             "改为货物 / 服务类后，付清条件与封顶规则随之变化，请确认历史付款仍然合规"
                         };

@@ -4,10 +4,11 @@ use crate::error::{DomainError, Result};
 use crate::money::Money;
 use crate::rate::Rate;
 
-/// 未满足「付清」条件时的累计付款上限（有效计价基准的 80%）。
+/// 未满足「付清」条件时的累计付款上限（有效计价基准的 97%）。
 ///
 /// 该上限是硬约束：不叠加容差。口径见 `pay_limit`。
-pub const UNSETTLED_CAP_BP: i32 = 8_000;
+/// R-75：业务口径由 80% 调整为 97%（2026-11-11 用户确认，三条封顶分支统一）。
+pub const UNSETTLED_CAP_BP: i32 = 9_700;
 
 /// 施工合同需要「交工日期距开单日期严格大于该年数」才能付清。
 pub const SETTLE_YEARS: i32 = 2;
@@ -17,7 +18,7 @@ pub const SETTLE_YEARS: i32 = 2;
 pub struct PayLimit {
     /// 允许的累计已付上限（不含容差）
     pub ceiling: Money,
-    /// 上限比例：8000 = 80%，10000 = 100%
+    /// 上限比例：9700 = 97%，10000 = 100%
     pub cap_bp: i32,
     /// 受限原因；`None` 表示无额外限制，可按「基准 + 容差」付款
     pub note: Option<&'static str>,
@@ -31,10 +32,10 @@ impl PayLimit {
 
 /// 按「付清条件」计算累计付款上限。
 ///
-/// 两条规则（业务方 2026-11-05 确认）：
-/// 1. **所有未交工合同**：累计付款不得超过有效计价基准的 80%；
+/// 两条规则（业务方 2026-11-05 确认比例 80%，2026-11-11 调整为 97%）：
+/// 1. **所有未交工合同**：累计付款不得超过有效计价基准的 97%；
 /// 2. **工程合同**：须已登记审计价、且交工日期距本次开单日期**严格超过 2 个自然年**，
-///    才允许付到 100%；否则同样按 80% 封顶。
+///    才允许付到 100%；否则同样按 97% 封顶。
 ///
 /// 非工程合同只要登记了交工日期即可付清。
 pub fn pay_limit(contract: &Contract, base: Money, pay_date: &str) -> Result<PayLimit> {
@@ -65,15 +66,15 @@ pub fn pay_limit_for(
 
     let delivery = delivery_date.map(str::trim).filter(|d| !d.is_empty());
     let Some(delivery) = delivery else {
-        return capped("未登记交工日期，累计付款不得超过有效计价基准的 80%");
+        return capped("未登记交工日期，累计付款不得超过有效计价基准的 97%");
     };
 
     if is_engineering {
         if !is_audited {
-            return capped("工程合同未登记审计价，累计付款不得超过有效计价基准的 80%");
+            return capped("工程合同未登记审计价，累计付款不得超过有效计价基准的 97%");
         }
         if !date::years_elapsed_over(delivery, pay_date, SETTLE_YEARS) {
-            return capped("工程合同交工未满 2 年，累计付款不得超过有效计价基准的 80%");
+            return capped("工程合同交工未满 2 年，累计付款不得超过有效计价基准的 97%");
         }
     }
 
@@ -133,11 +134,11 @@ pub struct PaymentQuota {
     /// 这是**视图口径**：只受「基准 + 容差」约束，不含付清条件限制。
     /// 登记拨款请用 `payable_amount`。
     pub available_amount: Money,
-    /// 付清条件允许的累计上限（= min(ceiling, 80% 封顶)）
+    /// 付清条件允许的累计上限（= min(ceiling, 97% 封顶)）
     pub limit_amount: Money,
     /// 本期实际可付 = `limit_amount − 已付 − 在途`（可为负）
     pub payable_amount: Money,
-    /// 封顶比例：8000 = 80%，10000 = 100%
+    /// 封顶比例：9700 = 97%，10000 = 100%
     pub cap_bp: i32,
     /// 付清条件受限原因；`None` 表示无额外限制
     pub limit_note: Option<&'static str>,
@@ -170,7 +171,7 @@ impl PaymentQuota {
         let available = ceiling.checked_sub(occupied)?;
 
         let limit = pay_limit(contract, base, pay_date)?;
-        // 受限时按 80% 硬封顶（不叠加容差）；不受限时沿用「基准 + 容差」口径。
+        // 受限时按 97% 硬封顶（不叠加容差）；不受限时沿用「基准 + 容差」口径。
         let limit_amount = if limit.cap_bp >= 10_000 {
             ceiling
         } else if limit.ceiling.cent() < ceiling.cent() {
@@ -379,18 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn 未交工一律封顶八成() {
+    fn 未交工一律封顶九七() {
         let c = construct(1_000, Some(900), None);
         let q = PaymentQuota::for_new_payment(&c, yuan(300), Rate::ZERO, PAY_DATE).unwrap();
         assert_eq!(q.cap_bp, UNSETTLED_CAP_BP);
         assert_eq!(q.available_amount.cent(), 600, "视图口径仍是基准减已付");
-        assert_eq!(q.payable_amount.cent(), 420, "900 × 80% − 300");
+        assert_eq!(q.payable_amount.cent(), 573, "900 × 97% − 300");
         assert!(q.limit_note.unwrap().contains("未登记交工日期"));
 
-        assert!(q.check_new_payment(yuan(420)).is_ok(), "恰好用满 80% 可以");
-        match q.check_new_payment(yuan(421)) {
+        assert!(q.check_new_payment(yuan(573)).is_ok(), "恰好用满 97% 可以");
+        match q.check_new_payment(yuan(574)) {
             Err(DomainError::PaymentBlocked(msg)) => {
-                assert!(msg.contains("80%"), "提示应说明 80% 封顶：{msg}");
+                assert!(msg.contains("97%"), "提示应说明 97% 封顶：{msg}");
             }
             other => panic!("应被付清条件拦截，实得 {other:?}"),
         }
@@ -408,13 +409,13 @@ mod tests {
 
     #[test]
     fn 工程合同付清需审定且交工满两年() {
-        // 未审定 → 80%
+        // 未审定 → 97%
         let c = construct(1_000, None, Some("2020-01-01"));
         let q = PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, PAY_DATE).unwrap();
         assert_eq!(q.cap_bp, UNSETTLED_CAP_BP);
         assert!(q.limit_note.unwrap().contains("未登记审计价"));
 
-        // 已审定但交工未满 2 年 → 80%
+        // 已审定但交工未满 2 年 → 97%
         let c = construct(1_000, Some(1_000), Some("2024-06-01"));
         let q =
             PaymentQuota::compute(&c, Money::ZERO, Money::ZERO, Rate::ZERO, "2026-05-31").unwrap();

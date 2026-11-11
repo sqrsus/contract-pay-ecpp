@@ -30,7 +30,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new("拨款管理").size(19.0).strong().color(p.text));
             ui.label(
                 RichText::new(
-                    "未交工合同累计付款不超过有效计价基准的 80%；工程合同须已审定、且交工满 2 年方可付清",
+                    "未交工 / 未审定合同累计付款不超过有效计价基准的 97%；工程合同须已审定、且交工满 2 年方可付清",
                 )
                 .size(12.0)
                 .color(p.text_muted),

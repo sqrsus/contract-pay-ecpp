@@ -128,7 +128,7 @@ pub struct EditContract {
     pub bid_agent_text: Option<String>,
     /// 合同类型变更的二次确认（R-68）。
     ///
-    /// 类型决定付清条件与 80% 封顶规则，静默改类型可能让历史付款瞬间「超付」。
+    /// 类型决定付清条件与 97% 封顶规则，静默改类型可能让历史付款瞬间「超付」。
     /// 首次提交传 `false`，服务层返回 `NeedConfirm`；界面弹框确认后带 `true` 重交。
     pub confirm_type_change: bool,
 }
@@ -702,7 +702,7 @@ pub fn update_contract_master(
     // R-68（C9）：类型变更会改变付清条件与封顶规则，必须先二次确认。
     if input.contract_type != c.contract_type && !input.confirm_type_change {
         let note = if input.contract_type == ContractType::Engineering {
-            "改为工程类后，该合同将受「已审定 + 交工满 2 年」与 80% 封顶约束，已有付款可能变成超付"
+            "改为工程类后，该合同将受「已审定 + 交工满 2 年」与 97% 封顶约束，已有付款可能变成超付"
         } else {
             "改为货物 / 服务类后，付清条件与封顶规则随之变化，请确认历史付款仍然合规"
         };

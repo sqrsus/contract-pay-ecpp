@@ -288,21 +288,21 @@ fn 容差固定为零_超基准即拦截() {
 }
 
 #[test]
-fn 未交工合同封顶八成() {
+fn 未交工合同封顶九七() {
     let (mut conn, cid) = fixture_with(1000, ctp_core::contract::ContractType::Engineering, None);
 
     pay(&mut conn, &cid, 700).unwrap();
-    let err = pay(&mut conn, &cid, 101).unwrap_err();
+    let err = pay(&mut conn, &cid, 271).unwrap_err();
     assert!(err.is_payment_blocked(), "应为付清条件拦截，实得 {err}");
 
-    // 恰好推到有效计价基准的 80% 可以通过
-    pay(&mut conn, &cid, 100).unwrap();
-    assert_eq!(repo::paid_net(&conn, &cid).unwrap().cent(), 80_000);
+    // 恰好推到有效计价基准的 97% 可以通过
+    pay(&mut conn, &cid, 270).unwrap();
+    assert_eq!(repo::paid_net(&conn, &cid).unwrap().cent(), 97_000);
     // 再付 1 分即被拦
     assert!(pay(&mut conn, &cid, 1).unwrap_err().is_payment_blocked());
 
     let q = service::quota_on(&conn, &cid, "2026-03-31").unwrap();
-    assert_eq!(q.cap_bp, 8_000);
+    assert_eq!(q.cap_bp, 9_700);
     assert_eq!(q.payable_amount.cent(), 0);
     assert!(q.limit_note.unwrap().contains("未登记交工日期"));
 }
@@ -316,11 +316,11 @@ fn 工程合同付清需审定且交工满两年() {
         Some("2024-06-01"),
     );
 
-    // 未审定 → 80% 封顶
-    assert!(pay(&mut conn, &cid, 900).unwrap_err().is_payment_blocked());
-    pay(&mut conn, &cid, 800).unwrap();
+    // 未审定 → 97% 封顶（上限 970 元）
+    assert!(pay(&mut conn, &cid, 971).unwrap_err().is_payment_blocked());
+    pay(&mut conn, &cid, 900).unwrap();
 
-    // 补登记审计价，仍不满 2 年 → 不得付清
+    // 补登记审计价，仍不满 2 年 → 累计上限仍是 970 元，不得付清
     service::register_audit_price(
         &mut conn,
         &cid,
@@ -332,15 +332,16 @@ fn 工程合同付清需审定且交工满两年() {
         "t",
     )
     .unwrap();
-    let err = pay(&mut conn, &cid, 200).unwrap_err();
+    let err = pay(&mut conn, &cid, 71).unwrap_err();
     assert!(
         err.is_payment_blocked(),
         "交工未满 2 年不得付清，实得 {err}"
     );
+    pay(&mut conn, &cid, 70).unwrap(); // 900 + 70 = 970，恰好用满封顶
 
     // 交工日期提前到 2023-01-01（+2 年 = 2025-01-01 < 开单日）→ 可付清
     service::set_delivery_date(&mut conn, &cid, "2023-01-01", "t").unwrap();
-    pay(&mut conn, &cid, 200).unwrap();
+    pay(&mut conn, &cid, 30).unwrap();
     let q = service::quota_on(&conn, &cid, "2026-03-31").unwrap();
     assert!(q.is_settled());
     assert_eq!(q.cap_bp, 10_000);
@@ -366,8 +367,8 @@ fn 满两年当日仍不可付清() {
         "t",
     )
     .unwrap();
-    pay(&mut conn, &cid, 800).unwrap();
-    assert!(pay(&mut conn, &cid, 200).unwrap_err().is_payment_blocked());
+    pay(&mut conn, &cid, 970).unwrap();
+    assert!(pay(&mut conn, &cid, 30).unwrap_err().is_payment_blocked());
 
     let q = service::quota_on(&conn, &cid, "2026-04-01").unwrap();
     assert_eq!(q.cap_bp, 10_000, "开单日推到满 2 年之后即可付清");
