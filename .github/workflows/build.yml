@@ -1,10 +1,10 @@
 name: build
 
 # 触发条件：
-#   - push 到 main            → 跑测试 + 编 release，产物作为 artifact 保留 30 天
-#   - 向 main 提 PR           → 只跑测试，避免重复构建
-#   - 推送 v* 标签            → 额外创建 GitHub Release，附上 Windows 二进制与校验和
-#   - 手动 workflow_dispatch → 按需重跑
+#   - push 到 main            → 测试 + 编 release，并按 Cargo.toml 版本号自动打标签、发布 Release
+#   - 推送 v* 标签            → 同一套发布流程，按标签名发布（手工打标签的场景仍然可用）
+#   - 向 main 提 PR           → 只跑测试与构建，不发版
+#   - 手动 workflow_dispatch  → 按需重跑；版本已发过时会自动跳过，不会重复发版
 on:
   push:
     branches: [main]
@@ -17,10 +17,11 @@ on:
 permissions:
   contents: read
 
-# 同一分支的旧构建自动取消，避免连续提交堆叠排队（标签发布不取消）
+# 同一分支的旧构建自动取消，避免连续提交堆叠排队；标签发布不允许被取消，
+# 否则可能出现「tag 已推、Release 没建完」的半成品。
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -111,39 +112,118 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 第 3 关：只有打 v* 标签才发布。把产物下载下来，
-  # 生成 SHA256SUMS.txt 一并挂到 Release，便于分发时校验完整性。
+  # 第 3 关：发布 Release。PR 不发布，其余触发都走这里。
+  #
+  # 版本号与标签规则：
+  #   - push 到 main：读 Cargo.toml 的 [workspace.package] version（唯一真源）→ 标签 v<version>
+  #   - push v* 标签：直接用该标签名，并从标签名反解版本号
+  #   - 该版本已存在 Release 时整段跳过：改文档 / 调 CI / 重复推送都不会重复发版
+  #
+  # 发布说明：--generate-notes 自动汇总「上一个 v* 标签 → 本次」之间的提交与 PR，
+  #           --notes-start-tag 显式指定起点，避免把更早的历史也带进来。
+  #           如需按 PR 标签分组，可另加 .github/release.yml 定制分类。
   # ---------------------------------------------------------------------------
   release:
     name: 发布 Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ github.event_name != 'pull_request' }}
     needs: build
     runs-on: ubuntu-latest
-    # 只有这个 job 需要创建 Release / 上传资产
+    # 只有这个 job 需要建标签 / 建 Release / 传资产
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # 需要完整历史：git describe 要找到上一个 v* 标签来界定发布说明的范围
+          fetch-depth: 0
+
+      - name: 解析版本号与标签
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          else
+            # Cargo.toml 里只有 [workspace.package] 下的 version 顶格书写
+            VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+            TAG="v${VERSION}"
+          fi
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::无法解析版本号（得到 '${VERSION}'），请检查 Cargo.toml 的 workspace.package.version"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "版本 ${VERSION} → 标签 ${TAG}"
+
+      - name: 判断该版本是否已发布
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${TAG} 已存在 Release，本次跳过发布（版本号未变即视为无需发版）"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 创建并推送标签
+        if: ${{ steps.guard.outputs.exists == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "远端已存在标签 ${TAG}，直接复用"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "release ${TAG}"
+            # 用 GITHUB_TOKEN 推标签不会再次触发 workflow，天然避免自我循环
+            git push origin "refs/tags/${TAG}"
+          fi
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: ${{ steps.guard.outputs.exists == 'false' }}
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: 生成校验和
+      - name: 重命名产物并生成校验和
+        if: ${{ steps.guard.outputs.exists == 'false' }}
+        shell: bash
         run: |
           set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
           cd artifacts
+          mv ctp-gui.exe "ctp-gui-${VERSION}-windows-x64.exe"
+          sha256sum ./*.exe > SHA256SUMS.txt
           ls -lh
-          sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: 创建 Release
+        if: ${{ steps.guard.outputs.exists == 'false' }}
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 本 job 没有 checkout，gh 无法从 git remote 推断仓库，必须显式指定
+          # 本 job 的 checkout 在子目录之外，gh 仍无法可靠推断仓库，显式指定
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" artifacts/* \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            --verify-tag
+          TAG="${{ steps.ver.outputs.tag }}"
+          ARGS=(--title "${TAG}" --generate-notes --verify-tag --latest)
+          PREV="$(git describe --tags --abbrev=0 --match 'v*' "refs/tags/${TAG}^" 2>/dev/null || true)"
+          if [[ -n "${PREV}" ]]; then
+            ARGS+=(--notes-start-tag "${PREV}")
+            echo "发布说明范围：${PREV} .. ${TAG}"
+          else
+            echo "未找到更早的 v* 标签，发布说明将覆盖全部历史"
+          fi
+          gh release create "${TAG}" artifacts/* "${ARGS[@]}"
