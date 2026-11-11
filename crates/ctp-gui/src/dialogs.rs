@@ -963,7 +963,24 @@ pub fn planned_end_is_manual(end: &str, last_auto: &Option<String>) -> bool {
     !end.trim().is_empty() && last_auto.as_deref() != Some(end)
 }
 
-/// 下拉框（索引式）。
+/// 表单控件统一高度：`field` 的文本框与 `date_input` 都是 26，下拉必须同高，
+/// 否则同一网格行里两列控件基线不一致、行高被下拉撑高。
+const FIELD_H: f32 = 26.0;
+
+/// 用统一的「控件外形」包一层再画下拉：高度 26、内边距 8/4，
+/// 与文本框的 `add_sized([w, 26.0])` + `margin(symmetric(8, 4))` 完全对齐。
+fn combo_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        // ComboBox 的按钮高度取 `interact_size.y`（全局 30），内边距取 `button_padding.y`（全局 7），
+        // 两者都比文本框大；这里只在本控件作用域内改小，不影响其他按钮。
+        ui.spacing_mut().interact_size.y = FIELD_H;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+        add(ui)
+    })
+    .inner
+}
+
+/// 下拉框（索引式）。高度与文本框统一（见 `combo_scope`）。
 fn combo(
     ui: &mut egui::Ui,
     id: &str,
@@ -976,28 +993,66 @@ fn combo(
         .get(current)
         .cloned()
         .unwrap_or_else(|| "（无）".to_string());
-    egui::ComboBox::from_id_salt(id)
-        .width(width)
-        .selected_text(text)
-        .show_ui(ui, |ui| {
-            for (i, l) in labels.iter().enumerate() {
-                ui.selectable_value(sel, i, l);
-            }
-        });
+    combo_scope(ui, |ui| {
+        egui::ComboBox::from_id_salt(id)
+            .width(width)
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                for (i, l) in labels.iter().enumerate() {
+                    ui.selectable_value(sel, i, l);
+                }
+            });
+    });
+}
+
+/// 「标签 + 下拉」整格：标签与控件间距按 `field` 的 2.0 走
+/// （默认是 10.0，会让下拉格比同排文本框格高出一截）。
+fn labeled_combo(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    id: &str,
+    width: f32,
+    labels: Vec<String>,
+    sel: &mut usize,
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        combo(ui, id, width, *sel, labels, sel);
+    });
 }
 
 /// 修改窗的招标方式下拉（R-68 / C3）：直接读写 `BidMethod` 值。
 /// 当前值是 `Unknown(原码)` 时显示「未知(XXX)」；三个常规选项可选，
-/// 不碰下拉就原样保留，不会把未知码写成 NULL。
+/// 不碰下拉就原样保留，不会把未知码写成 NULL。高度同文本框（见 `combo_scope`）。
 fn bid_method_combo(ui: &mut egui::Ui, id: &str, width: f32, sel: &mut BidMethod) {
-    egui::ComboBox::from_id_salt(id)
-        .width(width)
-        .selected_text(sel.label())
-        .show_ui(ui, |ui| {
-            for m in &BID_METHODS {
-                ui.selectable_value(sel, m.clone(), m.label());
-            }
-        });
+    combo_scope(ui, |ui| {
+        egui::ComboBox::from_id_salt(id)
+            .width(width)
+            .selected_text(sel.label())
+            .show_ui(ui, |ui| {
+                for m in &BID_METHODS {
+                    ui.selectable_value(sel, m.clone(), m.label());
+                }
+            });
+    });
+}
+
+/// 「标签 + 招标方式下拉」整格，间距口径同 `labeled_combo`。
+fn labeled_bid_combo(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    id: &str,
+    width: f32,
+    sel: &mut BidMethod,
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        bid_method_combo(ui, id, width, sel);
+    });
 }
 
 /// R-46：合同台账导出前的列选择。
@@ -2269,20 +2324,8 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
         .min_width(720.0)
         .show(ctx, |ui| {
             ui.set_width(700.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("合同编号 {contract_no}"))
-                        .size(12.0)
-                        .color(p.text_muted),
-                );
-                ui.label(
-                    RichText::new(
-                        "编号与金额不在此修改；金额请用「编辑金额」，审计价请用「登记审计价」",
-                    )
-                    .size(10.5)
-                    .color(p.text_muted),
-                );
-            });
+            // 抬头只留合同编号；原先后面还跟了一句「编号与金额不在此修改…」的说明，按需求删除。
+            ui.label(RichText::new(format!("合同编号 {contract_no}")).size(12.0).color(p.text_muted));
             ui.add_space(8.0);
 
             egui::ScrollArea::vertical()
@@ -2299,23 +2342,9 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                             .spacing([12.0, 6.0])
                             .show(ui, |ui| {
                                 field(ui, &p, "* 合同名称", 300.0, &mut form.name);
-                                ui.vertical(|ui| {
-                                    widgets::field_label(ui, &p, "合同类别");
-                                    let labels: Vec<String> = dict::CONTRACT_CATEGORIES
-                                        .iter()
-                                        .map(|(_, n)| n.to_string())
-                                        .collect();
-                                    combo(
-                                        ui,
-                                        "edit_category",
-                                        300.0,
-                                        form.category_idx,
-                                        labels,
-                                        &mut form.category_idx,
-                                    );
-                                });
-                                ui.end_row();
-
+                                // 字段位置按需求整体前移一格（三格轮换）：
+                                // 所属项目 ← 原「合同类别」位；发包人（甲方）← 原「所属项目」位；
+                                // 合同类别 ← 原「发包人（甲方）」位；其余字段位置不变。
                                 ac_field_pick(
                                     ui,
                                     &p,
@@ -2327,17 +2356,6 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                                     300.0,
                                     widgets::SuggestMode::TypedOnly,
                                     &|s| pick_project_name(&project_src, s),
-                                );
-                                ac_field(
-                                    ui,
-                                    &p,
-                                    "* 承包单位",
-                                    "edit_contractor",
-                                    &mut form.contractor_text,
-                                    &unit_hints,
-                                    "输入名称后联想已有单位",
-                                    300.0,
-                                    widgets::SuggestMode::TypedOnly,
                                 );
                                 ui.end_row();
 
@@ -2352,21 +2370,43 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                                     300.0,
                                     widgets::SuggestMode::TypedOnly,
                                 );
-                                ui.vertical(|ui| {
-                                    widgets::field_label(ui, &p, "合同类型");
-                                    let labels: Vec<String> = CONTRACT_TYPES
+                                ac_field(
+                                    ui,
+                                    &p,
+                                    "* 承包单位",
+                                    "edit_contractor",
+                                    &mut form.contractor_text,
+                                    &unit_hints,
+                                    "输入名称后联想已有单位",
+                                    300.0,
+                                    widgets::SuggestMode::TypedOnly,
+                                );
+                                ui.end_row();
+
+                                labeled_combo(
+                                    ui,
+                                    &p,
+                                    "合同类别",
+                                    "edit_category",
+                                    300.0,
+                                    dict::CONTRACT_CATEGORIES
+                                        .iter()
+                                        .map(|(_, n)| n.to_string())
+                                        .collect(),
+                                    &mut form.category_idx,
+                                );
+                                labeled_combo(
+                                    ui,
+                                    &p,
+                                    "合同类型",
+                                    "edit_ctype",
+                                    300.0,
+                                    CONTRACT_TYPES
                                         .iter()
                                         .map(|t| t.label().to_string())
-                                        .collect();
-                                    combo(
-                                        ui,
-                                        "edit_ctype",
-                                        300.0,
-                                        form.ctype_idx,
-                                        labels,
-                                        &mut form.ctype_idx,
-                                    );
-                                });
+                                        .collect(),
+                                    &mut form.ctype_idx,
+                                );
                                 ui.end_row();
 
                                 date_field(
@@ -2425,22 +2465,24 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                             .num_columns(2)
                             .spacing([12.0, 6.0])
                             .show(ui, |ui| {
-                                ui.vertical(|ui| {
-                                    widgets::field_label(ui, &p, "招标方式");
-                                    bid_method_combo(
-                                        ui,
-                                        "edit_bid_method",
-                                        300.0,
-                                        &mut form.bid_method,
-                                    );
-                                });
-                                date_field(
+                                // 开标时间与计价方式互换位置：第一行右格改为计价方式，
+                                // 第二行右格改为开标时间；招标方式、招标代理原位不动。
+                                labeled_bid_combo(
                                     ui,
                                     &p,
-                                    "开标时间",
-                                    "edit_open_bid",
+                                    "招标方式",
+                                    "edit_bid_method",
                                     300.0,
-                                    &mut form.open_bid_date,
+                                    &mut form.bid_method,
+                                );
+                                labeled_combo(
+                                    ui,
+                                    &p,
+                                    "计价方式",
+                                    "edit_pricing",
+                                    300.0,
+                                    PRICING.iter().map(|x| x.to_string()).collect(),
+                                    &mut form.pricing_idx,
                                 );
                                 ui.end_row();
 
@@ -2455,19 +2497,14 @@ fn edit_contract(app: &mut App, ctx: &egui::Context) {
                                     300.0,
                                     widgets::SuggestMode::TypedOnly,
                                 );
-                                ui.vertical(|ui| {
-                                    widgets::field_label(ui, &p, "计价方式");
-                                    let labels: Vec<String> =
-                                        PRICING.iter().map(|x| x.to_string()).collect();
-                                    combo(
-                                        ui,
-                                        "edit_pricing",
-                                        300.0,
-                                        form.pricing_idx,
-                                        labels,
-                                        &mut form.pricing_idx,
-                                    );
-                                });
+                                date_field(
+                                    ui,
+                                    &p,
+                                    "开标时间",
+                                    "edit_open_bid",
+                                    300.0,
+                                    &mut form.open_bid_date,
+                                );
                                 ui.end_row();
 
                                 field(ui, &p, "质保金率 %", 300.0, &mut form.retention);
@@ -3487,7 +3524,7 @@ fn ro_text(ui: &mut egui::Ui, p: &Palette, text: &str) {
         });
 }
 
-/// 合同详情（只读）：布局与新建合同一致；底部三个按钮读取并展示对应附件。
+/// 合同详情（只读）：布局与新建合同一致；底部四个按钮读取并展示对应附件。
 fn contract_detail(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
     let Some(c) = app.modal_contract.clone() else {
@@ -3714,11 +3751,10 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("附件材料").size(12.0).color(p.text_muted));
-                for kind in [
-                    AttachmentKind::BidNotice,
-                    AttachmentKind::Contract,
-                    AttachmentKind::AuditReport,
-                ] {
+                // 四类附件全部列出（中标通知书 / 合同 / 验收材料 / 审计报告）。
+                // 原先这里手写了三项、漏了「验收材料」，导致详情卡只显示 3 个附件按钮；
+                // 改走 AttachmentKind::ALL，与新建页、附件管理弹窗保持同一份清单。
+                for kind in AttachmentKind::ALL {
                     if widgets::ghost_button_sm(ui, &p, kind.label()).clicked() {
                         material = Some(kind);
                     }
