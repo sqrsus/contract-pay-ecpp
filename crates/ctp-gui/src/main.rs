@@ -1562,15 +1562,13 @@ impl App {
                             let (fg, _) = tone.colors(&p);
                             ui.spacing_mut().item_spacing.x = 6.0;
                             ui.label(RichText::new("●").size(12.0).color(fg));
-                            // 截断而非换行：状态栏高度固定，换行会被裁掉且顶到上沿
-                            let resp = ui.add(
+                            // 截断而非换行：状态栏高度固定，换行会被裁掉且顶到上沿。
+                            // R-82：截断时全文浮层由 egui 的 Label::truncate() 内建提供，
+                            // 不再手动挂 on_hover_text，否则悬停会冒出两个相同浮层。
+                            let _ = ui.add(
                                 egui::Label::new(RichText::new(&text).size(12.5).color(p.text))
                                     .truncate(),
                             );
-                            // 被截断时悬停给全文，长提示不至于读不全
-                            if text_width(ui, &text, 12.5) > left_w - 24.0 {
-                                let _ = resp.on_hover_text(text);
-                            }
                         },
                     );
 

@@ -213,12 +213,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     // ---------------- 当前合同（下拉正下方一行）
     // 三项状态元素已移回下拉右侧；本行显示「合同名称 + 四个半角空格 + 承包单位」（R-76）。
     // 名称与承包单位分两段着色（名称 p.text、承包单位 p.text_muted），
-    // 用 LayoutJob 拼成一行：既能保留两段颜色，又能整行单行截断、悬停看全文。
+    // 用 LayoutJob 拼成一行：既能保留两段颜色，又能整行单行截断。
     // 字号与表单输入框一致（Body 14），名称再长也不会把行撑破。
+    // R-82：截断后的全文浮层由 egui 的 Label::truncate() 内建提供，不再手动挂第二个。
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.label(RichText::new("当前合同为：").size(14.0).color(p.text_muted));
-        let full = format!("{}    {}", s.contract_name, s.contractor_name);
         let font = egui::FontId::proportional(14.0);
         let mut job = egui::text::LayoutJob::default();
         job.append(
@@ -248,12 +248,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 ..Default::default()
             },
         );
-        let name_w = ui.available_width();
-        let resp = ui.add(egui::Label::new(job).truncate());
-        // 被截断时悬停看全名与承包单位
-        if crate::text_width(ui, &full, 14.0) > name_w {
-            let _ = resp.on_hover_text(full);
-        }
+        let _ = ui.add(egui::Label::new(job).truncate());
     });
 
     ui.add_space(10.0);
@@ -420,20 +415,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                     // 大写金额：随输入实时换算（零壹贰…圆角分整）。
                     // 字号与输入框显示字体一致（Body 14），未填或格式非法时显示「—」；
-                    // 该行始终占位，长金额单行截断并悬停看全，输入时下方按钮不跳动。
+                    // 该行始终占位，长金额单行截断，输入时下方按钮不跳动。
+                    // R-82：全文浮层由 egui 的 Label::truncate() 内建提供，勿再手动挂第二个。
                     let cn = amount_cn_text(&app.pay_form.amount);
                     ui.add_space(3.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         ui.label(RichText::new("大写：").size(14.0).color(p.text_muted));
-                        let avail = ui.available_width();
-                        let resp = ui.add(
+                        let _ = ui.add(
                             egui::Label::new(RichText::new(&cn).size(14.0).color(p.text))
                                 .truncate(),
                         );
-                        if crate::text_width(ui, &cn, 14.0) > avail {
-                            let _ = resp.on_hover_text(&cn);
-                        }
                     });
 
                     ui.add_space(6.0);

@@ -365,26 +365,28 @@ pub fn field_label(ui: &mut Ui, p: &Palette, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(p.text_muted));
 }
 
-/// 详情行的宽度预算：返回 `(值区宽度, 是否需要悬停全文)`。
+/// 详情行的值区宽度：容器宽扣掉标签文字与控件间距，下限 0。
 ///
-/// R-81：值区宽度只由容器、标签文字与控件间距决定，**与值文本长度无关**；
-/// `value_text_w` 仅用于判断是否被截断。抽成纯函数便于单测锁定这条不变量。
-fn kv_row_budget(row_w: f32, label_w: f32, gap: f32, value_text_w: f32) -> (f32, bool) {
-    let value_w = (row_w - label_w - gap).max(0.0);
-    (value_w, value_text_w > value_w)
+/// R-81：值区宽度只由容器、标签文字与控件间距决定，**与值文本长度无关**。
+/// R-82 起不再自算「是否省略」——是否截断由 egui 的 `galley.elided` 自行判定。
+fn kv_value_width(row_w: f32, label_w: f32, gap: f32) -> f32 {
+    (row_w - label_w - gap).max(0.0)
 }
 
 /// 一行「标签 — 值」，用于详情面板。
 ///
-/// R-81：值区按剩余宽度定宽并单行截断，截断时悬停显示完整文本。
+/// R-81：值区按剩余宽度定宽并单行截断。
 /// 旧实现里两个 Label 都按内容自然宽度排版，超长合同名称会把整行、
 /// 进而把不可缩放的弹窗撑出屏幕，导致左侧标签首字被裁切。
+///
+/// R-82：**不要在这里手动挂 `on_hover_text`**。egui 0.29 的 `Label::truncate()`
+/// 在文本被省略时会自动挂一个显示全文的浮层（`egui::widgets::label.rs:256-258`），
+/// 再挂一个会出现两份相同的完整文本。
 pub fn kv(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
     let row_w = ui.available_width();
     let gap = ui.spacing().item_spacing.x;
     let label_w = crate::text_width(ui, label, 12.5);
-    let value_text_w = crate::text_width(ui, value, 13.0);
-    let (value_w, need_hover) = kv_row_budget(row_w, label_w, gap, value_text_w);
+    let value_w = kv_value_width(row_w, label_w, gap);
     ui.horizontal(|ui| {
         // 钉死整行宽度：horizontal 默认按内容推进光标，不钉宽就会被长文本带跑。
         ui.set_width(row_w);
@@ -392,11 +394,9 @@ pub fn kv(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // 值区同样钉宽，Label::truncate 才有确定的裁切边界。
             ui.set_width(value_w);
-            let resp =
+            // 截断浮层由 egui 内建提供，全项目只此一处，勿重复挂载。
+            let _ =
                 ui.add(egui::Label::new(RichText::new(value).size(13.0).color(p.text)).truncate());
-            if need_hover {
-                let _ = resp.on_hover_text(value);
-            }
         });
     });
 }
@@ -1541,35 +1541,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn r81_详情行宽度不随值文本变长() {
-        let (short_w, short_hover) = kv_row_budget(520.0, 50.0, 6.0, 30.0);
-        let (long_w, long_hover) = kv_row_budget(520.0, 50.0, 6.0, 9_999.0);
-        assert_eq!(short_w, long_w, "值区宽度只认容器，不认文本长度");
-        assert_eq!(short_w, 464.0);
-        assert!(!short_hover, "短值无需悬停");
-        assert!(long_hover, "超长值必须能悬停看全文");
+    fn r82_详情行宽度只认容器与标签() {
+        assert_eq!(kv_value_width(520.0, 50.0, 6.0), 464.0);
+        assert_eq!(kv_value_width(520.0, 75.0, 6.0), 439.0);
+        assert_eq!(kv_value_width(320.0, 75.0, 8.0), 237.0);
+        // R-82 起宽度函数不再接收值文本长度：宽度与文本长短在类型层面解耦，
+        // 是否省略、是否弹全文浮层一律由 egui 的 galley.elided 判定。
     }
 
     #[test]
     fn r81_详情行预算守恒且窄容器不溢出() {
         for (row_w, label_w, gap) in [(520.0, 50.0, 6.0), (320.0, 75.0, 8.0)] {
-            let (value_w, _) = kv_row_budget(row_w, label_w, gap, 0.0);
+            let value_w = kv_value_width(row_w, label_w, gap);
             assert!(value_w >= 0.0);
             assert!(
                 (value_w + label_w + gap - row_w).abs() < 1e-3,
                 "标签 + 间距 + 值区必须恰好等于行宽，不得挤出额外宽度"
             );
         }
-        let (narrow, need_hover) = kv_row_budget(20.0, 50.0, 6.0, 100.0);
-        assert_eq!(narrow, 0.0, "容器比标签还窄时不得产生负宽度");
-        assert!(need_hover);
+        assert_eq!(
+            kv_value_width(20.0, 50.0, 6.0),
+            0.0,
+            "容器比标签还窄时不得产生负宽度"
+        );
     }
 
     #[test]
-    fn r81_恰好放得下不触发悬停() {
-        let (value_w, need_hover) = kv_row_budget(520.0, 50.0, 6.0, 464.0);
-        assert_eq!(value_w, 464.0);
-        assert!(!need_hover, "边界相等不应误报截断");
+    fn r82_容器变宽时值区同比变宽() {
+        let base = kv_value_width(400.0, 50.0, 6.0);
+        let wider = kv_value_width(520.0, 50.0, 6.0);
+        assert_eq!(wider - base, 120.0);
+        // 同一容器下换更长的标签，值区相应收窄，仍与值文本无关。
+        assert_eq!(kv_value_width(520.0, 75.0, 6.0), wider - 25.0);
     }
 
     fn 样例() -> Vec<String> {
