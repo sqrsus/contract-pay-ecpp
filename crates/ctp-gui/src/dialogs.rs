@@ -1718,6 +1718,184 @@ fn form_card(p: &Palette) -> egui::Frame {
         .inner_margin(egui::Margin::same(12.0))
 }
 
+// ---------------------------------------------------------------- 新建合同 · 回车导航（R-80）
+
+/// 第一步的回车跳转链，按**业务分组**排序（用户 2026-11-12 确认）：
+/// 合同主体 6 项 → 价款与条款的单行部分 4 项 → 招标与工期 5 项，共 15 项，末项回到首项。
+///
+/// 只收「可直接键入的单行文本框」：普通文本框、联想框、日期框都算；
+/// 下拉（招标方式 / 合同类型 / 合同类别 / 计价方式）、复选框、按钮，
+/// 以及「付款条款」「备注」两个多行文本框**不参与**——多行回车仍是换行。
+/// 每项 key 同时用作联想 / 日历弹层的 id 前缀，回车跳走时据此收起浮层。
+const NC_ENTER_ORDER: &[&str] = &[
+    // 合同主体
+    "name",
+    "party_a",
+    "project",
+    "contractor",
+    "project_leader",
+    "contact_info",
+    // 价款与条款（单行部分）
+    "sign_date",
+    "amount",
+    "retention",
+    "delivery_date",
+    // 招标与工期
+    "open_bid_date",
+    "bid_agent",
+    "duration",
+    "planned_start",
+    "planned_end",
+];
+
+/// 跳转链控件的具名 id；加前缀避免与其它弹窗里同名控件的 id 撞车。
+fn nc_field_id(key: &str) -> egui::Id {
+    egui::Id::new(("nc_enter_nav", key))
+}
+
+/// 纯函数：链内某一项的下一项；末项回到首项，链外控件返回 `None`（回车保持原行为）。
+fn nc_next_key(cur: &str) -> Option<&'static str> {
+    let i = NC_ENTER_ORDER.iter().position(|k| *k == cur)?;
+    Some(NC_ENTER_ORDER[(i + 1) % NC_ENTER_ORDER.len()])
+}
+
+/// 每帧末调用：本帧按了回车且焦点原本在链内某项，就把焦点交给下一项。
+/// `focused_at_start` 必须是**绘制前**读到的焦点——单行文本框吃到回车会立刻交出焦点，
+/// 若等到绘制后再读就已是 `None`，这正是此处要先存一份的原因。
+fn nc_enter_nav(ctx: &egui::Context, focused_at_start: Option<egui::Id>) {
+    if !ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        return;
+    }
+    let Some(focused) = focused_at_start else {
+        return;
+    };
+    let Some(key) = NC_ENTER_ORDER
+        .iter()
+        .copied()
+        .find(|k| nc_field_id(k) == focused)
+    else {
+        return;
+    };
+    let Some(next) = nc_next_key(key) else {
+        return;
+    };
+    ctx.memory_mut(|m| {
+        // 跳走后旧字段的候选浮层 / 月历不能继续挂在原位置
+        m.data.insert_temp(egui::Id::new((key, "ac_open")), false);
+        m.data.insert_temp(egui::Id::new((key, "dt_open")), false);
+        m.request_focus(nc_field_id(next));
+    });
+}
+
+/// 外形与 `field` 完全一致，只多一个具名 id 供回车跳转链定位。
+fn nc_field(ui: &mut egui::Ui, p: &Palette, label: &str, w: f32, value: &mut String, key: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        ui.add_sized(
+            [w, FIELD_H],
+            egui::TextEdit::singleline(value)
+                .id(nc_field_id(key))
+                .margin(egui::Margin::symmetric(8.0, 4.0)),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nc_ac_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    key: &str,
+    text: &mut String,
+    hints: &[String],
+    hint_text: &str,
+    w: f32,
+    mode: widgets::SuggestMode,
+) -> Option<String> {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        widgets::autocomplete_nav(
+            ui,
+            key,
+            p,
+            text,
+            hints,
+            w,
+            hint_text,
+            mode,
+            nc_field_id(key),
+        )
+    })
+    .inner
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nc_ac_field_pick(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    key: &str,
+    text: &mut String,
+    hints: &[String],
+    hint_text: &str,
+    w: f32,
+    mode: widgets::SuggestMode,
+    pick: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        widgets::autocomplete_pick_nav(
+            ui,
+            key,
+            p,
+            text,
+            hints,
+            w,
+            hint_text,
+            mode,
+            pick,
+            nc_field_id(key),
+        )
+    })
+    .inner
+}
+
+fn nc_date_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    key: &str,
+    w: f32,
+    value: &mut String,
+) {
+    let _ = nc_date_field_note(ui, p, label, key, w, value, None);
+}
+
+/// 与 `date_field_note` 同形，返回「本帧用户是否改过该字段」（计划交工手改判定要用）。
+fn nc_date_field_note(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    key: &str,
+    w: f32,
+    value: &mut String,
+    note: Option<&str>,
+) -> bool {
+    let before = value.clone();
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        widgets::field_label(ui, p, label);
+        widgets::date_input_nav(ui, key, p, value, w, nc_field_id(key));
+        if let Some(n) = note {
+            ui.label(RichText::new(n).size(10.5).color(p.text_muted));
+        }
+    });
+    *value != before
+}
+
 fn new_contract(app: &mut App, ctx: &egui::Context) {
     let p = app.pal;
 
@@ -1771,6 +1949,10 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
         && is_iso_date(&app.new_contract.sign_date)
         && !app.new_contract.terms.trim().is_empty();
 
+    // R-80：绘制前的焦点快照。单行文本框吃到回车会当帧交出焦点，
+    // 回车导航必须靠这份快照判断「是从哪个框按下回车」。
+    let focused_at_start = ctx.memory(|m| m.focused());
+
     let step = app.new_contract.step;
     let activate = app.new_contract.activate;
     let has_contract_copy = app.new_contract.has_contract_copy();
@@ -1819,14 +2001,14 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                 .num_columns(2)
                                 .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
-                                    field(ui, &p, "* 合同名称", 218.0, &mut app.new_contract.name);
-                                    ac_field(ui, &p, "* 发包人（甲方）", "party_a", &mut app.new_contract.party_a, &owner_hints, "输入名称，可从已有业主中联想", 218.0, widgets::SuggestMode::ShowAllOnEmpty);
+                                    nc_field(ui, &p, "* 合同名称", 218.0, &mut app.new_contract.name, "name");
+                                    nc_ac_field(ui, &p, "* 发包人（甲方）", "party_a", &mut app.new_contract.party_a, &owner_hints, "输入名称，可从已有业主中联想", 218.0, widgets::SuggestMode::ShowAllOnEmpty);
                                     ui.end_row();
-                                    ac_field_pick(ui, &p, "* 所属项目", "project", &mut app.new_contract.project_text, &project_hints, "输入编码或名称后联想", 218.0, widgets::SuggestMode::TypedOnly, &|s| pick_project_name(&project_src, s));
-                                    ac_field(ui, &p, "* 承包单位", "contractor", &mut app.new_contract.contractor_text, &unit_hints, "输入名称后联想已有单位", 218.0, widgets::SuggestMode::TypedOnly);
+                                    nc_ac_field_pick(ui, &p, "* 所属项目", "project", &mut app.new_contract.project_text, &project_hints, "输入编码或名称后联想", 218.0, widgets::SuggestMode::TypedOnly, &|s| pick_project_name(&project_src, s));
+                                    nc_ac_field(ui, &p, "* 承包单位", "contractor", &mut app.new_contract.contractor_text, &unit_hints, "输入名称后联想已有单位", 218.0, widgets::SuggestMode::TypedOnly);
                                     ui.end_row();
-                                    field(ui, &p, "项目负责人", 218.0, &mut app.new_contract.project_leader);
-                                    field(ui, &p, "联系方式", 218.0, &mut app.new_contract.contact_info);
+                                    nc_field(ui, &p, "项目负责人", 218.0, &mut app.new_contract.project_leader, "project_leader");
+                                    nc_field(ui, &p, "联系方式", 218.0, &mut app.new_contract.contact_info, "contact_info");
                                     ui.end_row();
                                 });
                         });
@@ -1848,12 +2030,12 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                         ];
                                         combo(ui, "bid_method", 218.0, app.new_contract.bid_method_idx, bid_labels, &mut app.new_contract.bid_method_idx);
                                     });
-                                    date_field(ui, &p, "开标时间", "open_bid_date", 218.0, &mut app.new_contract.open_bid_date);
+                                    nc_date_field(ui, &p, "开标时间", "open_bid_date", 218.0, &mut app.new_contract.open_bid_date);
                                     ui.end_row();
-                                    ac_field(ui, &p, "招标代理", "bid_agent", &mut app.new_contract.bid_agent_text, &agent_hints, "输入名称后联想；新名称自动建档", 218.0, widgets::SuggestMode::TypedOnly);
-                                    field(ui, &p, "工期（日历天）", 218.0, &mut app.new_contract.duration);
+                                    nc_ac_field(ui, &p, "招标代理", "bid_agent", &mut app.new_contract.bid_agent_text, &agent_hints, "输入名称后联想；新名称自动建档", 218.0, widgets::SuggestMode::TypedOnly);
+                                    nc_field(ui, &p, "工期（日历天）", 218.0, &mut app.new_contract.duration, "duration");
                                     ui.end_row();
-                                    date_field(ui, &p, "计划开工", "planned_start", 218.0, &mut app.new_contract.planned_start);
+                                    nc_date_field(ui, &p, "计划开工", "planned_start", 218.0, &mut app.new_contract.planned_start);
                                     // R-50：工期与开工日都有效时，自动算「计划交工」（含开工当日）。
                                     // 用户手改过就不再覆盖，只在字段下方提示。
                                     auto_planned_end(
@@ -1868,7 +2050,7 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                     );
                                     let show_note =
                                         app.new_contract.planned_end_dirty && end_manual;
-                                    let end_changed = date_field_note(
+                                    let end_changed = nc_date_field_note(
                                         ui,
                                         &p,
                                         "计划交工",
@@ -1911,17 +2093,17 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                                         combo(ui, "category", 218.0, app.new_contract.category_idx, labels, &mut app.new_contract.category_idx);
                                     });
                                     ui.end_row();
-                                    date_field(ui, &p, "* 签订日期", "sign_date", 218.0, &mut app.new_contract.sign_date);
-                                    field(ui, &p, "* 合同金额（元）", 218.0, &mut app.new_contract.amount);
+                                    nc_date_field(ui, &p, "* 签订日期", "sign_date", 218.0, &mut app.new_contract.sign_date);
+                                    nc_field(ui, &p, "* 合同金额（元）", 218.0, &mut app.new_contract.amount, "amount");
                                     ui.end_row();
                                     ui.vertical(|ui| {
                                         widgets::field_label(ui, &p, "计价方式");
                                         let labels: Vec<String> = PRICING.iter().map(|x| x.to_string()).collect();
                                         combo(ui, "pricing", 218.0, app.new_contract.pricing_idx, labels, &mut app.new_contract.pricing_idx);
                                     });
-                                    field(ui, &p, "质保金率 %", 218.0, &mut app.new_contract.retention);
+                                    nc_field(ui, &p, "质保金率 %", 218.0, &mut app.new_contract.retention, "retention");
                                     ui.end_row();
-                                    date_field(ui, &p, "交工日期", "delivery_date", 218.0, &mut app.new_contract.delivery_date);
+                                    nc_date_field(ui, &p, "交工日期", "delivery_date", 218.0, &mut app.new_contract.delivery_date);
                                     ui.label("");
                                     ui.end_row();
                                 });
@@ -2079,6 +2261,12 @@ fn new_contract(app: &mut App, ctx: &egui::Context) {
                 });
             }
         });
+
+    // R-80：回车导航只在第一步生效；第二步附件页没有文本输入框，回车保持原行为。
+    // 本帧若点了「下一步 / 取消」，表单即将切页或关闭，不再抢焦点。
+    if step == 0 && !next && !cancel {
+        nc_enter_nav(ctx, focused_at_start);
+    }
 
     // ---------------- 交互落地
     if cancel {
@@ -4266,6 +4454,115 @@ mod r70_number_input_tests {
         assert!(number_input_error("10", "NaN")
             .unwrap()
             .contains("质保金比例"));
+    }
+}
+
+/// R-80 回归：新建合同第一步回车跳转链的顺序、闭环与链外排除。
+/// 纯函数测试，不依赖 egui 上下文，也不需要模拟键盘事件。
+#[cfg(test)]
+mod r80_enter_nav_tests {
+    use super::{nc_next_key, NC_ENTER_ORDER};
+    use eframe::egui;
+
+    #[test]
+    fn 顺序为业务分组且末项回到首项() {
+        assert_eq!(NC_ENTER_ORDER.len(), 15);
+        assert_eq!(NC_ENTER_ORDER[0], "name");
+        assert_eq!(NC_ENTER_ORDER[5], "contact_info");
+        assert_eq!(NC_ENTER_ORDER[6], "sign_date");
+        assert_eq!(NC_ENTER_ORDER[9], "delivery_date");
+        assert_eq!(NC_ENTER_ORDER[10], "open_bid_date");
+        assert_eq!(NC_ENTER_ORDER[14], "planned_end");
+        assert_eq!(nc_next_key("name"), Some("party_a"));
+        assert_eq!(nc_next_key("contact_info"), Some("sign_date"));
+        assert_eq!(nc_next_key("delivery_date"), Some("open_bid_date"));
+        assert_eq!(nc_next_key("planned_end"), Some("name"));
+    }
+
+    #[test]
+    fn 链外控件不参与且链内无重复() {
+        for k in [
+            "terms",
+            "remark",
+            "bid_method",
+            "ctype",
+            "category",
+            "pricing",
+            "activate",
+        ] {
+            assert_eq!(nc_next_key(k), None, "{k} 不应进入跳转链");
+        }
+        let mut keys = NC_ENTER_ORDER.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), NC_ENTER_ORDER.len(), "跳转链不能有重复项");
+        for (i, k) in NC_ENTER_ORDER.iter().enumerate() {
+            assert_eq!(
+                nc_next_key(k),
+                Some(NC_ENTER_ORDER[(i + 1) % NC_ENTER_ORDER.len()])
+            );
+        }
+    }
+
+    fn enter_input() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn 回车把焦点交给下一项末项回首项并收起弹层() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(enter_input(), |ctx| {
+            super::nc_enter_nav(ctx, Some(super::nc_field_id("name")));
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(super::nc_field_id("party_a"))
+            );
+            // 联想框 / 日历浮层的展开标记被清成 false
+            assert_eq!(
+                ctx.memory(|m| { m.data.get_temp::<bool>(egui::Id::new(("name", "ac_open"))) }),
+                Some(false)
+            );
+
+            super::nc_enter_nav(ctx, Some(super::nc_field_id("planned_end")));
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(super::nc_field_id("name")),
+                "末项回车应回到第一项"
+            );
+        });
+    }
+
+    #[test]
+    fn 无回车或焦点在链外时不抢焦点() {
+        // 没按回车：焦点原地不动
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.memory_mut(|m| m.request_focus(super::nc_field_id("name")));
+            super::nc_enter_nav(ctx, Some(super::nc_field_id("name")));
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(super::nc_field_id("name"))
+            );
+        });
+
+        // 焦点在多行框 / 下拉等链外控件：回车不触发跳转
+        let ctx = egui::Context::default();
+        let _ = ctx.run(enter_input(), |ctx| {
+            let outside = egui::Id::new("some_combo_box");
+            super::nc_enter_nav(ctx, Some(outside));
+            assert_eq!(ctx.memory(|m| m.focused()), None);
+            super::nc_enter_nav(ctx, None);
+            assert_eq!(ctx.memory(|m| m.focused()), None);
+        });
     }
 }
 

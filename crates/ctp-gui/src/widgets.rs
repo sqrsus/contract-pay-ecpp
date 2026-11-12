@@ -488,7 +488,7 @@ pub fn autocomplete_full(
     hint: &str,
     mode: SuggestMode,
 ) -> AcOutcome {
-    autocomplete_impl(ui, id, p, text, candidates, width, hint, mode, None)
+    autocomplete_impl(ui, id, p, text, candidates, width, hint, mode, None, None)
 }
 
 /// 同 `autocomplete`，但点选后写入的是 `pick(候选)` 的结果。
@@ -507,10 +507,81 @@ pub fn autocomplete_pick(
     mode: SuggestMode,
     pick: &dyn Fn(&str) -> String,
 ) -> Option<String> {
-    autocomplete_impl(ui, id, p, text, candidates, width, hint, mode, Some(pick)).picked
+    autocomplete_impl(
+        ui,
+        id,
+        p,
+        text,
+        candidates,
+        width,
+        hint,
+        mode,
+        Some(pick),
+        None,
+    )
+    .picked
 }
 
-// 内部实现：多一个可选的「回填值换算」，其余入参与公开入口一一对应。
+/// 同 `autocomplete`，另给文本框挂上具名 id（新建合同第一步的回车跳转链用）。
+/// 不传 id 的普通调用点行为完全不变。
+#[allow(clippy::too_many_arguments)]
+pub fn autocomplete_nav(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    candidates: &[String],
+    width: f32,
+    hint: &str,
+    mode: SuggestMode,
+    nav_id: egui::Id,
+) -> Option<String> {
+    autocomplete_impl(
+        ui,
+        id,
+        p,
+        text,
+        candidates,
+        width,
+        hint,
+        mode,
+        None,
+        Some(nav_id),
+    )
+    .picked
+}
+
+/// 同 `autocomplete_pick`，另给文本框挂上具名 id。
+#[allow(clippy::too_many_arguments)]
+pub fn autocomplete_pick_nav(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    candidates: &[String],
+    width: f32,
+    hint: &str,
+    mode: SuggestMode,
+    pick: &dyn Fn(&str) -> String,
+    nav_id: egui::Id,
+) -> Option<String> {
+    autocomplete_impl(
+        ui,
+        id,
+        p,
+        text,
+        candidates,
+        width,
+        hint,
+        mode,
+        Some(pick),
+        Some(nav_id),
+    )
+    .picked
+}
+
+// 内部实现：多两个可选参数（「回填值换算」与「回车导航用 id」），
+// 其余入参与公开入口一一对应。
 #[allow(clippy::too_many_arguments)]
 fn autocomplete_impl(
     ui: &mut Ui,
@@ -522,13 +593,15 @@ fn autocomplete_impl(
     hint: &str,
     mode: SuggestMode,
     pick: Option<&dyn Fn(&str) -> String>,
+    nav_id: Option<egui::Id>,
 ) -> AcOutcome {
-    let resp = ui.add_sized(
-        [width, 26.0],
-        egui::TextEdit::singleline(text)
-            .hint_text(RichText::new(hint).size(12.0).color(p.text_muted))
-            .margin(Margin::symmetric(8.0, 4.0)),
-    );
+    let te = egui::TextEdit::singleline(text)
+        .hint_text(RichText::new(hint).size(12.0).color(p.text_muted))
+        .margin(Margin::symmetric(8.0, 4.0));
+    let resp = match nav_id {
+        Some(nid) => ui.add_sized([width, 26.0], te.id(nid)),
+        None => ui.add_sized([width, 26.0], te),
+    };
 
     // 弹层显隐不能只看 `has_focus`：鼠标按在候选上时输入框会先失去焦点，
     // 若此时提前 return，候选列表当帧不再绘制，这次点击就永远丢失。
@@ -1143,12 +1216,37 @@ fn contract_row(
 /// 与联想框同理，弹层用 memory 维持——点日历格子时输入框会先失焦，
 /// 若依赖 `has_focus` 就会当帧收起、点击丢失。
 pub fn date_input(ui: &mut Ui, id: &str, p: &Palette, text: &mut String, width: f32) {
-    let resp = ui.add_sized(
-        [width, 26.0],
-        egui::TextEdit::singleline(text)
-            .hint_text(RichText::new("YYYY-MM-DD").size(12.0).color(p.text_muted))
-            .margin(Margin::symmetric(8.0, 4.0)),
-    );
+    date_input_impl(ui, id, p, text, width, None);
+}
+
+/// 同 `date_input`，另给文本框挂上具名 id（新建合同第一步的回车跳转链用）。
+/// 日历弹层、`changed()` 收起、点击回填等原有逻辑一律不变。
+pub fn date_input_nav(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    width: f32,
+    nav_id: egui::Id,
+) {
+    date_input_impl(ui, id, p, text, width, Some(nav_id));
+}
+
+fn date_input_impl(
+    ui: &mut Ui,
+    id: &str,
+    p: &Palette,
+    text: &mut String,
+    width: f32,
+    nav_id: Option<egui::Id>,
+) {
+    let te = egui::TextEdit::singleline(text)
+        .hint_text(RichText::new("YYYY-MM-DD").size(12.0).color(p.text_muted))
+        .margin(Margin::symmetric(8.0, 4.0));
+    let resp = match nav_id {
+        Some(nid) => ui.add_sized([width, 26.0], te.id(nid)),
+        None => ui.add_sized([width, 26.0], te),
+    };
 
     let open_id = egui::Id::new((id, "dt_open"));
     let rect_id = egui::Id::new((id, "dt_rect"));
