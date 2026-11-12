@@ -3393,6 +3393,10 @@ fn payment_detail(app: &mut App, ctx: &egui::Context) {
 
     modal(format!("拨款单 {}", pm.payment_no), &p)
         .default_width(560.0)
+        // R-81：窗口宽度钉死，任何长度的合同名称都不能把它撑出屏幕。
+        // 内部 ui.set_width(520.0) + 左右各 20 px 内边距 = 560，两个数值须同步。
+        .min_width(560.0)
+        .max_width(560.0)
         .show(ctx, |ui| {
             ui.set_width(520.0);
             ui.horizontal(|ui| {

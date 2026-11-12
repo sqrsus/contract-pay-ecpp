@@ -365,12 +365,38 @@ pub fn field_label(ui: &mut Ui, p: &Palette, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(p.text_muted));
 }
 
+/// 详情行的宽度预算：返回 `(值区宽度, 是否需要悬停全文)`。
+///
+/// R-81：值区宽度只由容器、标签文字与控件间距决定，**与值文本长度无关**；
+/// `value_text_w` 仅用于判断是否被截断。抽成纯函数便于单测锁定这条不变量。
+fn kv_row_budget(row_w: f32, label_w: f32, gap: f32, value_text_w: f32) -> (f32, bool) {
+    let value_w = (row_w - label_w - gap).max(0.0);
+    (value_w, value_text_w > value_w)
+}
+
 /// 一行「标签 — 值」，用于详情面板。
+///
+/// R-81：值区按剩余宽度定宽并单行截断，截断时悬停显示完整文本。
+/// 旧实现里两个 Label 都按内容自然宽度排版，超长合同名称会把整行、
+/// 进而把不可缩放的弹窗撑出屏幕，导致左侧标签首字被裁切。
 pub fn kv(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
+    let row_w = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let label_w = crate::text_width(ui, label, 12.5);
+    let value_text_w = crate::text_width(ui, value, 13.0);
+    let (value_w, need_hover) = kv_row_budget(row_w, label_w, gap, value_text_w);
     ui.horizontal(|ui| {
+        // 钉死整行宽度：horizontal 默认按内容推进光标，不钉宽就会被长文本带跑。
+        ui.set_width(row_w);
         ui.label(RichText::new(label).size(12.5).color(p.text_muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).size(13.0).color(p.text));
+            // 值区同样钉宽，Label::truncate 才有确定的裁切边界。
+            ui.set_width(value_w);
+            let resp =
+                ui.add(egui::Label::new(RichText::new(value).size(13.0).color(p.text)).truncate());
+            if need_hover {
+                let _ = resp.on_hover_text(value);
+            }
         });
     });
 }
@@ -1513,6 +1539,38 @@ pub fn total_rule(ui: &Ui, p: &Palette, left: f32, right: f32, y: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r81_详情行宽度不随值文本变长() {
+        let (short_w, short_hover) = kv_row_budget(520.0, 50.0, 6.0, 30.0);
+        let (long_w, long_hover) = kv_row_budget(520.0, 50.0, 6.0, 9_999.0);
+        assert_eq!(short_w, long_w, "值区宽度只认容器，不认文本长度");
+        assert_eq!(short_w, 464.0);
+        assert!(!short_hover, "短值无需悬停");
+        assert!(long_hover, "超长值必须能悬停看全文");
+    }
+
+    #[test]
+    fn r81_详情行预算守恒且窄容器不溢出() {
+        for (row_w, label_w, gap) in [(520.0, 50.0, 6.0), (320.0, 75.0, 8.0)] {
+            let (value_w, _) = kv_row_budget(row_w, label_w, gap, 0.0);
+            assert!(value_w >= 0.0);
+            assert!(
+                (value_w + label_w + gap - row_w).abs() < 1e-3,
+                "标签 + 间距 + 值区必须恰好等于行宽，不得挤出额外宽度"
+            );
+        }
+        let (narrow, need_hover) = kv_row_budget(20.0, 50.0, 6.0, 100.0);
+        assert_eq!(narrow, 0.0, "容器比标签还窄时不得产生负宽度");
+        assert!(need_hover);
+    }
+
+    #[test]
+    fn r81_恰好放得下不触发悬停() {
+        let (value_w, need_hover) = kv_row_budget(520.0, 50.0, 6.0, 464.0);
+        assert_eq!(value_w, 464.0);
+        assert!(!need_hover, "边界相等不应误报截断");
+    }
 
     fn 样例() -> Vec<String> {
         vec![
