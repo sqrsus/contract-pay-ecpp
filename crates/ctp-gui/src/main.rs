@@ -259,6 +259,8 @@ pub struct App {
     pub new_contract: ContractForm,
     /// 合同详情只读弹窗（点击合同编号）
     pub modal_contract: Option<Contract>,
+    /// 详情弹窗对应合同的附件数量：决定「打包下载」是否可用（R-83）
+    pub detail_attachment_count: usize,
     pub audit_form: AuditForm,
     /// 审计价表单当前对应的合同 id（R-67）。弹窗打开期间用户仍可点下面的行切换焦点，
     /// 记住它才能保证「回填的是谁、提交就写给谁」，不会把 A 的审定信息写到 B 上。
@@ -441,6 +443,7 @@ impl App {
             new_contract: ContractForm::default(),
             new_contract_flash: None,
             modal_contract: None,
+            detail_attachment_count: 0,
             audit_form: AuditForm::default(),
             audit_target: None,
             delivery_form: String::new(),
@@ -817,6 +820,14 @@ impl App {
             .db
             .as_ref()
             .and_then(|c| repo::get_contract(c, id).ok());
+        // R-83：同时取附件数量，供「打包下载」按钮判断是否有可打包内容。
+        // 只读查询；拿不到就按 0 处理，按钮置灰而不是打开空包。
+        self.detail_attachment_count = self
+            .db
+            .as_ref()
+            .and_then(|c| repo::attachment_count(c, id).ok())
+            .unwrap_or(0)
+            .max(0) as usize;
         self.dialog = Dialog::ContractDetail;
     }
 

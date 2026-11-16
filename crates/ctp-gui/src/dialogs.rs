@@ -6,6 +6,7 @@
 use crate::theme::Palette;
 use crate::widgets::{self, Tone};
 use crate::App;
+use ctp_app::attachment_zip::{self, ZipEntry};
 use ctp_app::report::{ReportColumnError, ReportResult};
 use ctp_app::service::{self, EditContract, NewContract, NewPayment};
 use ctp_core::attachment::{Attachment, AttachmentKind};
@@ -3749,6 +3750,8 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
 
     let mut close = false;
     let mut material: Option<AttachmentKind> = None;
+    let mut pack_download = false;
+    let has_attachments = app.detail_attachment_count > 0;
 
     modal(format!("合同详情 · {}", c.contract_no), &p)
         .default_width(960.0)
@@ -3951,6 +3954,14 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
                         material = Some(kind);
                     }
                 }
+                // R-83：四类附件之后新增「打包下载」。无附件时置灰并说明原因，
+                // 不弹空包；有附件时才进入打包流程。
+                let pack_resp = widgets::ghost_button_sm_on(ui, &p, "打包下载", has_attachments);
+                if !has_attachments {
+                    pack_resp.on_hover_text("当前合同尚未上传附件，无法打包");
+                } else if pack_resp.clicked() {
+                    pack_download = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if widgets::primary_button(ui, &p, "关闭", true).clicked() {
                         close = true;
@@ -3963,6 +3974,51 @@ fn contract_detail(app: &mut App, ctx: &egui::Context) {
         app.dialog = Dialog::None;
         app.modal_contract = None;
         return;
+    }
+
+    // R-83：打包下载。先把全部附件字节读进内存并生成 ZIP；只有打包成功后
+    // 才弹「另存为」并写盘，失败时页面提示且不产生半成品文件。
+    if pack_download {
+        let cid = c.id.clone();
+        let got = app.read(move |conn| {
+            let list = repo::list_attachments(conn, &cid)?;
+            let mut entries = Vec::with_capacity(list.len());
+            for a in list {
+                let bytes = service::attachment_bytes(conn, &a.id)?;
+                let category = AttachmentKind::from_code(&a.kind_code)
+                    .map(|k| k.label())
+                    .unwrap_or("其他");
+                entries.push(ZipEntry {
+                    category,
+                    file_name: a.file_name,
+                    bytes,
+                });
+            }
+            Ok(entries)
+        });
+        match got {
+            Ok(entries) => match attachment_zip::pack_entries(&entries) {
+                Ok(bytes) => {
+                    let default_name = attachment_zip::zip_file_name(&c.contract_no);
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(&default_name)
+                        .add_filter("ZIP 压缩包", &["zip"])
+                        .save_file()
+                    {
+                        match std::fs::write(&path, &bytes) {
+                            Ok(()) => app.success(format!(
+                                "已打包 {} 个附件：{}",
+                                entries.len(),
+                                path.display()
+                            )),
+                            Err(e) => app.error(format!("写入 ZIP 失败：{e}")),
+                        }
+                    }
+                }
+                Err(e) => app.error(format!("打包失败：{e}")),
+            },
+            Err(e) => app.error(format!("读取附件失败：{e}")),
+        }
     }
 
     if let Some(kind) = material {

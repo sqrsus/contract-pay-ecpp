@@ -14,6 +14,8 @@ serde_json.workspace = true
 # 打印不走模板填充，见 print.rs / paper.rs 与文档 ADR-06 / R-28。
 rust_xlsxwriter = "0.102"
 calamine = { version = "0.38.0", default-features = false }
+# 合同附件打包下载：zip 9.3 已在 workspace 锁文件中，仅启用 deflate（避免引入加密/多余压缩格式）
+zip = { version = "9.3", default-features = false, features = ["deflate"] }
 
 # 打印：只用 Windows 自带 GDI + 通用打印对话框，不依赖 Word / Edge。
 # StartDocW / StartPage / EndPage / EndDoc / DOCINFOW 在 Storage::Xps 下（gdi32 导出）。

@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "ctp-app"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "calamine",
  "ctp-core",
@@ -833,18 +833,19 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "windows-sys 0.59.0",
+ "zip",
 ]
 
 [[package]]
 name = "ctp-core"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "ctp-gui"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "ctp-app",
  "ctp-core",
@@ -858,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "ctp-store"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "ctp-core",
  "rusqlite",
