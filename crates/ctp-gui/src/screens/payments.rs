@@ -873,16 +873,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     if import_tpl && app.require_write() {
-        // R-39：导入仍是同步执行（本轮不做线程化），但先置「处理中」状态挡住重复提交，
-        // 真正的文件读取放到下一帧，让用户至少能看到一次明确的处理中反馈。
-        if app.busy.is_some() {
-            app.toast(Tone::Neutral, "正在处理上一次导入，请稍候");
-        } else if let Some(path) = rfd::FileDialog::new()
+        // 导入已改为后台任务：这里只选文件并登记，进度与结果由主界面统一展示。
+        if let Some(path) = rfd::FileDialog::new()
             .add_filter("Excel 工作簿", &["xlsx"])
             .pick_file()
         {
-            app.pending_import = Some((crate::BatchImport::Payments, path));
-            app.busy = Some(crate::BatchImport::Payments.busy_text().to_string());
+            app.start_import(crate::BatchImport::Payments, path);
         }
     }
 

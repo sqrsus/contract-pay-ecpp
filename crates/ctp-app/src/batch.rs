@@ -352,6 +352,22 @@ fn cell_pay_method(row: &[calamine::Data], col: usize) -> std::result::Result<Pa
 /// 返回 `Err` 表示整份文件不可用（读不出、缺校验表、标记不符）；
 /// 行级问题放在 `ImportReport::failures` 里，不影响其他行。
 pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<ImportReport> {
+    import_with_progress(conn, path, operator, |_, _| {})
+}
+
+/// 与 `import` 同口径，但在逐行处理时回报进度，供 GUI 后台任务刷新遮罩。
+///
+/// `progress(done, total)` 只用于展示：行级失败、跳过、重复仍由 `ImportReport` 统计，
+/// 回调不参与校验也不影响写入。总量按 Excel 可见的数据行数计算（不含表头）。
+pub fn import_with_progress<F>(
+    conn: &mut Connection,
+    path: &Path,
+    operator: &str,
+    mut progress: F,
+) -> Result<ImportReport>
+where
+    F: FnMut(usize, usize),
+{
     use calamine::Reader;
 
     // R-39：先把文件大小与行数挡在解压之前/之初，避免超大表把 UI 帧卡死
@@ -446,11 +462,18 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
     // 若前几行是空的（用户把表头删了），calamine 的 Range 会从第一个有值的行开始，
     // 相对序号就会把数据行当成表头跳掉。
     let start_row = range.start().map(|(r, _)| r as usize).unwrap_or(0);
+    let total_rows = range
+        .height()
+        .saturating_sub(FIRST_DATA_ROW.saturating_sub(start_row))
+        .max(1);
+    let mut seen = 0usize;
     for (i, row) in range.rows().enumerate() {
         let abs = start_row + i;
         if abs < FIRST_DATA_ROW {
             continue;
         }
+        seen += 1;
+        progress(seen.min(total_rows), total_rows);
         let line = abs + 1; // Excel 可见行号（从 1 起）
                             // 未填或填 0「本次金额」= 本行不导入、不算失败。模板会把全部合同预填一遍，
                             // 用户只填其中几行是正常用法。
@@ -646,6 +669,25 @@ mod tests {
         assert_eq!(report.imported, 0, "没填本次金额就不该写入");
         assert!(report.skipped > 0, "空金额行应计入跳过");
         assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn 进度回调覆盖全部数据行() {
+        let mut conn = conn_with_fixture();
+        let rows = fixture_rows(&conn);
+        let path = temp_path("progress");
+        write_template(&rows, &path, "x").unwrap();
+
+        let mut seen = Vec::new();
+        let report = import_with_progress(&mut conn, &path, "t", |done, total| {
+            seen.push((done, total));
+        })
+        .unwrap();
+        assert_eq!(seen.len(), rows.len(), "每个数据行都应回报一次进度");
+        assert_eq!(seen.last().copied(), Some((rows.len(), rows.len())));
+        assert!(seen.iter().all(|(_, total)| *total == rows.len()));
+        assert_eq!(report.imported, 0, "空白模板不应写入拨款");
         let _ = std::fs::remove_file(&path);
     }
 

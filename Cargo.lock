@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "ctp-app"
-version = "0.5.13"
+version = "0.6.0"
 dependencies = [
  "calamine",
  "ctp-core",
@@ -838,14 +838,14 @@ dependencies = [
 
 [[package]]
 name = "ctp-core"
-version = "0.5.13"
+version = "0.6.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "ctp-gui"
-version = "0.5.13"
+version = "0.6.0"
 dependencies = [
  "ctp-app",
  "ctp-core",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "ctp-store"
-version = "0.5.13"
+version = "0.6.0"
 dependencies = [
  "ctp-core",
  "rusqlite",

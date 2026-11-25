@@ -25,6 +25,8 @@ use eframe::egui::{self, Color32, Margin, RichText, Rounding};
 use raw_window_handle::HasWindowHandle;
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use dialogs::{
@@ -136,7 +138,7 @@ pub struct ShotJob {
 /// 批量导入的来源。
 ///
 /// 两条链路共用同一套护栏（隐藏校验表、文件/行数上限、逐行事务、结果弹窗），
-/// 差别只在「读进哪个模块」与文案，所以用同一个待办槽位 + 一个来源标记，
+/// 差别只在「读进哪个模块」与文案，所以用同一个后台任务槽位 + 一个来源标记，
 /// 避免为合同再造一份 `pending_*` 状态与一套弹窗。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchImport {
@@ -164,6 +166,65 @@ impl BatchImport {
     }
 }
 
+/// 后台任务的进度事件。`Done` 必须是最后一条事件，界面据此结束遮罩。
+enum BgEvent {
+    Progress { done: usize, total: usize },
+    Done(BgDone),
+}
+
+/// 后台任务的最终结果。错误一律先转成 `String` 再跨线程传，避免服务层错误类型外泄。
+enum BgDone {
+    Import {
+        kind: BatchImport,
+        result: Result<ctp_app::batch::ImportReport, String>,
+    },
+    Export {
+        title: String,
+        path: PathBuf,
+        result: Result<usize, String>,
+    },
+}
+
+/// 正在执行的后台任务类别，只供遮罩显示文案。
+enum BgJob {
+    Import { kind: BatchImport, path: PathBuf },
+    Export { title: String, path: PathBuf },
+}
+
+impl BgJob {
+    fn label(&self) -> String {
+        match self {
+            BgJob::Import { kind, .. } => kind.busy_text().to_string(),
+            BgJob::Export { title, .. } => format!("正在导出「{title}」…"),
+        }
+    }
+
+    /// 遮罩上显示当前文件名，避免同时有多个任务时用户不知道在处理哪份文件。
+    fn file_name(&self) -> String {
+        let path = match self {
+            BgJob::Import { path, .. } | BgJob::Export { path, .. } => path,
+        };
+        path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
+}
+
+/// 单个后台任务槽位：同时只允许一个导入 / 导出在跑。
+struct BgTask {
+    job: BgJob,
+    rx: mpsc::Receiver<BgEvent>,
+    done: usize,
+    total: usize,
+}
+
+/// 导出任务的数据来源。屏幕已经算好的汇总 / 台账结果直接随任务带走，
+/// 避免工作线程再查一次库导致「屏幕与文件不一致」。
+enum ExportWork {
+    ByKind(ReportKind),
+    Ready(ctp_app::report::ReportResult),
+}
+
 /// 应用状态。
 pub struct App {
     pub mode: ThemeMode,
@@ -179,11 +240,9 @@ pub struct App {
     /// R-39：只读查询失败时保留的一条可见警告；内容不变就不重复刷提示条。
     /// 顶栏上的「重试读取」会清掉它并重新载入全部视图数据。
     pub data_warning: Option<String>,
-    /// R-39：耗时操作的「处理中」状态。批量导入仍是同步的（本轮不做线程化），
-    /// 该状态用于挡住重复提交，并在下一帧真正执行前给出可见反馈。
-    pub busy: Option<String>,
-    /// 上一帧登记的批量导入：（来源, 文件）。来源决定调哪个模块的 `import`。
-    pub pending_import: Option<(BatchImport, std::path::PathBuf)>,
+    /// 导入 / 导出共用的后台任务槽位。`busy` 与 `pending_import` 已由它统一取代：
+    /// 提交时立即 spawn，工作线程独立开库，主线程每帧收进度与结果。
+    bg: Option<BgTask>,
 
     pub summaries: Vec<ContractSummary>,
     pub projects: Vec<Project>,
@@ -401,8 +460,7 @@ impl App {
             db_path: path.to_string_lossy().to_string(),
             init_error: None,
             data_warning: None,
-            busy: None,
-            pending_import: None,
+            bg: None,
             summaries: Vec::new(),
             projects: Vec::new(),
             contractors: Vec::new(),
@@ -1088,8 +1146,9 @@ impl App {
         }
     }
 
-    /// 报表导出：弹保存框 → 写 .xlsx → 落 EXPORT 审计日志。
+    /// 报表导出：弹保存框 → 后台写 .xlsx → 落 EXPORT 审计日志。
     ///
+    /// 保存框仍在 UI 线程；写文件与审计日志挪到后台线程，期间可继续看到进度遮罩。
     /// 屏幕表格与导出读的是同一份 `ReportResult` 构造逻辑（文档 4.4.2）。
     pub fn export_report(&mut self, kind: ReportKind) {
         // 默认文件名仍由 report_of 给出；查询失败时沿用原来的「{报表名}.xlsx」兜底，
@@ -1100,10 +1159,7 @@ impl App {
             .and_then(|conn| ctp_app::service::report_of(conn, kind).ok())
             .map(|r| r.default_file_name())
             .unwrap_or_else(|| format!("{}.xlsx", kind.file_stem()));
-        let op = self.operator();
-        self.save_report(kind.title(), &file_name, |conn, path| {
-            ctp_app::service::export_report(conn, kind, path, op)
-        });
+        self.start_export(kind.title(), &file_name, ExportWork::ByKind(kind));
     }
 
     /// 导出当前汇总结果（区间由界面决定，不能走 `report_of` 的默认区间）。
@@ -1119,43 +1175,63 @@ impl App {
     /// 屏幕与 Excel 读同一个结果对象，不重新查库、不重算合计。
     pub fn export_report_result(&mut self, result: &ctp_app::report::ReportResult) {
         let file_name = result.default_file_name();
-        let op = self.operator();
-        self.save_report(result.title, &file_name, |conn, path| {
-            ctp_app::service::export_result(conn, result, path, op)
-        });
+        self.start_export(result.title, &file_name, ExportWork::Ready(result.clone()));
     }
 
-    /// 所有导出入口共用的「保存框 → 写出 → 成功 / 失败提示」。
+    /// 所有导出入口共用的「保存框 → 后台写出 → 成功 / 失败提示」。
     ///
-    /// 取消保存框用空串静默返回，失败统一走 `导出失败：{e}`，
+    /// 取消保存框静默返回，失败统一走 `导出失败：{e}`，
     /// 成功提示文案保持「已导出「{标题}」{行数} 行 → {路径}」不变。
-    fn save_report(
-        &mut self,
-        title: &str,
-        file_name: &str,
-        write: impl FnOnce(&Connection, &std::path::Path) -> ctp_store::Result<(usize, usize)>,
-    ) {
-        let outcome: Result<(usize, PathBuf), String> = (|| {
-            let path = rfd::FileDialog::new()
-                .set_file_name(file_name)
-                .add_filter("Excel 工作簿", &["xlsx"])
-                .save_file()
-                // 用户取消保存框：用空串标记，不弹错误提示
-                .ok_or_else(String::new)?;
-            // R-70：导出是「只读查看 + 系统留痕」，走专用门面而非裸 db 连接；
-            // 该门面只允许服务层写 sys_audit_log，改业务数据一律走 exec。
-            let (rows, _) = self
-                .export_audit(|conn| write(conn, &path))
-                .map_err(|e| e.to_string())?;
-            Ok((rows, path))
-        })();
-        match outcome {
-            Ok((rows, path)) => {
-                self.success(format!("已导出「{title}」{rows} 行 → {}", path.display()))
-            }
-            Err(e) if e.is_empty() => {}
-            Err(e) => self.error(format!("导出失败：{e}")),
+    fn start_export(&mut self, title: &str, file_name: &str, work: ExportWork) {
+        if self.bg.is_some() {
+            self.toast(Tone::Neutral, "正在处理上一次任务，请稍候");
+            return;
         }
+        if self.role.is_none() {
+            self.error(Self::NO_PERMISSION);
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(file_name)
+            .add_filter("Excel 工作簿", &["xlsx"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let op = self.operator();
+        let db_path = self.db_path.clone();
+        let title_owned = title.to_string();
+        let title_for_result = title_owned.clone();
+        let path_for_job = path.clone();
+        self.spawn_bg(
+            BgJob::Export {
+                title: title_owned,
+                path: path_for_job,
+            },
+            move |_tx| {
+                let result = (|| -> Result<usize, String> {
+                    // 工作线程独立开库：rusqlite::Connection 不是 Send，不能跨线程传。
+                    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
+                    // R-70：导出只读业务表，服务层只会写 sys_audit_log 的 EXPORT 记录。
+                    let (rows, _) = match &work {
+                        ExportWork::ByKind(kind) => {
+                            ctp_app::service::export_report(&conn, *kind, &path, op)
+                        }
+                        ExportWork::Ready(result) => {
+                            ctp_app::service::export_result(&conn, result, &path, op)
+                        }
+                    }
+                    .map_err(|e| e.to_string())?;
+                    Ok(rows)
+                })();
+                BgDone::Export {
+                    title: title_for_result,
+                    path,
+                    result,
+                }
+            },
+        );
     }
 
     /// 合同台账「导出 Excel」：先把当前筛选 / 排序下的完整结果快照进列选择弹窗，
@@ -1188,23 +1264,136 @@ impl App {
         let _ = offer_print_success(&mut self.print_success, view);
     }
 
-    /// 上一帧登记的批量导入，在这一帧真正执行（R-39「处理中」状态的落地）。
-    fn run_pending_import(&mut self, kind: BatchImport, path: &std::path::Path) {
-        // 两条链路返回同一个 `ImportReport`，结果弹窗与失败行提示完全共用
+    /// 启动一个后台任务。槽位唯一：导入与导出共用，避免两路同时写库。
+    fn spawn_bg<F>(&mut self, job: BgJob, work: F) -> bool
+    where
+        F: FnOnce(mpsc::Sender<BgEvent>) -> BgDone + Send + 'static,
+    {
+        if self.bg.is_some() {
+            self.toast(Tone::Neutral, "正在处理上一次任务，请稍候");
+            return false;
+        }
+        let (tx, rx) = mpsc::channel();
+        let work_tx = tx.clone();
+        thread::spawn(move || {
+            let done = work(work_tx);
+            let _ = tx.send(BgEvent::Done(done));
+        });
+        self.bg = Some(BgTask {
+            job,
+            rx,
+            done: 0,
+            total: 0,
+        });
+        true
+    }
+
+    /// 批量导入入口：UI 线程只做权限判断与登记，真正读文件 / 写库在后台线程。
+    pub fn start_import(&mut self, kind: BatchImport, path: PathBuf) -> bool {
+        if !self.can_write() {
+            self.error(Self::NO_PERMISSION);
+            return false;
+        }
         let op = self.operator();
-        let report = match kind {
-            BatchImport::Payments => self.exec(|c| ctp_app::batch::import(c, path, op)),
-            BatchImport::Contracts => self.exec(|c| ctp_app::contract_batch::import(c, path, op)),
-        };
-        let view = match report {
-            Ok(report) => {
-                self.refresh();
-                crate::dialogs::ImportResultView::from_report(&report, kind)
+        let db_path = self.db_path.clone();
+        let job_path = path.clone();
+        self.spawn_bg(
+            BgJob::Import {
+                kind,
+                path: job_path,
+            },
+            move |tx| {
+                let result = (|| -> Result<ctp_app::batch::ImportReport, String> {
+                    // rusqlite::Connection 不是 Send：后台线程按同一路径重新开库。
+                    // db::open 已设置 WAL + busy_timeout，写事务边界仍由服务层决定。
+                    let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+                    let report = match kind {
+                        BatchImport::Payments => ctp_app::batch::import_with_progress(
+                            &mut conn,
+                            &path,
+                            op,
+                            |done, total| {
+                                let _ = tx.send(BgEvent::Progress { done, total });
+                            },
+                        ),
+                        BatchImport::Contracts => ctp_app::contract_batch::import_with_progress(
+                            &mut conn,
+                            &path,
+                            op,
+                            |done, total| {
+                                let _ = tx.send(BgEvent::Progress { done, total });
+                            },
+                        ),
+                    };
+                    report.map_err(|e| e.to_string())
+                })();
+                BgDone::Import { kind, result }
+            },
+        )
+    }
+
+    /// 每帧轮询后台任务：进度只更新遮罩，结果回到 UI 线程再刷新与弹窗。
+    fn pump_bg(&mut self) {
+        let (finished, disconnected) = match self.bg.as_mut() {
+            Some(task) => {
+                let mut finished = None;
+                let mut disconnected = false;
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(BgEvent::Progress { done, total }) => {
+                            task.done = done;
+                            task.total = total;
+                        }
+                        Ok(BgEvent::Done(done)) => {
+                            finished = Some(done);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                (finished, disconnected)
             }
-            Err(e) => crate::dialogs::ImportResultView::rejected(kind, format!("导入失败：{e}")),
+            None => return,
         };
-        self.busy = None;
-        self.show_import_result(view);
+        if let Some(done) = finished {
+            self.bg = None;
+            self.finish_bg(done);
+        } else if disconnected {
+            self.bg = None;
+            self.error("后台任务异常终止，请重试");
+        }
+    }
+
+    /// 后台任务结束后的界面动作：只在这里碰 `App` 状态与缓存。
+    fn finish_bg(&mut self, done: BgDone) {
+        match done {
+            BgDone::Import { kind, result } => {
+                let view = match result {
+                    Ok(report) => {
+                        self.refresh();
+                        crate::dialogs::ImportResultView::from_report(&report, kind)
+                    }
+                    Err(e) => {
+                        crate::dialogs::ImportResultView::rejected(kind, format!("导入失败：{e}"))
+                    }
+                };
+                self.show_import_result(view);
+            }
+            BgDone::Export {
+                title,
+                path,
+                result,
+            } => match result {
+                Ok(rows) => {
+                    self.success(format!("已导出「{title}」{rows} 行 → {}", path.display()))
+                }
+                Err(e) => self.error(format!("导出失败：{e}")),
+            },
+        }
     }
 
     pub fn toast(&mut self, tone: Tone, text: impl Into<String>) {
@@ -1262,6 +1451,7 @@ impl App {
     /// 在数据库上执行一次写操作，随后刷新缓存。
     ///
     /// 写入口统一从这里过，所以「浏览用户不得改数据」只需在这一处拦截；
+    /// 后台导入 / 导出期间也在这里挡住其他写操作，避免第二条连接并发写同库。
     /// 只读操作（如读取附件字节）走 `db.as_ref()`，不受影响。
     pub fn exec<T>(
         &mut self,
@@ -1269,6 +1459,9 @@ impl App {
     ) -> Result<T, String> {
         if !self.can_write() {
             return Err(Self::NO_PERMISSION.to_string());
+        }
+        if self.bg.is_some() {
+            return Err("正在处理导入或导出，请稍候再操作".to_string());
         }
         let conn = self.db.as_mut().ok_or_else(|| "数据库未打开".to_string())?;
         let out = f(conn).map_err(|e| e.to_string())?;
@@ -1818,10 +2011,8 @@ impl eframe::App for App {
         if (self.screen == Screen::Checks || self.screen == Screen::Logs) && !self.can_write() {
             self.screen = Screen::Dashboard;
         }
-        // R-39：上一帧登记的耗时操作在这一帧执行，期间「处理中」状态挡住重复提交
-        if let Some((kind, path)) = self.pending_import.take() {
-            self.run_pending_import(kind, &path);
-        }
+        // 导入 / 导出已在后台线程运行；每帧只取已到达的进度与结果，不阻塞绘制。
+        self.pump_bg();
 
         self.top_bar(ctx);
         self.status_bar(ctx);
@@ -1859,8 +2050,16 @@ impl eframe::App for App {
 
         dialogs::draw(self, ctx);
 
-        // R-39：处理中状态。同步任务执行前显示一帧，并吃掉所有点击防止重复提交。
-        if let Some(msg) = self.busy.clone() {
+        // 后台任务遮罩：显示真实进度，并吃掉点击防止重复提交。
+        let bg_view = self.bg.as_ref().map(|task| {
+            (
+                task.job.label(),
+                task.job.file_name(),
+                task.done,
+                task.total,
+            )
+        });
+        if let Some((label, file_name, done, total)) = bg_view {
             let p = self.pal;
             let rect = ctx.screen_rect();
             egui::Area::new(egui::Id::new("busy_overlay"))
@@ -1869,7 +2068,23 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     let _ = ui.allocate_response(rect.size(), egui::Sense::click());
                     widgets::card(&p).show(ui, |ui| {
-                        ui.label(RichText::new(msg).size(14.0).strong().color(p.text));
+                        ui.label(RichText::new(label).size(14.0).strong().color(p.text));
+                        ui.label(RichText::new(file_name).size(11.5).color(p.text_muted));
+                        if total > 0 {
+                            let fraction = (done.min(total) as f32) / (total as f32);
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .text(format!("{done} / {total}"))
+                                    .animate(true),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("正在准备文件…")
+                                    .size(11.5)
+                                    .color(p.text_muted),
+                            );
+                        }
+                        ui.add_space(4.0);
                         ui.label(
                             RichText::new("处理中，请勿重复操作…")
                                 .size(11.5)
@@ -1930,6 +2145,21 @@ mod tests {
             "版本号含非法字符：{APP_VERSION}"
         );
         assert!(!APP_VERSION.is_empty(), "版本号不得为空");
+    }
+
+    /// 后台任务遮罩的文案必须能区分导入与导出，避免用户误判当前在跑哪件事。
+    #[test]
+    fn bg_job_label_distinguishes_import_and_export() {
+        let import = BgJob::Import {
+            kind: BatchImport::Payments,
+            path: PathBuf::from("x.xlsx"),
+        };
+        let export = BgJob::Export {
+            title: "合同台账".to_string(),
+            path: PathBuf::from("y.xlsx"),
+        };
+        assert_eq!(import.label(), "正在导入批量拨款…");
+        assert_eq!(export.label(), "正在导出「合同台账」…");
     }
 
     /// 结构版本未就绪时不能出现「版本 0.5.2 · 结构」这种尾巴悬空的串。

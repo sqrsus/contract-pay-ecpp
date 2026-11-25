@@ -470,6 +470,21 @@ fn dup_key(name: &str, unit: &str) -> (String, String) {
 ///
 /// 返回 `Err` 表示整份文件不可用；行级问题放在 `ImportReport::failures` 里，不影响其他行。
 pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<ImportReport> {
+    import_with_progress(conn, path, operator, |_, _| {})
+}
+
+/// 与 `import` 同口径，但在逐行处理时回报进度，供 GUI 后台任务刷新遮罩。
+///
+/// 进度只用于展示，不改变校验、去重、事务边界与结果统计。
+pub fn import_with_progress<F>(
+    conn: &mut Connection,
+    path: &Path,
+    operator: &str,
+    mut progress: F,
+) -> Result<ImportReport>
+where
+    F: FnMut(usize, usize),
+{
     use calamine::Reader;
 
     let bytes = std::fs::metadata(path)
@@ -558,11 +573,18 @@ pub fn import(conn: &mut Connection, path: &Path, operator: &str) -> Result<Impo
     }
 
     let start_row = range.start().map(|(r, _)| r as usize).unwrap_or(0);
+    let total_rows = range
+        .height()
+        .saturating_sub(FIRST_DATA_ROW.saturating_sub(start_row))
+        .max(1);
+    let mut seen = 0usize;
     for (i, row) in range.rows().enumerate() {
         let abs = start_row + i;
         if abs < FIRST_DATA_ROW {
             continue;
         }
+        seen += 1;
+        progress(seen.min(total_rows), total_rows);
         // 模板预置的空白行直接忽略，不计入统计
         if row_is_blank(row) {
             continue;
@@ -788,6 +810,22 @@ mod tests {
             (C_TERMS, "按月计量支付至 80%"),
             (C_REMARK, "批量导入"),
         ]
+    }
+
+    #[test]
+    fn 进度回调覆盖全部数据行() {
+        let mut conn = conn_with_fixture();
+        let path = temp_path("progress");
+        workbook_with_row(&path, &full_row());
+
+        let mut seen = Vec::new();
+        let report = import_with_progress(&mut conn, &path, "t", |done, total| {
+            seen.push((done, total));
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(1, 1)], "单行模板应回报一次 1/1");
+        assert_eq!(report.imported, 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
